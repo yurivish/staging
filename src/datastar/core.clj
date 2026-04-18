@@ -5,6 +5,7 @@
 (ns datastar.core
   (:require
    [clojure.data.json :as json]
+   [clojure.java.io :as io]
    [clojure.string :as string]
    [datastar.sse]
    [hiccup2.core :as h]
@@ -99,12 +100,16 @@
 (defn read-signals
   "See https://github.com/starfederation/datastar/blob/main/sdk/ADR.md#readsignals"
   [request]
-  (let [ret (if (and (contains? #{:get :delete} (:request-method request)) (contains? (:query-params request) :datastar))
-              ;; http method get: assume for now a json datastar parameter
-              (json/read-str (:datastar (:query-params request)))
-              ;; other methods: assume a json body
-              (:json-params request))]
-    ret))
+  (case (:request-method request)
+    (:get :delete)
+    (some-> request :query-params :datastar (json/read-str :key-fn keyword))
+
+    (:post :put :patch)
+    (or (:json-params request)
+      ;; modern versions of clojure garbage-collect unused keywords, so this does not risk memory exhaustion
+        (some-> request :body io/reader (json/read :key-fn keyword)))
+
+    nil))
 
 ;; perf opportunities:
 ;; - maintain the data as a vector through to the event->bytes method

@@ -8,7 +8,6 @@
   (:require
    [clojure.core.async :refer [<! go-loop timeout]]
    [datastar.core :as d]
-   [hiccup.util :as hu]
    [hiccup2.core :as h]
    [org.httpkit.server :as hk]))
 

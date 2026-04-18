@@ -141,10 +141,6 @@
         first-match (some (into #{} encodings) ranked-prefs)]
     (or first-match default-content-encoding)))
 
-;; This request key is used by Pedestal to signal when the initial contents of a response
-;; including headers set by interceptors have been sent, and our SSE response can begin.
-(def ^:private commited-ch-key :io.pedestal.http.request/response-commited-ch)
-
 ;; Shared header + encoding negotiation for both the streaming (`stream`) and
 ;; synchronous (`response`) entry points. Returns the response headers and a
 ;; constructor `->sse` that, given an SSESink, yields the appropriate SSE record.
@@ -171,6 +167,10 @@
     {:headers headers :->sse ->sse}))
 
 (defn- default-on-close [_ch _status])
+
+;; This request key is used by Pedestal to signal when the initial contents of a response
+;; including headers set by interceptors have been sent, and our SSE response can begin.
+(def ^:private commited-ch-key :io.pedestal.http.request/response-commited-ch)
 
 ;; on-open args are [sse] and on-close args are [sse status] where status is passed from http-kit
 ;; and is either :client-close or :server-close
