@@ -1,11 +1,9 @@
 (ns datastar.sse
-  "Support for Server-Sent Events, based on the Pedesal SSE implementation.
+  "Support for Server-Sent Events over http-kit.
 
-   Adds support for specifying an event `retry` field, and reorders fields
-   to match the Datastar spec (event, id, retry, data):
+   Fields are ordered to match the Datastar spec (event, id, retry, data):
    https://github.com/starfederation/datastar/blob/develop/sdk/ADR.md"
   (:require
-   [clojure.core.async :refer [<! go]]
    [clojure.spec.alpha :as s]
    [clojure.string :as string]
    [org.httpkit.server :as hk])
@@ -17,9 +15,9 @@
    [org.httpkit.server AsyncChannel]))
 
 ;; SSE is designed to support incrmemental writing of a compressed message with periodic flushing.
-;; The semantics of write-bytes as potentially flushing is to support uncompressed writing through
+;; We model write-bytes as potentially flushing to support uncompressed writing through
 ;; the same high-level interface (see send!, which works for compressed and uncompressed sse streams).
-;; This is a low-level interface, and not thread-safe.
+;; This is a low-level interface and is not thread-safe.
 (defprotocol SSE
   (write-bytes! [this bytes])                  ; write, and potentially flush
   (send-bytes! [this bytes close-after-send])) ; write, flush, and optionally close
@@ -30,13 +28,13 @@
 (defprotocol SSESink
   (sink-write! [this bytes close?]))
 
-;; Used for async SSE responses
+;; Sink for async SSE responses
 (defrecord ChannelSink [^AsyncChannel ch]
   SSESink
   (sink-write! [_ data close?]
     (hk/send! ch data close?)))
 
-;; Used for sync SSE responses
+;; Sink for sync SSE responses
 (defrecord BufferSink [^ByteArrayOutputStream buf]
   SSESink
   (sink-write! [_ data _close?]
@@ -82,7 +80,7 @@
 ;; GZip
 ;;
 
-;; we compress and send one message at a time.
+;; we compress and send one message at a time, flushing after each.
 ;; todo: figure out how to elegantly accept strings or []byte for data in the protocol
 ;; todo: spec that the data is not nil - for compressed it matters! or we should coerce data to empty string [done]
 
@@ -147,11 +145,6 @@
 ;;
 ;; We use a content-encoding based on *our* ranked preferences since d* takes strong advantage of
 ;; Brotli's larger compression window, so we prefer it to gzip whenever possible.
-;;
-;; All header keys are kept lowercase for case-consistency. In Pedestal, this was also necessary
-;; to overwrite headers already set by upstream interceptors (which are title-cased); if two keys
-;; differ only in case they both get emitted and the SSE stream ends up with both application/json
-;; and text/event-stream content-types.
 (defn- negotiate-response
   [request {:keys [brotli-opts gzip-opts]}]
   (let [accept-encoding-str (get-in request [:headers "accept-encoding"])
@@ -168,37 +161,35 @@
 
 (defn- default-on-close [_ch _status])
 
-;; This request key is used by Pedestal to signal when the initial contents of a response
-;; including headers set by interceptors have been sent, and our SSE response can begin.
-(def ^:private commited-ch-key :io.pedestal.http.request/response-commited-ch)
-
-;; on-open args are [sse] and on-close args are [sse status] where status is passed from http-kit
-;; and is either :client-close or :server-close
 (defn stream
+  "Returns a Ring response that streams SSE over http-kit's AsyncChannel.
+
+   `on-open` receives the SSE object once the channel is ready; `on-close` receives
+   [sse status] where status is http-kit's :client-close or :server-close.
+
+   The response status line (200) is written to the wire before `on-open` fires,
+   so there is no way to return a non-2xx from a handler that has already called
+   `stream`. If a request should be rejected, do it *before* invoking `stream` and
+   return a plain Ring response. Errors that emerge mid-stream must be surfaced
+   in-band as SSE events (e.g. an `event: error` or a Datastar signal patch)
+   before closing."
   [request {:keys [on-open on-close] :or {on-close default-on-close} :as opts}]
 
   (s/assert (s/nilable fn?) on-open)
   (s/assert (s/nilable fn?) on-close)
 
-  (let [committed-ch (commited-ch-key request)
-        {:keys [headers ->sse]} (negotiate-response request opts)
+  (let [{:keys [headers ->sse]} (negotiate-response request opts)
         ;; holds the SSE object once constructed, then passed into on-close.
         sse-atom    (atom nil)
-        ;; If the Pedestal committed-ch is present on the request, wait for it before
-        ;; firing on-open — Pedestal has already committed the initial response line
-        ;; + headers. On bare http-kit the key is absent, and http-kit ignores
-        ;; :status / :headers on the handler's returned response map when the body is
-        ;; an AsyncChannel, so we must push the initial response ourselves via send!
-        ;; with a {:status :headers} map before any body bytes go out.
-        wrap-on-open (if committed-ch
-                       (fn [on-open] (fn [ch]
-                                       (go (<! committed-ch) (on-open (reset! sse-atom (->sse (->ChannelSink ch)))))))
-                       (fn [on-open] (fn [ch]
-                                       (hk/send! ch {:status 200 :headers headers} false)
-                                       (on-open (reset! sse-atom (->sse (->ChannelSink ch)))))))
+        ;; http-kit ignores :status / :headers on the handler's returned response map when the body
+        ;; is an AsyncChannel, so we push the initial response ourselves via send! with a
+        ;; {:status :headers} map before any body bytes go out.
+        wrap-on-open (fn [on-open]
+                       (fn [ch]
+                         (hk/send! ch {:status 200 :headers headers} false)
+                         (on-open (reset! sse-atom (->sse (->ChannelSink ch))))))
         chan-opts   (cond-> {}
                       on-open  (assoc :on-open (wrap-on-open on-open))
-
                       ;; IMPORTANT: Must register an on-close handler (even a no-op) to ensure proper
                       ;; channel closure detection. When a client disconnects, http-kit's RingHandler
                       ;; only calls AsyncChannel.onClose() if hasCloseHandler() returns true (see

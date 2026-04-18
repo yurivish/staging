@@ -1,7 +1,3 @@
-;; Refs:
-;; - https://andersmurphy.com/2025/04/15/why-you-should-use-brotli-sse.html
-;; - https://github.com/JeremS/datastar-pedestal-http-kit
-
 (ns datastar.core
   (:require
    [clojure.data.json :as json]
