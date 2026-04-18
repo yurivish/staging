@@ -10,16 +10,13 @@
    [hiccup2.core :as h]
    [hiccup.util :as hu]))
 
-;; todo: figure out how to send sse stuff over plain http nonstreamingly.
-;; ie. a regular non-streaming non-asyncchannel response, but capable of
-;; delivering all of the standard datastar events.
-
 ;; re-export sse functions for user convenience.
 ;; exported as vars for interactive development.
 ;; claude says the runtime cost is a few pointer dereferences per call.
-(def sse-stream #'datastar.sse/stream)
-(def sse-send! #'datastar.sse/send!)
-(def sse-close! #'datastar.sse/close!)
+(def sse-stream   #'datastar.sse/stream)
+(def sse-response #'datastar.sse/response)
+(def sse-send!    #'datastar.sse/send!)
+(def sse-close!   #'datastar.sse/close!)
 
 (defn- elements-list
   "Given a hiccup html representation, return a string of datastar-style 'elements' data lines"

@@ -24,16 +24,32 @@
   (write-bytes! [this bytes])                  ; write, and potentially flush
   (send-bytes! [this bytes close-after-send])) ; write, flush, and optionally close
 
+;; An SSESink is where an SSE record's outgoing bytes land. Streaming uses a ChannelSink
+;; (forwards to http-kit's AsyncChannel); synchronous responses use a BufferSink
+;; (accumulates into a ByteArrayOutputStream that the caller drains into a Ring body).
+(defprotocol SSESink
+  (sink-write! [this bytes close?]))
+
+(defrecord ChannelSink [^AsyncChannel ch]
+  SSESink
+  (sink-write! [_ data close?]
+    (hk/send! ch data close?)))
+
+(defrecord BufferSink [^ByteArrayOutputStream buf]
+  SSESink
+  (sink-write! [_ data _close?]
+    (when data (.write buf ^bytes data))))
+
 (defrecord UncompressedSSE
-           [^AsyncChannel ch]
+           [sink]
   SSE
   (write-bytes! [this data]
     (send-bytes! this data false))
   (send-bytes! [_ data close-after-send]
-    (hk/send! ch data close-after-send)))
+    (sink-write! sink data close-after-send)))
 
 (defrecord CompressedSSE
-           [^AsyncChannel ch
+           [sink
             ^ByteArrayOutputStream out-stream
             enc-stream]
   SSE
@@ -45,7 +61,7 @@
     (let [result (.toByteArray out-stream)]
       (.reset out-stream)
       (when close-after-send (.close enc-stream))
-      (hk/send! ch result close-after-send))))
+      (sink-write! sink result close-after-send))))
 
 (defn send!
   ([sse data]
@@ -68,12 +84,12 @@
 ;; todo: figure out how to elegantly accept strings or []byte for data in the protocol
 ;; todo: spec that the data is not nil - for compressed it matters! or we should coerce data to empty string [done]
 
-(defn gzip-sse [ch & [opts]]
+(defn gzip-sse [sink & [opts]]
   (let [out-stream (ByteArrayOutputStream.)
         enc-stream (if-let [buffer-size (:buffer-size opts)]
                      (GZIPOutputStream. out-stream buffer-size true)
                      (GZIPOutputStream. out-stream true))]
-    (->CompressedSSE ch out-stream enc-stream)))
+    (->CompressedSSE sink out-stream enc-stream)))
 
 ;;
 ;; Brotli
@@ -90,14 +106,14 @@
     (.setQuality quality)))
 
 ;; TODO: Use the same defaults as Brotli in Go
-(defn brotli-sse [ch & {:keys [quality window-size buffer-size] :or {quality 5 window-size 24}}]
+(defn brotli-sse [sink & {:keys [quality window-size buffer-size] :or {quality 5 window-size 24}}]
   (Brotli4jLoader/ensureAvailability)
   (let [out-stream (ByteArrayOutputStream.)
         encoder-params (brotli-encoder-params quality window-size)
         enc-stream (if buffer-size
                      (BrotliOutputStream. out-stream encoder-params buffer-size)
                      (BrotliOutputStream. out-stream encoder-params))]
-    (->CompressedSSE ch out-stream enc-stream)))
+    (->CompressedSSE sink out-stream enc-stream)))
 
 ;;
 ;; Stream
@@ -127,33 +143,43 @@
 ;; including headers set by interceptors have been sent, and our SSE response can begin.
 (def ^:private commited-ch-key :io.pedestal.http.request/response-commited-ch)
 
+;; Shared header + encoding negotiation for both the streaming (`stream`) and
+;; synchronous (`response`) entry points. Returns the response headers and a
+;; constructor `->sse` that, given an SSESink, yields the appropriate SSE record.
+;;
+;; We use a content-encoding based on *our* ranked preferences since d* takes strong advantage of
+;; Brotli's larger compression window, so we prefer it to gzip whenever possible.
+;;
+;; All header keys are kept lowercase for case-consistency. In Pedestal, this was also necessary
+;; to overwrite headers already set by upstream interceptors (which are title-cased); if two keys
+;; differ only in case they both get emitted and the SSE stream ends up with both application/json
+;; and text/event-stream content-types.
+(defn- negotiate-response
+  [request {:keys [brotli-opts gzip-opts]}]
+  (let [accept-encoding-str (get-in request [:headers "accept-encoding"])
+        encoding (preferred-content-encoding accept-encoding-str ["br" "gzip" "identity"])
+        headers  (cond-> {"content-type"  "text/event-stream; charset=UTF-8"
+                          "cache-control" "no-cache"}
+                   encoding (assoc "content-encoding" (name encoding)))
+        ->sse    (case encoding
+                   "br"       (fn [sink] (brotli-sse sink brotli-opts))
+                   "gzip"     (fn [sink] (gzip-sse sink gzip-opts))
+                   "identity" ->UncompressedSSE
+                   ->UncompressedSSE)]
+    {:headers headers :->sse ->sse}))
+
 (defn- default-on-close [_ch _status])
 
 ;; on-open args are [sse] and on-close args are [sse status] where status is passed from http-kit
 ;; and is either :client-close or :server-close
 (defn stream
-  [request {:keys [on-open on-close brotli-opts gzip-opts] :or {on-close default-on-close}}]
+  [request {:keys [on-open on-close] :or {on-close default-on-close} :as opts}]
 
   (s/assert (s/nilable fn?) on-open)
   (s/assert (s/nilable fn?) on-close)
 
   (let [committed-ch (commited-ch-key request)
-        accept-encoding-str (get-in request [:headers "accept-encoding"])
-        ;; We use a content-encoding based on *our* ranked preferences since d* takes strong advantage of
-        ;; Brotli's larger compression window, so we prefer it to gzip whenever possible.
-        encoding (preferred-content-encoding accept-encoding-str ["br" "gzip" "identity"])
-        ;; All keys kept lowercase for case-consistency. In Pedestal, this was also necessary
-        ;; to overwrite headers already set by upstream interceptors (which are title-cased);
-        ;; if two keys differ only in case they both get emitted and the SSE stream ended up
-        ;; with both application/json and text/event-stream content-types.
-        headers     (cond-> {"content-type"  "text/event-stream; charset=UTF-8"
-                             "cache-control" "no-cache"}
-                      encoding (assoc "content-encoding" (name encoding)))
-        ->sse       (case encoding
-                      "br"       (fn [ch] (brotli-sse ch brotli-opts))
-                      "gzip"     (fn [ch] (gzip-sse ch gzip-opts))
-                      "identity" ->UncompressedSSE
-                      ->UncompressedSSE)
+        {:keys [headers ->sse]} (negotiate-response request opts)
         sse-atom    (atom nil) ;; holds the SSE object once constructed, then passed into on-close.
         ;; If the Pedestal committed-ch is present on the request, wait for it before
         ;; firing on-open — Pedestal has already committed the initial response line
@@ -163,11 +189,11 @@
         ;; with a {:status :headers} map before any body bytes go out.
         wrap-on-open (if committed-ch
                        (fn [on-open] (fn [ch]
-                                       (go (<! committed-ch) (on-open (reset! sse-atom (->sse ch))))))
+                                       (go (<! committed-ch) (on-open (reset! sse-atom (->sse (->ChannelSink ch)))))))
                        (fn [on-open] (fn [ch]
                                        (hk/send! ch {:status 200 :headers headers} false)
-                                       (on-open (reset! sse-atom (->sse ch))))))
-        opts        (cond-> {}
+                                       (on-open (reset! sse-atom (->sse (->ChannelSink ch)))))))
+        chan-opts   (cond-> {}
                       on-open  (assoc :on-open (wrap-on-open on-open))
 
                       ;; IMPORTANT: Must register an on-close handler (even a no-op) to ensure proper
@@ -176,7 +202,23 @@
                       ;; RingHandler.clientClose()). Without a handler, closedRan remains false and send
                       ;; operations continue returning true, silently discarding data after disconnect.
                       on-close (assoc :on-close (fn [_ch status] (on-close @sse-atom status))))]
-    (assoc (hk/as-channel request opts) :status 200 :headers headers)))
+    (assoc (hk/as-channel request chan-opts) :status 200 :headers headers)))
+
+(defn response
+  "Runs `f` synchronously with an SSE object and returns a Ring response map
+   whose body is the accumulated (possibly compressed) SSE byte stream.
+
+   Uses the same content-type + encoding negotiation as `stream`; opts may
+   include :brotli-opts and :gzip-opts."
+  [request opts f]
+  (let [{:keys [headers ->sse]} (negotiate-response request opts)
+        buf (ByteArrayOutputStream.)
+        sse (->sse (->BufferSink buf))]
+    (f sse)
+    (close! sse)
+    {:status  200
+     :headers headers
+     :body    (.toByteArray buf)}))
 
 ;; perf notes:
 ;; - http-kit sets Transfer-Encoding: chunked (see AsyncChannel.firstWrite)
