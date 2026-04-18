@@ -1,7 +1,9 @@
 {:paths ["src"]
  :deps  {org.clojure/clojure       {:mvn/version "1.12.4"}
          org.clojure/core.async    {:mvn/version "1.9.865"}
-         http-kit/http-kit         {:mvn/version "2.8.1"}
+         ;; 2.8.x has a regression (#578/#579) where on-close never fires on client
+         ;; disconnect — the fix (76b869f) only landed in the 2.9 line.
+         http-kit/http-kit         {:mvn/version "2.9.0-beta3"}
          org.clojure/data.json     {:mvn/version "2.5.2"}
          hiccup/hiccup             {:mvn/version "2.0.0"}
          com.aayushatharva.brotli4j/brotli4j

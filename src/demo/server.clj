@@ -1,12 +1,12 @@
 (ns demo.server
-  "Same shape as the in-browser-dispatch repro, but patches now arrive via a
-   real SSE response from the server (triggered by a button's @get).
+  "Run:  clj -M:run
+   Open: http://localhost:8080
 
-   Run:  clj -M:run
-   Open: http://localhost:8080 and click 'patch' repeatedly, watching the
-   console for 'init' logs."
+   Shows that a server-push SSE stream (ticking #count every second) coexists
+   with user-triggered actions (button randomizes the page background) without
+   either interfering with the other."
   (:require
-   [clojure.core.async :refer [<! go-loop timeout]]
+   [clojure.core.async :refer [alt! chan close! go-loop timeout]]
    [datastar.core :as d]
    [hiccup2.core :as h]
    [org.httpkit.server :as hk]))
@@ -15,79 +15,61 @@
   "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js")
 
 (def css "
-*, *::before, *::after { box-sizing: border-box; }
-* { margin: 0; }
-:root {
-  --base-color: oklch(92.2% 0 0);
-  --base-color-content: oklch(25.3267% 0.015896 252.417568);
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --base-color: oklch(25.3267% 0.015896 252.417568);
-    --base-color-content: oklch(92.2% 0 0);
-  }
-}
 body {
-  display: grid;
-  place-content: center;
-  background-color: var(--base-color);
-  font-family: system-ui;
-  height: 100vh;
-  padding: 4rem;
-  text-align: center;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  height: 100vh; margin: 0;
+  font-family: system-ui; gap: 1.5rem;
 }
-div { color: var(--base-color-content); font-size: 2rem; }
-button { font: inherit; padding: .5rem 1rem; }
+#count  { font-size: 4rem; }
+button  { font-size: 2rem; padding: .5rem 1.5rem; }
 ")
 
-(def messages
-  ["Stop overcomplicating it."
-   "Backend controls state."
-   "Props down, Events up."
-   "Flamegraphs don't care about your feelings."
-   "Practice yourself, for heaven's sake, in little things; and thence proceed to greater"
-   "Freedom is the only worthy goal in life. It is won by disregarding things that lie beyond our control."
-   "Be the change you want to see."
-   "https://data-star.dev/ 🚀"])
+(def counter  (atom 0))
+(def bg-color (atom "hsl(210, 70%, 85%)"))
 
 (defn random-light-color []
   (format "hsl(%d, 70%%, 85%%)" (rand-int 360)))
 
-(defn page-contents [_msg]
-  [:div#page {:style     (str "background: " (random-light-color) "; min-height: 100vh")}
-   [:h1 "datastar + http-kit demo"]
-   [:p "Tick count updated via SSE:"]
-   [:div#tick {:data-init "console.log('init'); @get('/events')"} "waiting…"]
-   [:button {:data-on:click "@get('/patch')"} "patch"]])
+(defn body-contents []
+  [:body {:style (str "background: " @bg-color)}
+   [:div#count (str @counter)]
+   [:button {:data-on:click "@get('/randomize')"} "randomize bg"]])
 
 (defn page []
   (str "<!doctype html>"
        (h/html
         [:html
          [:head
+          [:style (h/raw css)]
           [:script {:type "module" :defer true :src datastar-cdn}]]
-         [:body (page-contents "Hello there!")]])))
-
-(defn patch [req]
-  (d/sse-response req {}
-                  (fn [sse]
-                    (d/patch-elements sse (page-contents (rand-nth messages))))))
+         ;; data-init lives only on the initial render so it fires exactly once;
+         ;; patches from /randomize and /events deliberately don't carry it.
+         (-> (body-contents)
+             (update 1 assoc :data-init "console.log('init'); @get('/events')"))])))
 
 (defn events [req]
-  (d/sse-stream
-   req
-   {:on-open
-    (fn [sse]
-      (go-loop [n 0]
-        (d/patch-elements sse [:div#tick {:data-init "console.log('init'); @get('/events')"} (str "tick " n)])
-        (<! (timeout 1000))
-        (recur (inc n))))}))
+  (let [closed (chan)]
+    (d/sse-stream
+     req
+     {:on-open  (fn [sse]
+                  (println "open")
+                  (go-loop []
+                    (swap! counter inc)
+                    (d/patch-elements sse [:div#count (str @counter)])
+                    (alt! closed         :done
+                          (timeout 1000) (recur))))
+      :on-close (fn [_sse status] (println "close" status) (close! closed))})))
+
+(defn randomize [req]
+  (reset! bg-color (random-light-color))
+  (d/sse-response req {} (fn [sse] (d/patch-elements sse (body-contents)))))
 
 (defn handler [req]
   (case (:uri req)
-    "/"       {:status 200 :headers {"content-type" "text/html; charset=utf-8"} :body (page)}
-    "/events" (events req)
-    "/patch"  (patch req)
+    "/"          {:status 200 :headers {"content-type" "text/html; charset=utf-8"} :body (page)}
+    "/events"    (events req)
+    "/randomize" (randomize req)
     {:status 404 :body "not found"}))
 
 (defonce server (atom nil))
