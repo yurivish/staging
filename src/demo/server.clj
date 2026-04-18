@@ -9,13 +9,13 @@
    Or from the CLI:
      clj -M -m demo.server"
   (:require
-   [clojure.core.async :as async :refer [<! go-loop timeout]]
+   [clojure.core.async :refer [<! go-loop timeout]]
    [datastar.core :as d]
    [hiccup2.core :as h]
    [org.httpkit.server :as hk]))
 
 (def datastar-cdn
-  "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0-beta.11/bundles/datastar.js")
+  "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js")
 
 (defn page []
   (str
@@ -28,24 +28,16 @@
      [:body
       [:h1 "datastar + http-kit demo"]
       [:p "Tick count updated via SSE:"]
-      [:div#tick {:data-on-load "@get('/events')"} "waiting…"]]])))
+      [:div#tick {:data-init "@get('/events')"} "waiting…"]]])))
 
 (defn index [_req]
   {:status  200
    :headers {"content-type" "text/html; charset=utf-8"}
    :body    (page)})
 
-;; datastar.sse/stream expects a Pedestal-style "response committed" channel
-;; on the request. In this bare-http-kit demo we supply one that's already
-;; closed so on-open fires immediately.
-(defn- with-committed-ch [req]
-  (let [c (async/chan)]
-    (async/close! c)
-    (assoc req :io.pedestal.http.request/response-commited-ch c)))
-
 (defn events [req]
   (d/sse-stream
-   (with-committed-ch req)
+   req
    {:on-open
     (fn [sse]
       (go-loop [n 0]

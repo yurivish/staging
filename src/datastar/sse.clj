@@ -25,7 +25,7 @@
   (send-bytes! [this bytes close-after-send])) ; write, flush, and optionally close
 
 (defrecord UncompressedSSE
-  [^AsyncChannel ch]
+           [^AsyncChannel ch]
   SSE
   (write-bytes! [this data]
     (send-bytes! this data false))
@@ -33,9 +33,9 @@
     (hk/send! ch data close-after-send)))
 
 (defrecord CompressedSSE
-  [^AsyncChannel ch
-   ^ByteArrayOutputStream out-stream
-   enc-stream]
+           [^AsyncChannel ch
+            ^ByteArrayOutputStream out-stream
+            enc-stream]
   SSE
   (write-bytes! [_ data]
     (.write enc-stream data))
@@ -105,8 +105,8 @@
 
 (defn parse-accept-field [^String accept-elem-str]
   (-> (string/split accept-elem-str #";" 2)
-    first
-    string/trim))
+      first
+      string/trim))
 
 (defn parse-accept-encoding
   [accept-encoding-str]
@@ -138,28 +138,37 @@
   (s/assert (s/nilable fn?) on-close)
 
   (let [committed-ch (commited-ch-key request)
-        ;; These need to be lower case in order to overwrite headers set by Pedestal.
-        ;; I once lost several hours to debugging an issue where the SSE stream had
-        ;; both an application/json and text/event-stream content-type.
-        sse-headers {"content-type"  "text/event-stream; charset=UTF-8"
-                     "connection"    "keep-alive"
-                     "cache-control" "no-cache"}
         accept-encoding-str (get-in request [:headers "accept-encoding"])
         ;; We use a content-encoding based on *our* ranked preferences since d* takes strong advantage of
         ;; Brotli's larger compression window, so we prefer it to gzip whenever possible.
         encoding (preferred-content-encoding accept-encoding-str ["br" "gzip" "identity"])
-        headers     (merge (:headers request)
-                      sse-headers
-                      (when encoding {"Content-Encoding" (name encoding)}))
+        ;; All keys kept lowercase for case-consistency. In Pedestal, this was also necessary
+        ;; to overwrite headers already set by upstream interceptors (which are title-cased);
+        ;; if two keys differ only in case they both get emitted and the SSE stream ended up
+        ;; with both application/json and text/event-stream content-types.
+        headers     (cond-> {"content-type"  "text/event-stream; charset=UTF-8"
+                             "cache-control" "no-cache"}
+                      encoding (assoc "content-encoding" (name encoding)))
         ->sse       (case encoding
                       "br"       (fn [ch] (brotli-sse ch brotli-opts))
                       "gzip"     (fn [ch] (gzip-sse ch gzip-opts))
                       "identity" ->UncompressedSSE
                       ->UncompressedSSE)
         sse-atom    (atom nil) ;; holds the SSE object once constructed, then passed into on-close.
+        ;; If the Pedestal committed-ch is present on the request, wait for it before
+        ;; firing on-open — Pedestal has already committed the initial response line
+        ;; + headers. On bare http-kit the key is absent, and http-kit ignores
+        ;; :status / :headers on the handler's returned response map when the body is
+        ;; an AsyncChannel, so we must push the initial response ourselves via send!
+        ;; with a {:status :headers} map before any body bytes go out.
+        wrap-on-open (if committed-ch
+                       (fn [on-open] (fn [ch]
+                                       (go (<! committed-ch) (on-open (reset! sse-atom (->sse ch))))))
+                       (fn [on-open] (fn [ch]
+                                       (hk/send! ch {:status 200 :headers headers} false)
+                                       (on-open (reset! sse-atom (->sse ch))))))
         opts        (cond-> {}
-                      ;; Wait for the response to be comitted before calling the on-open callback
-                      on-open  (assoc :on-open (fn [ch] (go (<! committed-ch) (on-open (reset! sse-atom (->sse ch))))))
+                      on-open  (assoc :on-open (wrap-on-open on-open))
 
                       ;; IMPORTANT: Must register an on-close handler (even a no-op) to ensure proper
                       ;; channel closure detection. When a client disconnects, http-kit's RingHandler
