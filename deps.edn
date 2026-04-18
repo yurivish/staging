@@ -5,4 +5,9 @@
          org.clojure/data.json     {:mvn/version "2.5.2"}
          hiccup/hiccup             {:mvn/version "2.0.0"}
          com.aayushatharva.brotli4j/brotli4j
-         {:mvn/version "1.22.0"}}}
+         {:mvn/version "1.22.0"}}
+ ;; brotli4j calls System.loadLibrary, which trips JDK 24+ restricted-method warnings.
+ ;; Granting native access to the unnamed module silences them.
+ :aliases
+ {:run {:jvm-opts  ["--enable-native-access=ALL-UNNAMED"]
+        :main-opts ["-m" "demo.server"]}}}

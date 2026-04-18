@@ -30,11 +30,13 @@
 (defprotocol SSESink
   (sink-write! [this bytes close?]))
 
+;; Used for async SSE responses
 (defrecord ChannelSink [^AsyncChannel ch]
   SSESink
   (sink-write! [_ data close?]
     (hk/send! ch data close?)))
 
+;; Used for sync SSE responses
 (defrecord BufferSink [^ByteArrayOutputStream buf]
   SSESink
   (sink-write! [_ data _close?]
@@ -180,7 +182,8 @@
 
   (let [committed-ch (commited-ch-key request)
         {:keys [headers ->sse]} (negotiate-response request opts)
-        sse-atom    (atom nil) ;; holds the SSE object once constructed, then passed into on-close.
+        ;; holds the SSE object once constructed, then passed into on-close.
+        sse-atom    (atom nil)
         ;; If the Pedestal committed-ch is present on the request, wait for it before
         ;; firing on-open — Pedestal has already committed the initial response line
         ;; + headers. On bare http-kit the key is absent, and http-kit ignores

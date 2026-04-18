@@ -77,7 +77,7 @@
   ([sse signals] (send-event! sse (patch-signals-core signals)))
   ([sse signals opts] (send-event! sse (patch-signals-core signals opts))))
 
-(defn execute-script-core
+(defn- execute-script-core
   "Emit a script element. If both attrs and auto-remove are specified, a :data-effect key in
    attrs will override the auto-remove data-effect attribute added by this function.
 
@@ -96,8 +96,6 @@
    See https://github.com/starfederation/datastar/blob/main/sdk/ADR.md#serversenteventgeneratorexecutescript"
   [sse script & [opts]] (send-event! sse (execute-script-core script opts)))
 
-;; ref: https://github.com/starfederation/datastar/blob/v0.21.4/sdk/go/signals.go#L101
-;; we should do proper error handling/throwing if there is no json or if it is unparseable.
 (defn read-signals
   "See https://github.com/starfederation/datastar/blob/main/sdk/ADR.md#readsignals"
   [request]
@@ -106,15 +104,7 @@
               (json/read-str (:datastar (:query-params request)))
               ;; other methods: assume a json body
               (:json-params request))]
-    (println "ret: " ret " and " (:json-params request))
     ret))
-
-;; might be useful:
-;; https://pedestal.io/pedestal/0.6/guides/hello-world-content-types.html
-
-;; testing
-#_(patch-elements-core [:h1 "fooo"] {:selector "#roop"})
-#_(patch-signals-core {:a 1 :b 2} {:only-if-missing true})
 
 ;; perf opportunities:
 ;; - maintain the data as a vector through to the event->bytes method
@@ -125,4 +115,7 @@
 ;; or vec in the specific case of the :data key.
 ;; - elements-list: optimize the common case of one-line strings
 
+;; testing
+#_(patch-elements-core [:h1 "fooo"] {:selector "#roop"})
+#_(patch-signals-core {:a 1 :b 2} {:only-if-missing true})
 #_(println (execute-script-core "alert(1)" nil))
