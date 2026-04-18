@@ -10,4 +10,4 @@
  ;; Granting native access to the unnamed module silences them.
  :aliases
  {:run {:jvm-opts  ["--enable-native-access=ALL-UNNAMED"]
-        :main-opts ["-e" "(set! *warn-on-reflection* true)" "-m" "demo.server"]}}}
+        :main-opts ["-e" "(do (set! *warn-on-reflection* true) nil)" "-m" "demo.server"]}}}

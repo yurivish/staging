@@ -10,7 +10,7 @@
   (:import
    [com.aayushatharva.brotli4j Brotli4jLoader]
    [com.aayushatharva.brotli4j.encoder BrotliOutputStream Encoder$Mode Encoder$Parameters]
-   [java.io ByteArrayOutputStream]
+   [java.io ByteArrayOutputStream OutputStream]
    [java.util.zip GZIPOutputStream]
    [org.httpkit.server AsyncChannel]))
 
@@ -51,10 +51,10 @@
 (defrecord CompressedSSE
            [sink
             ^ByteArrayOutputStream out-stream
-            enc-stream]
+            ^OutputStream enc-stream]
   SSE
   (write-bytes! [_ data]
-    (.write enc-stream data))
+    (.write enc-stream ^bytes data))
   (send-bytes! [this data close-after-send]
     (when data (write-bytes! this data))
     (.flush enc-stream)
@@ -104,8 +104,8 @@
 ;; We use the same default as the Go implementation.
 ;; Quality ranges from 0-11; larger values yield better but slower compression.
 ;; Window size ranges from 10-24; window size is `(pow(2, x) - 16)`; larger window size means more
-;; lookback and the decoder needs more memory to decode; 0 lets the compressor decide the size.
-(defn brotli-sse [sink & {:keys [quality window-size buffer-size] :or {quality 6 window-size 0}}]
+;; lookback and the decoder needs more memory to decode; -1 lets the compressor decide the size.
+(defn brotli-sse [sink & {:keys [quality window-size buffer-size] :or {quality 6 window-size -1}}]
   (Brotli4jLoader/ensureAvailability)
   (let [out-stream (ByteArrayOutputStream.)
         encoder-params (brotli-encoder-params quality window-size)
