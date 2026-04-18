@@ -1,0 +1,183 @@
+# toolkit
+
+A small collection of Clojure dev-loop helpers, independent of any particular
+app. Assumes the app uses Stuart Sierra's `component` for lifecycle.
+
+## Namespaces
+
+### `toolkit.watcher`
+
+A polling `FileWatcher` component. Start it with `:dir`, `:interval-ms`, and
+`:on-change`; on any change under the directory (recursive, `.clj` files only)
+it invokes `on-change` on a detached thread. Stopping the component shuts
+down the scan thread.
+
+### `toolkit.hotreload`
+
+Datastar-based browser reload: the page opens an SSE to `/hot-reload` which
+retries across server reboots. The first reconnect after `arm!` receives
+`window.location.reload()`; further reconnects park silently.
+
+Public:
+- `path` — route the SSE attaches to (`"/hot-reload"` by convention).
+- `snippet` — hiccup `<div data-init="@get(...)">` to inject in dev pages.
+- `handler` — the SSE handler. Register at `path`.
+- `arm!` — reset the once-flag. Call from your reload orchestration.
+
+### `toolkit.dev`
+
+- `refresh` — `tools.namespace.repl/refresh` wrapped with the `*ns*` thread-local
+  binding it needs off REPL threads (see gotcha 1 below).
+- `reload!` — the stop/refresh/before-start/start dance; takes plain fns so it
+  doesn't know about your `sys` atom.
+
+## Canonical `dev/user.clj`
+
+Copy this into your project and adjust the component wiring:
+
+```clojure
+(ns user
+  (:require [clojure.tools.namespace.repl :as repl]
+            [com.stuartsierra.component :as component]
+            [toolkit.dev :as dev]
+            [toolkit.hotreload :as hr]
+            [toolkit.watcher :as watcher]
+            ;; Eager-load app namespaces so compile errors surface at REPL
+            ;; start. We don't alias them — see gotcha 2 below for why we
+            ;; resolve their factories dynamically.
+            [myapp.server]))
+
+(repl/set-refresh-dirs "src/myapp")   ; refresh the app, not the toolkit
+
+;; Two independent lifecycles. The file watcher lives outside the app system
+;; so a failed refresh doesn't kill it — otherwise fixing the syntax error
+;; wouldn't be observed, because the watcher went down with the system.
+(defonce ^:private sys nil)
+(defonce ^:private fw nil)
+(defonce ^:private lock (Object.))
+
+(declare reload!)
+
+(defn- dev-system []
+  (component/system-map
+   :app-state ((requiring-resolve 'myapp.server/map->AppState) {})
+   :server    (component/using
+               ((requiring-resolve 'myapp.server/map->Server)
+                {:port 8080 :dev? true})
+               [:app-state])))
+
+(defn- start-sys! [] (alter-var-root #'sys #(or % (component/start (dev-system)))))
+(defn- stop-sys!  [] (alter-var-root #'sys (fn [s] (some-> s component/stop) nil)))
+
+(defn start! []
+  (alter-var-root #'fw
+    (fn [w]
+      (or w
+          (component/start
+           ((requiring-resolve 'toolkit.watcher/map->FileWatcher)
+            {:dir "src/myapp" :interval-ms 100 :on-change #(reload!)})))))
+  (start-sys!))
+
+(defn stop! []
+  (stop-sys!)
+  (alter-var-root #'fw (fn [w] (some-> w component/stop) nil)))
+
+(defn reload! []
+  (dev/reload! {:start start-sys! :stop stop-sys! :lock lock :before-start hr/arm!}))
+```
+
+Leave `dev/user.clj` outside `set-refresh-dirs` — the harness itself is not
+refreshed, only the app.
+
+### Why the watcher sits outside the app system
+
+If the watcher were a component in `dev-system`, a failed `reload!` would
+tear it down along with the rest of the app. You'd fix the syntax error,
+save — and nothing would happen, because there's no watcher left to notice.
+You'd have to hit the REPL and type `(reload!)` yourself.
+
+Keeping the watcher in its own var means `reload!` only touches `sys`. The
+watcher keeps polling through refresh failures, so fixing the code
+triggers an automatic retry exactly the same way the initial edit did.
+
+### App-side hotreload wiring
+
+Three touchpoints in the app:
+
+1. Inject the snippet in dev pages:
+   ```clojure
+   (when dev? hr/snippet)
+   ```
+2. Register the route:
+   ```clojure
+   hr/path (if dev? (hr/handler req) {:status 404 :body "not found"})
+   ```
+3. Let the Server component take a `:dev?` flag; set it in `dev-system`, leave
+   it unset in your prod system.
+
+## Two gotchas worth knowing
+
+Both are about `clojure.tools.namespace.repl/refresh`. The toolkit handles the
+first one for you; the second one is still the app's responsibility.
+
+### 1. `*ns*` must be thread-locally bound when calling `refresh`
+
+`refresh` internally does `(set! *ns* …)`. `set!` only works on a
+thread-locally bound var — it can't modify a root binding. A REPL thread
+always has `*ns*` bound as a thread-local; a bare background thread does not.
+
+The watcher dispatches `on-change` via `future`, which runs on a thread
+without `*ns*` bound. So `toolkit.dev/refresh` wraps the call in `binding`:
+
+```clojure
+(binding [*ns* (the-ns 'toolkit.dev)] (repl/refresh))
+```
+
+The specific namespace doesn't matter — `refresh` will update `*ns*` itself
+as it loads each file. What matters is that a thread-local binding *exists*.
+
+If you call `refresh` elsewhere off a REPL thread (nREPL worker threads,
+async event handlers, other watchers), wrap it the same way.
+
+### 2. `refresh` orphans Vars — non-refreshed code must resolve dynamically
+
+`refresh` doesn't just re-eval files; it `remove-ns`'s each changed
+namespace, then re-loads it. The reloaded namespace is a *new* `Namespace`
+object with *new* `Var` objects. Any old `Var`s are orphaned — they still
+hold their old values, but they're detached from the live namespace.
+
+This bites code in non-refreshed namespaces that references
+refreshed-namespace vars. The canonical example is `dev/user.clj` (which is
+not refreshed, since it sits outside `set-refresh-dirs`) holding a
+compile-time alias to app code:
+
+```clojure
+(ns user
+  (:require [myapp.server :as server]))   ; compile-time Var resolution
+
+(defn dev-system []
+  (component/system-map
+   :server (server/map->Server {:port 8080})))   ; ← compiled to the old Var
+```
+
+After `refresh`, `myapp.server` is a new namespace with a new `map->Server`
+Var. But `dev-system`'s bytecode still points at the *old, orphaned* Var —
+so it calls the old factory, creating instances of the old `Server` record,
+whose handler refs are also stale, and so on. The file on disk changed, but
+the running system reflects the pre-refresh code.
+
+Fix: resolve dynamically when you know the target has been refreshed.
+
+```clojure
+(defn dev-system []
+  (component/system-map
+   :server ((requiring-resolve 'myapp.server/map->Server) {:port 8080})))
+```
+
+`requiring-resolve` goes through `find-ns`, which always returns the
+*current* namespace object — so you always get the current Var and its
+current value.
+
+This only matters for things you call *after* `refresh` completes. Function
+calls that live inside refreshed namespaces (where the bytecode itself is
+regenerated) don't need this — they get fresh Var references automatically.
