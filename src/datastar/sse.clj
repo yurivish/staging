@@ -64,13 +64,11 @@
       (sink-write! sink result close-after-send))))
 
 (defn send!
-  ([sse data]
-   (send! sse data false))
-
-  ([sse data close-after-send]
-   (s/assert (s/coll-of string?) data)
+  ([sse s] (send! sse s false))
+  ([sse s close-after-send]
+   (s/assert string? s)
    (s/assert boolean? close-after-send)
-   (doseq [s data] (write-bytes! sse (.getBytes s "UTF-8")))
+   (write-bytes! sse (.getBytes ^String s "UTF-8"))
    (send-bytes! sse nil close-after-send)))
 
 (defn close! [sse]
@@ -81,8 +79,6 @@
 ;;
 
 ;; we compress and send one message at a time, flushing after each.
-;; todo: figure out how to elegantly accept strings or []byte for data in the protocol
-;; todo: spec that the data is not nil - for compressed it matters! or we should coerce data to empty string [done]
 
 (defn gzip-sse [sink & [opts]]
   (let [out-stream (ByteArrayOutputStream.)
@@ -105,8 +101,11 @@
     ;; Compression quality, in range [0, 11] or -1 for default value
     (.setQuality quality)))
 
-;; TODO: Use the same defaults as Brotli in Go
-(defn brotli-sse [sink & {:keys [quality window-size buffer-size] :or {quality 5 window-size 24}}]
+;; We use the same default as the Go implementation.
+;; Quality ranges from 0-11; larger values yield better but slower compression.
+;; Window size ranges from 10-24; window size is `(pow(2, x) - 16)`; larger window size means more
+;; lookback and the decoder needs more memory to decode; 0 lets the compressor decide the size.
+(defn brotli-sse [sink & {:keys [quality window-size buffer-size] :or {quality 6 window-size 0}}]
   (Brotli4jLoader/ensureAvailability)
   (let [out-stream (ByteArrayOutputStream.)
         encoder-params (brotli-encoder-params quality window-size)
@@ -139,12 +138,12 @@
         first-match (some (into #{} encodings) ranked-prefs)]
     (or first-match default-content-encoding)))
 
-;; Shared header + encoding negotiation for both the streaming (`stream`) and
+;; Shared header and encoding negotiation for streaming (`stream`) and
 ;; synchronous (`response`) entry points. Returns the response headers and a
-;; constructor `->sse` that, given an SSESink, yields the appropriate SSE record.
+;; constructor `->sse` that, given an SSESink, yields an SSE record of the appropriate type.
 ;;
-;; We use a content-encoding based on *our* ranked preferences since d* takes strong advantage of
-;; Brotli's larger compression window, so we prefer it to gzip whenever possible.
+;; We use a content-encoding based on *our* ranked preferences since datastar strongly benefits
+;; from Brotli's larger compression window, so when possible we always prefer Brotli.
 (defn- negotiate-response
   [request {:keys [brotli-opts gzip-opts]}]
   (let [accept-encoding-str (get-in request [:headers "accept-encoding"])
@@ -159,7 +158,7 @@
                    ->UncompressedSSE)]
     {:headers headers :->sse ->sse}))
 
-(defn- default-on-close [_ch _status])
+(def ^:private default-on-close (constantly nil))
 
 (defn stream
   "Returns a Ring response that streams SSE over http-kit's AsyncChannel.
@@ -200,7 +199,7 @@
 
 (defn response
   "Runs `f` synchronously with an SSE object and returns a Ring response map
-   whose body is the accumulated (possibly compressed) SSE byte stream.
+   whose body is the accumulated (and possibly compressed) SSE byte stream.
 
    Uses the same content-type + encoding negotiation as `stream`; opts may
    include :brotli-opts and :gzip-opts."

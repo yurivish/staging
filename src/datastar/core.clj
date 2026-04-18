@@ -22,19 +22,19 @@
     (when (not-empty s)
       (map (partial str "elements ") (string/split-lines s)))))
 
-(defn data-lines
-  "Takes a vector of data and returns a vector of SSE-ready data lines prefixed with 'data: '"
-  [data]
-  (map #(str "data: " % "\n") data))
-
-;; turns dispatch opts into the lines we want to send via sse
-(defn lines [{:keys [:name :id :retry :data]}]
-  (cond-> []
-    name                          (conj (str "event: " name "\n"))
-    id                            (conj (str "id: " id "\n"))
-    (and retry (not= 1000 retry)) (conj (str "retry: " retry "\n"))
-    data                          (into (data-lines data))
-    true                          (conj "\n\n")))
+;; Builds and returns a complete SSE frame as a string
+(defn- lines [{:keys [:name :id :retry :data]}]
+  (let [sb (StringBuilder.)]
+    (when name
+      (doto sb (.append "event: ") (.append (str name)) (.append \newline)))
+    (when id
+      (doto sb (.append "id: ") (.append (str id)) (.append \newline)))
+    (when (and retry (not= 1000 retry))
+      (doto sb (.append "retry: ") (.append (str retry)) (.append \newline)))
+    (doseq [d data]
+      (doto sb (.append "data: ") (.append ^String d) (.append \newline)))
+    (.append sb "\n\n")
+    (.toString sb)))
 
 (defn send-event!
   "Send an SSE event in datastar format to the channel ch.
