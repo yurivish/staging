@@ -123,10 +123,30 @@
 (defn ^:private utf8-reader ^BufferedReader [^InputStream is]
   (BufferedReader. (InputStreamReader. is StandardCharsets/UTF_8)))
 
+(defn- field-value
+  "Strip the `field:` prefix, then one optional leading space, per the
+   SSE spec. `(field-value \"data: foo\" 4)` → `\"foo\"`;
+   `(field-value \"data:foo\" 4)` → `\"foo\"`;
+   `(field-value \"data:  foo\" 4)` → `\" foo\"`."
+  [^String line prefix-len]
+  (let [rest (subs line prefix-len)]
+    (if (and (pos? (.length rest)) (= \space (.charAt rest 0)))
+      (subs rest 1)
+      rest)))
+
 (defn start-sse-stream!
-  "Spawn a daemon thread that reads SSE `data:` lines from `is`, calls
-   `(parse payload)` on each, and dispatches the resulting events onto a
-   new channel. Returns `[ch stop!]`.
+  "Spawn a daemon thread that reads an SSE stream from `is` and dispatches
+   parsed events onto a new channel. Returns `[ch stop!]`.
+
+   Framing follows the SSE spec:
+     - Lines starting with `:` are comments and are skipped.
+     - `data:` fields are accumulated; multiple `data:` lines within a
+       single event are concatenated with `\\n` before dispatch.
+     - A blank line terminates the current event — the concatenated data
+       payload is passed to `(parse payload)`.
+     - `event:`, `id:`, and `retry:` are recognized as field lines (not
+       dispatched as data) and are otherwise ignored.
+     - Any pending event is flushed on stream EOF.
 
    `parse` returns a seqable of zero or more event maps (or `nil` for
    \"no events this payload\"). Each event has a `:type` keyword:
@@ -147,32 +167,57 @@
         stop!    (fn []
                    (when (compare-and-set! stopped? false true)
                      (try (.close is) (catch Throwable _))
-                     (async/close! ch)))]
+                     (async/close! ch)))
+        dispatch (fn [^StringBuilder data]
+                   (when (pos? (.length data))
+                     (let [payload (.toString data)
+                           events  (try (parse payload)
+                                        (catch Throwable t
+                                          [{:type :error :value t}]))]
+                       (doseq [ev events
+                               :while (not @stopped?)]
+                         (case (:type ev)
+                           :chunk (async/>!! ch (:value ev))
+                           :error (do (async/>!! ch (:value ev))
+                                      (reset! stopped? true))
+                           :done  (reset! stopped? true)
+                           nil)))))]
     (doto (Thread.
            ^Runnable
            (fn []
              (try
                (with-open [r (utf8-reader is)]
-                 (loop []
-                   (when-not @stopped?
-                     (let [line (try (.readLine r)
-                                     (catch Throwable _
-                                       nil))]
-                       (when (some? line)
-                         (when (.startsWith ^String line "data: ")
-                           (let [payload (subs line 6)
-                                 events  (try (parse payload)
-                                              (catch Throwable t
-                                                [{:type :error :value t}]))]
-                             (doseq [ev events
-                                     :while (not @stopped?)]
-                               (case (:type ev)
-                                 :chunk (async/>!! ch (:value ev))
-                                 :error (do (async/>!! ch (:value ev))
-                                            (reset! stopped? true))
-                                 :done  (reset! stopped? true)
-                                 nil))))
-                         (recur))))))
+                 (let [data (StringBuilder.)]
+                   (loop []
+                     (when-not @stopped?
+                       (let [line (try (.readLine r)
+                                       (catch Throwable _ nil))]
+                         (cond
+                           ;; EOF: flush any pending event and exit.
+                           (nil? line)
+                           (dispatch data)
+
+                           ;; Blank line: event boundary.
+                           (zero? (.length ^String line))
+                           (do (dispatch data)
+                               (.setLength data 0)
+                               (recur))
+
+                           ;; Comment: skip.
+                           (.startsWith ^String line ":")
+                           (recur)
+
+                           ;; `data:` field — accumulate.
+                           (.startsWith ^String line "data:")
+                           (do
+                             (when (pos? (.length data))
+                               (.append data \newline))
+                             (.append data ^String (field-value line 5))
+                             (recur))
+
+                           ;; Other fields (event:, id:, retry:) — ignored.
+                           :else
+                           (recur)))))))
                (catch Throwable t
                  (when-not @stopped?
                    (try (async/>!! ch t) (catch Throwable _))))
@@ -182,3 +227,49 @@
       (.setName "toolkit.llm-sse-reader")
       (.start))
     [ch stop!]))
+
+;; --- rate-limit decorator --------------------------------------------------
+
+(defn- make-limiter
+  "Token bucket: `:per-second` refill rate, `:burst` capacity. Computes
+   available tokens on demand from elapsed wall time — no background
+   thread. Returns a zero-arg `acquire!` fn that blocks until a token
+   is available."
+  [{:keys [per-second burst]}]
+  (let [burst-d (double burst)
+        state   (atom {:tokens burst-d :last-fill (System/nanoTime)})]
+    (fn acquire! []
+      (loop []
+        (let [now (System/nanoTime)
+              s'  (swap! state
+                    (fn [{:keys [tokens last-fill]}]
+                      (let [refill (* per-second (/ (- now last-fill) 1e9))
+                            t'     (min burst-d (+ tokens refill))]
+                        (if (>= t' 1.0)
+                          {:tokens (- t' 1.0) :last-fill now}
+                          {:tokens t' :last-fill last-fill}))))]
+          (when (< (:tokens s') 1.0)
+            (Thread/sleep (long (/ 1000.0 per-second)))
+            (recur)))))))
+
+(defn with-rate-limit
+  "Wrap `provider` with per-model token-bucket rate limiting. Blocks each
+   call until a token is available for `(:model req)`.
+
+   Config: `{:limits {model-name {:per-second N :burst M}} :default {...}}`.
+   Unknown models use `:default`. Both `-query` and `-query-stream` are
+   gated. This is best installed as the innermost decorator, so cache hits
+   and dedup-coalesced callers don't spend tokens."
+  [provider {:keys [limits default]}]
+  (let [model->limiter (into {} (for [[m cfg] limits] [m (make-limiter cfg)]))
+        default-limiter (when default (make-limiter default))
+        acquire-for     (fn [model]
+                          (let [f (or (get model->limiter model) default-limiter)]
+                            (when f (f))))]
+    (reify Provider
+      (-query [_ req]
+        (acquire-for (:model req))
+        (-query provider req))
+      (-query-stream [_ req]
+        (acquire-for (:model req))
+        (-query-stream provider req)))))

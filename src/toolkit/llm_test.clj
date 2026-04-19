@@ -245,6 +245,60 @@
     (is (= ["one " "two"] values))
     (stop)))
 
+;; --- decorator test support ------------------------------------------------
+
+(defn- stub-provider
+  "Provider for decorator tests. Invokes `query-fn`/`stream-fn` on each
+   call; records call counts and per-call args in `state`."
+  [{:keys [query-fn stream-fn]}]
+  (let [state (atom {:query-calls [] :stream-calls []})
+        p     (reify llm/Provider
+                (-query [_ req]
+                  (swap! state update :query-calls conj {:req req :t (System/nanoTime)})
+                  (query-fn req))
+                (-query-stream [_ req]
+                  (swap! state update :stream-calls conj {:req req :t (System/nanoTime)})
+                  (stream-fn req)))]
+    {:provider p :state state}))
+
+;; --- rate-limit ------------------------------------------------------------
+
+(deftest rate-limit-paces-calls
+  (let [{:keys [provider state]}
+        (stub-provider {:query-fn (fn [_] {:text "ok" :raw nil})})
+        limited (llm/with-rate-limit provider
+                  {:default {:per-second 10.0 :burst 1}})
+        ;; With burst=1, after the first call we wait ~100ms per subsequent.
+        t0      (System/nanoTime)]
+    (dotimes [_ 3]
+      (llm/query limited {:model "m" :max-tokens 10
+                          :messages [(llm/user-msg "x")]}))
+    (let [elapsed-ms (/ (- (System/nanoTime) t0) 1e6)]
+      (is (= 3 (count (:query-calls @state))))
+      (is (>= elapsed-ms 180)
+          (str "3 calls at per-second=10 burst=1 should take ~200ms+, got "
+               (long elapsed-ms) "ms")))))
+
+(deftest rate-limit-is-per-model
+  (let [{:keys [provider state]}
+        (stub-provider {:query-fn (fn [_] {:text "ok" :raw nil})})
+        ;; Fast model has a loose limit, slow model has a tight one. We only
+        ;; call the fast model, so total elapsed should stay small even
+        ;; though the slow model's limiter is also built.
+        limited (llm/with-rate-limit provider
+                  {:limits  {"fast" {:per-second 1000.0 :burst 100}
+                             "slow" {:per-second 1.0    :burst 1}}
+                   :default {:per-second 1.0 :burst 1}})
+        t0      (System/nanoTime)]
+    (dotimes [_ 5]
+      (llm/query limited {:model "fast" :max-tokens 10
+                          :messages [(llm/user-msg "x")]}))
+    (let [elapsed-ms (/ (- (System/nanoTime) t0) 1e6)]
+      (is (= 5 (count (:query-calls @state))))
+      (is (< elapsed-ms 500)
+          (str "5 fast calls should complete quickly, got "
+               (long elapsed-ms) "ms")))))
+
 (deftest stop!-closes-channel-even-with-pending-data
   (let [in        (bytes-stream (anthropic-sse-fixture))
         [ch stop] (llm/start-sse-stream! in a-parse)]
@@ -252,12 +306,74 @@
     ;; channel must eventually close; draining must terminate
     (is (some? (drain ch)) "channel drains without deadlock")))
 
+;; --- SSE framing correctness ------------------------------------------------
+
+(deftest sse-skips-comment-lines
+  (let [fixture (str/join "\n"
+                  [": this is a heartbeat"
+                   "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
+                   ""
+                   ": another comment"
+                   ""
+                   "data: {\"type\":\"message_stop\"}"
+                   ""])
+        [ch stop] (llm/start-sse-stream! (bytes-stream fixture) a-parse)]
+    (is (= ["hi"] (drain ch)))
+    (stop)))
+
+(deftest sse-accumulates-multiline-data-fields
+  ;; Per the SSE spec, multiple `data:` lines within one event are joined
+  ;; with \n before dispatch. We verify via a parser that echoes its input.
+  (let [fixture   (str/join "\n"
+                    ["data: {\"x\":"
+                     "data:  1}"
+                     ""])
+        captured  (atom nil)
+        parse     (fn [payload]
+                    (reset! captured payload)
+                    [{:type :done}])
+        [ch stop] (llm/start-sse-stream! (bytes-stream fixture) parse)]
+    (drain ch)
+    (stop)
+    (is (= "{\"x\":\n 1}" @captured)
+        "data: lines must concatenate with \\n; leading space after the colon is stripped once")))
+
+(deftest sse-handles-no-space-after-colon
+  (let [fixture   (str/join "\n"
+                    ["data:{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}"
+                     ""])
+        [ch stop] (llm/start-sse-stream! (bytes-stream fixture) a-parse)]
+    (is (= ["ok"] (drain ch)))
+    (stop)))
+
+(deftest sse-ignores-event-and-id-fields
+  (let [fixture (str/join "\n"
+                  ["event: content_block_delta"
+                   "id: 42"
+                   "retry: 1000"
+                   "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"go\"}}"
+                   ""])
+        [ch stop] (llm/start-sse-stream! (bytes-stream fixture) a-parse)]
+    (is (= ["go"] (drain ch)))
+    (stop)))
+
+(deftest sse-flushes-pending-event-on-eof
+  ;; No trailing blank line — event must still dispatch on EOF.
+  (let [fixture   "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"end\"}}"
+        [ch stop] (llm/start-sse-stream! (bytes-stream fixture) a-parse)]
+    (is (= ["end"] (drain ch)))
+    (stop)))
+
 (deftest parser-may-return-multiple-events-per-payload
   ;; A stateful wrapper (e.g. future incremental-JSON parser that buffers
   ;; accumulated text) must be free to emit more than one event for a
   ;; single SSE payload. Simulate that here with a parser that splits the
   ;; payload on `|` and emits a :chunk per segment.
-  (let [fixture  "data: a|b|c\ndata: d|done\n"
+  (let [fixture  (str/join "\n"
+                   ["data: a|b|c"
+                    ""
+                    "data: d|done"
+                    ""])
         parse    (fn [payload]
                    (let [parts (str/split payload #"\|")]
                      (mapv (fn [p]
