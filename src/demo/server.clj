@@ -1,7 +1,7 @@
 (ns demo.server
   (:require
    [clojure.core.async :refer [alt! chan close! go-loop timeout]]
-   [datastar.core :as d]
+   [toolkit.datastar.core :as d]
    [com.stuartsierra.component :as component]
    [hiccup2.core :as h]
    [ring.util.http-response :as r]

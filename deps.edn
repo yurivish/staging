@@ -16,20 +16,36 @@
          metosin/ring-http-response {:mvn/version "0.9.5"}
          com.stuartsierra/component {:mvn/version "1.1.0"}
          com.aayushatharva.brotli4j/brotli4j
-         {:mvn/version "1.22.0"}}
+         {:mvn/version "1.22.0"}
+         ;; lmdbjava bundles native libs for linux/mac/windows; no JNI
+         ;; compile on our end. Needs --add-opens JVM flags (below) on
+         ;; JDK 16+ so it can reflect into DirectByteBuffer internals.
+         org.lmdbjava/lmdbjava     {:mvn/version "0.9.3"}
+         ;; H2 ships the MVStore classes in the main jar. We only touch
+         ;; org.h2.mvstore.* — no JDBC, no SQL engine.
+         com.h2database/h2         {:mvn/version "2.3.232"}}
  ;; brotli4j calls System.loadLibrary, which trips JDK 24+ restricted-method warnings.
  ;; Granting native access to the unnamed module silences them.
+ ;;
+ ;; --add-opens for java.nio/sun.nio.ch is required by lmdbjava; without it,
+ ;; the first ByteBuffer op throws InaccessibleObjectException.
  :aliases
- {:run {:jvm-opts  ["--enable-native-access=ALL-UNNAMED"]
+ {:run {:jvm-opts  ["--enable-native-access=ALL-UNNAMED"
+                    "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                    "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
         :main-opts ["-e" "(do (set! *warn-on-reflection* true) nil)" "-m" "demo.server"]}
   :dev {:extra-paths ["dev"]
-        :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
+        :jvm-opts    ["--enable-native-access=ALL-UNNAMED"
+                      "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                      "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
         :extra-deps  {org.clojure/tools.namespace {:mvn/version "1.5.0"}
                       org.clojure/test.check      {:mvn/version "1.1.1"}}
         :main-opts   ["-e" "(user/start!)" "-r"]}
   :test {:extra-deps {org.clojure/test.check            {:mvn/version "1.1.1"}
                       io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :jvm-opts   ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                      "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
          :exec-fn    cognitect.test-runner.api/test
          :exec-args  {:dirs ["src"] :patterns [".*-test$"]}}
   ;; Check for outdated deps: clojure -M:outdated

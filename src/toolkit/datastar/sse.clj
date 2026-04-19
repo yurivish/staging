@@ -1,4 +1,4 @@
-(ns datastar.sse
+(ns toolkit.datastar.sse
   "Support for Server-Sent Events over http-kit.
 
    Fields are ordered to match the Datastar spec (event, id, retry, data):

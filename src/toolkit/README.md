@@ -102,6 +102,82 @@ your own macro around `sub` if you want `&form` line numbers) and debug
 subs that see the full match result (call `(sublist/match ...)` directly
 if you want to inspect routing).
 
+### `toolkit.lmdb`
+
+Thin Clojure wrapper over `org.lmdbjava/lmdbjava`. One or more envs per
+process, each holding named Dbis; a single write txn spans every Dbi in
+its env so cross-Dbi updates are atomic.
+
+```clojure
+(require '[toolkit.lmdb :as lmdb])
+
+(def env   (lmdb/open-env "/tmp/mydb" {:max-dbs 4}))
+(def users (lmdb/open-dbi env "users"    {:key-codec lmdb/string-codec
+                                          :val-codec lmdb/string-codec}))
+(def index (lmdb/open-dbi env "by-email" {:key-codec lmdb/string-codec
+                                          :val-codec lmdb/string-codec}))
+
+(lmdb/put! users "alice" "{:age 30}")        ; one-shot auto-txn
+
+(lmdb/with-txn [t env :write]                ; cross-Dbi atomic write
+  (lmdb/put! t users "bob"       "{:age 42}")
+  (lmdb/put! t index "b@x.com"   "bob"))
+
+(lmdb/scan users (lmdb/prefix "a"))
+;; => [["alice" "{:age 30}"]]
+```
+
+Public:
+- `open-env` / `close-env`, `open-dbi` — env + Dbi lifecycle. Dbis
+  don't need closing; env close tears them all down.
+- `raw-codec` / `string-codec` / `long-be-codec` — built-in codecs.
+  A codec is `{:encode :decode}`; bring nippy/fressian/edn yourself.
+- `with-txn [t env mode]` — one unified macro, `mode` is `:read` or
+  `:write`. Write txns commit on normal exit, abort on throw.
+- `put!` / `get` / `exists?` / `delete!` — 2-arg form opens a
+  one-shot txn; 3-arg form `(put! txn dbi k v)` reuses an explicit
+  one (use this inside `with-txn`).
+- Range builders: `all`, `all-backward`, `at-least`, `at-most`,
+  `greater-than`, `less-than`, `closed`, `closed-open`, `open-closed`,
+  `open`, `prefix`. Each returns a plain data vector.
+- `reduce-range` / `scan` / `count-range` — consume a range.
+  `reduce-range` supports `reduced` for early termination.
+- `Store` / `map->Store` / `dbi` — Stuart Sierra component that
+  opens an env + a map of named Dbis on `start`, closes them on
+  `stop`. Configure with `:path`, `:env-opts`, and `:dbi-specs` (a
+  seq of per-Dbi spec maps including `:name`).
+
+Setup: the namespace needs these JVM flags on JDK 16+ (already added
+to `:run`, `:dev`, and `:test` in the project's `deps.edn`):
+
+```
+--add-opens=java.base/java.nio=ALL-UNNAMED
+--add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+```
+
+Without them, the first ByteBuffer operation throws
+`InaccessibleObjectException` — lmdbjava reflects into
+`DirectByteBuffer` internals.
+
+Gotchas:
+- `map-size` (default 1 GiB) is a **hard ceiling**. Exceeding it
+  throws `MapFullException`; pick generously since it's address
+  space, not disk.
+- Keys default to 511 bytes max; values are unbounded.
+- Never return a seq of raw LMDB buffers across a txn boundary —
+  backing memory is invalid after close. This wrapper copies bytes
+  out on every read path, so the values you get back are safe.
+- Read txns pin the MVCC snapshot; don't hold them across long work
+  or the DB file will grow.
+- Inside `with-txn`, always use the 3-arg form of `put!`/`get`/...;
+  the 2-arg form opens a new txn and (for writes) self-deadlocks
+  because LMDB serializes writers.
+
+v1 intentionally excludes `DUPSORT`, `INTEGERKEY`, a cursor
+escape-hatch, and auto-grow on `MapFullException` — see the
+`future work` comment block at the bottom of `lmdb.clj` for where
+they'd slot in.
+
 ## Canonical `dev/user.clj`
 
 Copy this into your project and adjust the component wiring:

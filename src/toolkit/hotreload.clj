@@ -20,7 +20,7 @@
    ;; See the "refresh orphans Vars" gotcha in toolkit/README.md.
   {:clojure.tools.namespace.repl/load false
    :clojure.tools.namespace.repl/unload false}
-  (:require [datastar.core :as d]))
+  (:require [toolkit.datastar.core :as d]))
 
 (def path "/hot-reload")
 

@@ -9,7 +9,7 @@
   (:require
    [clojure.core.async :refer [alt! chan close! go-loop timeout]]
    [com.stuartsierra.component :as component]
-   [datastar.core :as d]
+   [toolkit.datastar.core :as d]
    [hiccup2.core :as h]
    [org.httpkit.server :as hk]
    [toolkit.hotreload :as hotreload]))

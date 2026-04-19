@@ -1,19 +1,19 @@
-(ns datastar.core
+(ns toolkit.datastar.core
   (:require
    [clojure.data.json :as json]
    [clojure.java.io :as io]
    [clojure.string :as string]
-   [datastar.sse]
+   [toolkit.datastar.sse]
    [hiccup2.core :as h]
    [hiccup.util :as hu]))
 
 ;; re-export sse functions for user convenience.
 ;; exported as vars for interactive development.
 ;; claude says the runtime cost is a few pointer dereferences per call.
-(def sse-stream   #'datastar.sse/stream)
-(def sse-response #'datastar.sse/response)
-(def sse-send!    #'datastar.sse/send!)
-(def sse-close!   #'datastar.sse/close!)
+(def sse-stream   #'toolkit.datastar.sse/stream)
+(def sse-response #'toolkit.datastar.sse/response)
+(def sse-send!    #'toolkit.datastar.sse/send!)
+(def sse-close!   #'toolkit.datastar.sse/close!)
 
 (defn- elements-list
   "Given a hiccup html representation, return a string of datastar-style 'elements' data lines"
@@ -42,7 +42,7 @@
 
    See https://github.com/starfederation/datastar/blob/main/sdk/ADR.md#serversenteventgeneratorsend"
   [sse opts]
-  (datastar.sse/send! sse (lines opts)))
+  (toolkit.datastar.sse/send! sse (lines opts)))
 
 (defn- patch-elements-core
   [elements & {:keys [selector mode use-view-transition namespace] :as opts}]
