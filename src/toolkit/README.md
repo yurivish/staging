@@ -108,6 +108,11 @@ Thin Clojure wrapper over `org.lmdbjava/lmdbjava`. One or more envs per
 process, each holding named Dbis; a single write txn spans every Dbi in
 its env so cross-Dbi updates are atomic.
 
+Every single-op helper (`put!`/`get`/`exists?`/`delete!`/`scan`/…) takes
+a *context* as the first arg — either an `Env` (opens a one-shot txn)
+or a `Txn` (reuses the one you have). Call shape is identical either
+way; you just thread the context you own.
+
 ```clojure
 (require '[toolkit.lmdb :as lmdb])
 
@@ -117,14 +122,17 @@ its env so cross-Dbi updates are atomic.
 (def index (lmdb/open-dbi env "by-email" {:key-codec lmdb/string-codec
                                           :val-codec lmdb/string-codec}))
 
-(lmdb/put! users "alice" "{:age 30}")        ; one-shot auto-txn
+(lmdb/put! env users "alice" "{:age 30}")    ; env ctx → one-shot txn
 
 (lmdb/with-txn [t env :write]                ; cross-Dbi atomic write
-  (lmdb/put! t users "bob"       "{:age 42}")
-  (lmdb/put! t index "b@x.com"   "bob"))
+  (lmdb/put! t users "bob"     "{:age 42}")
+  (lmdb/put! t index "b@x.com" "bob"))
 
-(lmdb/scan users (lmdb/prefix "a"))
+(lmdb/scan env users (lmdb/prefix "a"))
 ;; => [["alice" "{:age 30}"]]
+
+(into {} (lmdb/range-reducible env users (lmdb/all)))
+;; => {"alice" "{:age 30}", "bob" "{:age 42}"}
 ```
 
 Public:
@@ -134,14 +142,32 @@ Public:
   A codec is `{:encode :decode}`; bring nippy/fressian/edn yourself.
 - `with-txn [t env mode]` — one unified macro, `mode` is `:read` or
   `:write`. Write txns commit on normal exit, abort on throw.
-- `put!` / `get` / `exists?` / `delete!` — 2-arg form opens a
-  one-shot txn; 3-arg form `(put! txn dbi k v)` reuses an explicit
-  one (use this inside `with-txn`).
+- `put!` / `get` / `exists?` / `delete!` — `(op ctx dbi k ...)` where
+  `ctx` is an `Env` or `Txn`. `get` takes a `not-found` arity matching
+  `clojure.core/get`.
+- `put-new!` — insert-if-absent; returns `true` if the key was new,
+  `false` if it already existed.
+- `bulk-append!` — MDB_APPEND fast path for batch loads. `(bulk-append!
+  ctx dbi kv-pairs)` takes any reducible of `[k v]` pairs; sorts them
+  by encoded-byte order internally, inserts under an env-or-txn ctx.
+  Pass `{:presorted? true}` to skip the sort. When called with a
+  caller's `Txn`, the batch commits or aborts with the surrounding
+  txn — atomic bundling with other writes.
 - Range builders: `all`, `all-backward`, `at-least`, `at-most`,
   `greater-than`, `less-than`, `closed`, `closed-open`, `open-closed`,
   `open`, `prefix`. Each returns a plain data vector.
+- `range-reducible` — an `IReduceInit` yielding `MapEntry` pairs;
+  composes with `reduce`/`transduce`/`into`. Reduce-only (not seq).
 - `reduce-range` / `scan` / `count-range` — consume a range.
-  `reduce-range` supports `reduced` for early termination.
+  `reduce-range` uses a 3-arg `(fn [acc k v])` reducer for the hot
+  path (skips the per-row MapEntry allocation). All support early
+  termination via `reduced`.
+- `env-stats` / `env-info` / `dbi-stats` / `reader-check` —
+  observability; return plain maps / ints.
+- `sync!` — fdatasync the env (only needed with `:no-sync`).
+- `copy-env!` — hot-copy the env to another directory (takes
+  `{:compact? true}` to rewrite without free space).
+- `clear-dbi!` / `drop-dbi!` — empty or delete a Dbi.
 - `Store` / `map->Store` / `dbi` — Stuart Sierra component that
   opens an env + a map of named Dbis on `start`, closes them on
   `stop`. Configure with `:path`, `:env-opts`, and `:dbi-specs` (a
@@ -169,9 +195,9 @@ Gotchas:
   out on every read path, so the values you get back are safe.
 - Read txns pin the MVCC snapshot; don't hold them across long work
   or the DB file will grow.
-- Inside `with-txn`, always use the 3-arg form of `put!`/`get`/...;
-  the 2-arg form opens a new txn and (for writes) self-deadlocks
-  because LMDB serializes writers.
+- LMDB allows only one txn per thread. Inside `with-txn`, thread the
+  bound txn as the `ctx` arg to every helper — passing the env instead
+  tries to open a second txn on the same thread and fails fast.
 
 v1 intentionally excludes `DUPSORT`, `INTEGERKEY`, a cursor
 escape-hatch, and auto-grow on `MapFullException` — see the
