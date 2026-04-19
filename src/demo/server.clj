@@ -1,6 +1,6 @@
 (ns demo.server
   (:require
-   ;; [clojure.core.async :refer [alt! chan close! go-loop timeout]]
+   [clojure.core.async :refer [alt! chan close! go-loop timeout]]
    [datastar.core :as d]
    [com.stuartsierra.component :as component]
    [hiccup2.core :as h]
@@ -25,6 +25,7 @@
   (page {:body (h/html
                 [:div @(:counter app)]
                 [:button {:data-on:click "@get('/inc')"} "click meeep"]
+                [:button {:data-on:click "@get('/loading')"} "start loading"]
                 [:span (random-uuid)]
                 [:div#loading])
          :dev? (:dev? app)}))
@@ -43,17 +44,32 @@
 (defn index-handler [app]
   (fn [_] (index-page app)))
 
+(defn loading-handler [_app]
+  (fn [req]
+    (let [closed (chan)]
+      (d/sse-stream
+       req
+       {:on-open  (fn [sse]
+                    (go-loop [n 0]
+                      (d/patch-elements sse [:div#loading (str n)])
+                      (if (>= n 10)
+                        (d/sse-close! sse)
+                        (alt! closed        :done
+                              (timeout 500) (recur (inc n))))))
+        :on-close (fn [_sse _status] (close! closed))}))))
+
 (defn app-routes [app]
   (ring/ring-handler
    (ring/router
     [["/", (index-handler app)]
      ["/stream" r/ok]
+     ["/loading" (loading-handler app)]
      ["/inc" (inc-handler app)]
      (when (:dev? app) [hotreload/path hotreload/handler])])
    (static-handler (:dev? app))))
 
+;; Component representing app state.
 (defrecord App [counter bg-color dev?]
-  "Component representing app state."
   component/Lifecycle
   (start [this]
     (assoc this
@@ -62,8 +78,8 @@
   (stop [this]
     (assoc this :counter nil :bg-color nil)))
 
+;; Component representing a web server.
 (defrecord Server [port app dev? stop-fn]
-  "Component representing a web server."
   component/Lifecycle
   (start [this]
     (println (str "http://star.test:" port))
