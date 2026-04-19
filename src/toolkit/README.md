@@ -31,6 +31,64 @@ Public:
 - `reload!` — the stop/refresh/before-start/start dance; takes plain fns so it
   doesn't know about your `sys` atom.
 
+### `toolkit.sublist`
+
+NATS-style subject routing trie. Subscribers register against subject
+patterns with `*` (single-token) and `>` (tail) wildcards; publishers look up
+matches by literal subject. Queue groups are supported — `pick-one` collapses
+a match result into a flat delivery set by load-balancing within each group.
+
+```clojure
+(let [sl (sublist/make)]
+  (sublist/insert! sl "foo.*.baz" :a)
+  (sublist/insert! sl "foo.>"     :b)
+  (sublist/match sl "foo.bar.baz"))
+;; => {:plain #{:a :b} :groups {}}
+```
+
+Public:
+- `make` — returns a fresh sublist (an atom).
+- `insert!` / `remove!` — register and unregister `(subject, value, queue)`.
+  Idempotent; `remove!` prunes empty branches on the way out.
+- `match` — returns `{:plain #{...} :groups {queue-name #{...}}}`.
+- `pick-one` — flattens a match result for delivery.
+- `valid-pattern?` / `valid-subject?` — non-throwing predicates.
+
+Subscriptions are value-deduped. If a pubsub layer on top wants Go-style
+multi-delivery (one handle per `sub` call even for identical handlers),
+wrap the stored value with a unique token — e.g. `{:handler f ::id (gensym)}`.
+
+### `toolkit.pubsub`
+
+Subject-based pub/sub on top of `toolkit.sublist`. Handlers run
+synchronously on the publisher's thread; a thrown handler is logged to
+`*err*` and does not block the rest.
+
+```clojure
+(let [ps (pubsub/make)]
+  (pubsub/sub ps "foo.*" (fn [subj msg] (println subj "→" msg)))
+  (pubsub/pub ps "foo.bar" :hello))
+;; prints: foo.bar → :hello
+```
+
+Public:
+- `make` — returns a fresh pubsub.
+- `sub` — subscribes a handler `(fn [subject message])` to a subject
+  pattern. Opts: `{:queue name :id any}`. Returns a zero-arg unsub fn
+  (idempotent). Two `sub` calls with the same handler + subject yield
+  two independent subscriptions.
+- `pub` — delivers a message to all matching subs; one-per-group for
+  queue-group subs.
+- `sub-chan` — returns `[ch stop!]`; messages flow onto `ch` via `put!`,
+  `stop!` unsubs and closes the channel.
+- `valid-pattern?` / `valid-subject?` — re-exported from sublist.
+
+What's intentionally not included: handler source-location capture
+(stack-walking is awkward in Clojure; use `:id` for labels, or build
+your own macro around `sub` if you want `&form` line numbers) and debug
+subs that see the full match result (call `(sublist/match ...)` directly
+if you want to inspect routing).
+
 ## Canonical `dev/user.clj`
 
 Copy this into your project and adjust the component wiring:

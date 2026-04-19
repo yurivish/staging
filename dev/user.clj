@@ -3,13 +3,14 @@
             [com.stuartsierra.component :as component]
             [toolkit.dev :as dev]
             [toolkit.hotreload :as hr]
-            [toolkit.watcher :as watcher]
             ;; Eager-load so compile errors surface at REPL start. We don't
             ;; alias — dev-system resolves factories dynamically (see the
             ;; toolkit README for why).
             [demo.server]))
 
-(repl/set-refresh-dirs "src/demo")
+(def refresh-dir "src")
+
+(repl/set-refresh-dirs refresh-dir)
 
 ;; Two independent lifecycles. The file watcher lives outside the app system
 ;; so a failed refresh doesn't kill it — otherwise fixing the syntax error
@@ -21,23 +22,18 @@
 (declare reload!)
 
 (defn- dev-system []
-  (component/system-map
-   :app-state ((requiring-resolve 'demo.server/map->AppState) {})
-   :server    (component/using
-               ((requiring-resolve 'demo.server/map->Server)
-                {:port 8080 :dev? true})
-               [:app-state])))
+  ((requiring-resolve 'demo.server/prod-system) {:port 8080 :dev? true}))
 
 (defn- start-sys! [] (alter-var-root #'sys #(or % (component/start (dev-system)))))
 (defn- stop-sys!  [] (alter-var-root #'sys (fn [s] (some-> s component/stop) nil)))
 
 (defn start! []
   (alter-var-root #'fw
-    (fn [w]
-      (or w
-          (component/start
-           ((requiring-resolve 'toolkit.watcher/map->FileWatcher)
-            {:dir "src/demo" :interval-ms 100 :on-change #(reload!)})))))
+                  (fn [w]
+                    (or w
+                        (component/start
+                         ((requiring-resolve 'toolkit.watcher/map->FileWatcher)
+                          {:dir refresh-dir :interval-ms 100 :on-change #(reload!)})))))
   (start-sys!))
 
 (defn stop! []
