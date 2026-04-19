@@ -1,14 +1,19 @@
 (ns toolkit.watcher
-  "Polling file watcher as a Stuart Sierra component. On any change under
-   `:dir`, invokes `:on-change` on a detached thread so a slow callback
-   doesn't back up the poll loop (and so the callback is free to stop this
-   component as part of its work)."
+  "Polling file watcher as a Stuart Sierra component. Configured with a seq
+   of `:watches` — each watch has its own `:dir`, `:include?` predicate, and
+   `:on-change` callback. A single scheduler thread polls every watch in
+   turn and runs each callback inline on that same thread, so a slow
+   callback does back up the poll loop. Thrown callbacks are caught and
+   logged; they don't cancel the scheduler."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.stuartsierra.component :as component])
   (:import [java.nio.file Files LinkOption]
            [java.nio.file.attribute BasicFileAttributes]
            [java.util.concurrent Executors TimeUnit]))
+
+(defn clj-file? [^java.io.File f]
+  (str/ends-with? (.getName f) ".clj"))
 
 (defn- path-attrs [path]
   (try
@@ -19,41 +24,42 @@
        :mtime (.toMillis (.lastModifiedTime a))})
     (catch Exception _ nil)))
 
-(defn- scan [dir]
+(defn- scan [dir include?]
   (->> (file-seq (io/file dir))
-       (filter #(and (.isFile %) (str/ends-with? (.getName %) ".clj")))
-       (keep #(some->> (path-attrs (.toPath %)) (vector (str %))))
+       (filter #(and (.isFile ^java.io.File %) (include? %)))
+       (keep #(some->> (path-attrs (.toPath ^java.io.File %)) (vector (str %))))
        (into {})))
 
 (defn- log-err [msg t]
   (binding [*out* *err*]
     (println "[watcher]" msg)
-    (when t (.printStackTrace t *err*))))
+    (when t (.printStackTrace ^Throwable t *err*))))
 
-(defrecord FileWatcher [dir on-change interval-ms executor]
+(defrecord FileWatcher [watches interval-ms executor]
   component/Lifecycle
   (start [this]
-    (let [snap (atom (scan dir))
+    (let [snap (atom (mapv (fn [{:keys [dir include?]}] (scan dir include?)) watches))
           exec (Executors/newSingleThreadScheduledExecutor)
           ms   (or interval-ms 100)]
       (.scheduleAtFixedRate
         exec
         (fn poll []
           (try
-            (let [t0  (System/currentTimeMillis)
-                  now (scan dir)
-                  dt  (- (System/currentTimeMillis) t0)]
-              (when (> dt 50)
-                (log-err (str "scan took " dt "ms") nil))
-              (when (not= now @snap)
-                (reset! snap now)
-                ;; Run the callback off the scheduler thread so it can
-                ;; safely stop this watcher, and so a slow callback
-                ;; doesn't back up the polling loop.
-                (future
-                  (try (on-change)
-                       (catch Throwable t
-                         (log-err "on-change threw" t))))))
+            (let [t0 (System/currentTimeMillis)]
+              (dotimes [i (count watches)]
+                (let [{:keys [dir include? on-change]} (nth watches i)
+                      now  (scan dir include?)
+                      prev (nth @snap i)]
+                  (when (not= now prev)
+                    (swap! snap assoc i now)
+                    ;; Inline on the scheduler thread: a slow callback
+                    ;; intentionally backs up the poll loop.
+                    (try (on-change)
+                         (catch Throwable t
+                           (log-err (str "on-change threw for " dir) t))))))
+              (let [dt (- (System/currentTimeMillis) t0)]
+                (when (> dt 50)
+                  (log-err (str "poll took " dt "ms") nil))))
             ;; scheduleAtFixedRate silently cancels future runs on throw.
             (catch Throwable t
               (log-err "poll threw" t))))

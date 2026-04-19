@@ -1,9 +1,10 @@
 ;; Commands:
 ;;   clojure -M:dev                    — start the REPL (dev alias)
 ;;   clojure -M:run                    — run the server entrypoint
+;;   clojure -X:test                   — run the tests
 ;;   clojure -M:outdated               — list outdated deps (via antq)
 ;;   clojure -M:outdated --upgrade     — upgrade outdated deps in place
-{:paths ["src"]
+{:paths ["src" "resources"]
  :deps  {org.clojure/clojure       {:mvn/version "1.12.4"}
          org.clojure/core.async    {:mvn/version "1.9.865"}
          ;; 2.8.x has a regression (#578/#579) where on-close never fires on client
@@ -26,6 +27,11 @@
         :extra-deps  {org.clojure/tools.namespace {:mvn/version "1.5.0"}
                       org.clojure/test.check      {:mvn/version "1.1.1"}}
         :main-opts   ["-e" "(user/start!)" "-r"]}
+  :test {:extra-deps {org.clojure/test.check            {:mvn/version "1.1.1"}
+                      io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :exec-fn    cognitect.test-runner.api/test
+         :exec-args  {:dirs ["src"] :patterns [".*-test$"]}}
   ;; Check for outdated deps: clojure -M:outdated
   ;; Upgrade in place:        clojure -M:outdated --upgrade
   :outdated {:deps      {com.github.liquidz/antq {:mvn/version "RELEASE"}

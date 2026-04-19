@@ -1,5 +1,5 @@
 (ns toolkit.sublist-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [are deftest is testing]]
             [toolkit.sublist :as sl])
   (:import [clojure.lang ExceptionInfo]))
 
@@ -39,23 +39,25 @@
 (deftest validation-rejection-reasons
   (let [s (sl/make)]
     (testing "pattern validation (insert)"
-      (is (= :empty-subject       (reason #(sl/insert! s ""        :v))))
-      (is (= :empty-subject       (reason #(sl/insert! s nil       :v))))
-      (is (= :empty-token         (reason #(sl/insert! s "foo..b"  :v))))
-      (is (= :empty-token         (reason #(sl/insert! s ".foo"    :v))))
-      (is (= :empty-token         (reason #(sl/insert! s "foo."    :v))))
-      (is (= :fwc-not-final       (reason #(sl/insert! s ">.foo"   :v))))
-      (is (= :fwc-not-final       (reason #(sl/insert! s "foo.>.b" :v))))
-      (is (= :bad-wildcard        (reason #(sl/insert! s "foo*"    :v))))
-      (is (= :bad-wildcard        (reason #(sl/insert! s "foo.*bar" :v))))
-      (is (= :bad-wildcard        (reason #(sl/insert! s "foo.>x"  :v))))
-      (is (= :whitespace-in-token (reason #(sl/insert! s "foo.b ar" :v))))
-      (is (= :whitespace-in-token (reason #(sl/insert! s "foo.b\tar" :v)))))
+      (are [pattern expected] (= expected (reason #(sl/insert! s pattern :v)))
+        ""          :empty-subject
+        nil         :empty-subject
+        "foo..b"    :empty-token
+        ".foo"      :empty-token
+        "foo."      :empty-token
+        ">.foo"     :fwc-not-final
+        "foo.>.b"   :fwc-not-final
+        "foo*"      :bad-wildcard
+        "foo.*bar"  :bad-wildcard
+        "foo.>x"    :bad-wildcard
+        "foo.b ar"  :whitespace-in-token
+        "foo.b\tar" :whitespace-in-token))
 
     (testing "subject validation (match) additionally rejects wildcards"
-      (is (= :wildcard-in-subject (reason #(sl/match s "foo.*"))))
-      (is (= :wildcard-in-subject (reason #(sl/match s "foo.>"))))
-      (is (= :empty-token         (reason #(sl/match s "foo..bar")))))
+      (are [subject expected] (= expected (reason #(sl/match s subject)))
+        "foo.*"    :wildcard-in-subject
+        "foo.>"    :wildcard-in-subject
+        "foo..bar" :empty-token))
 
     (testing "valid-pattern? / valid-subject? are non-throwing predicates"
       (is (true?  (sl/valid-pattern? "foo.bar.*")))
@@ -67,15 +69,15 @@
 (deftest prune-to-empty
   (let [s          (sl/make)
         fresh      @(sl/make)
-        operations [["a.b.c" :x nil]
-                    ["a.*.c" :y {:queue "g"}]
-                    ["a.>"   :z nil]
-                    [">"     :w nil]
-                    ["a.b.c" :dup {:queue "g"}]]]
-    (doseq [[subj v opts] operations]
-      (if opts (sl/insert! s subj v opts) (sl/insert! s subj v)))
-    (doseq [[subj v opts] operations]
-      (if opts (sl/remove! s subj v opts) (sl/remove! s subj v)))
+        operations [["a.b.c" :x   nil]
+                    ["a.*.c" :y   "g"]
+                    ["a.>"   :z   nil]
+                    [">"     :w   nil]
+                    ["a.b.c" :dup "g"]]]
+    (doseq [[subj v q] operations]
+      (sl/insert! s subj v (when q {:queue q})))
+    (doseq [[subj v q] (shuffle operations)]
+      (sl/remove! s subj v (when q {:queue q})))
     (is (= fresh @s)
         "after removing every inserted sub the trie should structurally match a fresh one")))
 

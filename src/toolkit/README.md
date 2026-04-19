@@ -7,22 +7,35 @@ app. Assumes the app uses Stuart Sierra's `component` for lifecycle.
 
 ### `toolkit.watcher`
 
-A polling `FileWatcher` component. Start it with `:dir`, `:interval-ms`, and
-`:on-change`; on any change under the directory (recursive, `.clj` files only)
-it invokes `on-change` on a detached thread. Stopping the component shuts
+A polling `FileWatcher` component. Configured with `:interval-ms` and
+`:watches` — a seq of `{:dir :include? :on-change}` maps. A single scan
+thread polls every watch; each watch's `on-change` fires on a detached
+thread when files under its `:dir` matching its `:include?` predicate
+change. `watcher/clj-file?` is exported for the common case; use
+`(constantly true)` to match everything. Stopping the component shuts
 down the scan thread.
 
 ### `toolkit.hotreload`
 
 Datastar-based browser reload: the page opens an SSE to `/hot-reload` which
-retries across server reboots. The first reconnect after `arm!` receives
-`window.location.reload()`; further reconnects park silently.
+retries across server reboots. Two paths fire a reload, for different
+situations:
+
+- **Server-restart path (`arm!`)** — for flows where the server process is
+  coming down (code reload). Set the flag; the *next* SSE reconnect (which
+  the restart forces) sends `window.location.reload()`.
+- **Push path (`reload-now!`)** — for flows where the server stays up (a
+  static-asset change). Broadcasts the reload script over every currently
+  open SSE, no reconnect needed.
 
 Public:
 - `path` — route the SSE attaches to (`"/hot-reload"` by convention).
 - `snippet` — hiccup `<div data-init="@get(...)">` to inject in dev pages.
 - `handler` — the SSE handler. Register at `path`.
-- `arm!` — reset the once-flag. Call from your reload orchestration.
+- `arm!` — arm for a reload on the next reconnect. Use when the server is
+  about to restart.
+- `reload-now!` — push a reload to every currently connected client. Use
+  when the server stays running.
 
 ### `toolkit.dev`
 
@@ -73,7 +86,7 @@ synchronously on the publisher's thread; a thrown handler is logged to
 
 Public:
 - `make` — returns a fresh pubsub.
-- `sub` — subscribes a handler `(fn [subject message])` to a subject
+- `sub` — subscribes a handler `(fn [subject msg])` to a subject
   pattern. Opts: `{:queue name :id any}`. Returns a zero-arg unsub fn
   (idempotent). Two `sub` calls with the same handler + subject yield
   two independent subscriptions.
@@ -132,8 +145,10 @@ Copy this into your project and adjust the component wiring:
     (fn [w]
       (or w
           (component/start
-           ((requiring-resolve 'toolkit.watcher/map->FileWatcher)
-            {:dir "src/myapp" :interval-ms 100 :on-change #(reload!)})))))
+           (watcher/map->FileWatcher
+            {:interval-ms 100
+             :watches [{:dir "src/myapp"         :include? watcher/clj-file?  :on-change reload!}
+                       {:dir "resources/public"  :include? (constantly true)  :on-change hr/arm!}]})))))
   (start-sys!))
 
 (defn stop! []
@@ -184,8 +199,8 @@ first one for you; the second one is still the app's responsibility.
 thread-locally bound var — it can't modify a root binding. A REPL thread
 always has `*ns*` bound as a thread-local; a bare background thread does not.
 
-The watcher dispatches `on-change` via `future`, which runs on a thread
-without `*ns*` bound. So `toolkit.dev/refresh` wraps the call in `binding`:
+The watcher runs `on-change` inline on its scheduler thread, which has no
+`*ns*` thread-local. So `toolkit.dev/refresh` wraps the call in `binding`:
 
 ```clojure
 (binding [*ns* (the-ns 'toolkit.dev)] (repl/refresh))

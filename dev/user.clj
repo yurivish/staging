@@ -3,12 +3,26 @@
             [com.stuartsierra.component :as component]
             [toolkit.dev :as dev]
             [toolkit.hotreload :as hr]
+            [toolkit.watcher :as watcher]
             ;; Eager-load so compile errors surface at REPL start. We don't
             ;; alias — dev-system resolves factories dynamically (see the
             ;; toolkit README for why).
             [demo.server]))
 
 (def refresh-dir "src")
+;; Path excluded from the autoreload watcher. dev/user.clj is outside
+;; set-refresh-dirs so its compiled bytecode survives refresh, but that
+;; also means its Var refs to this ns's deps get orphaned on reload.
+;; toolkit.hotreload is the one dep where that's a correctness bug
+;; (it holds the `armed` atom whose identity matters), so it opts out
+;; of tools.namespace reload in its ns decl — and we mirror that here
+;; so saving the file doesn't fire a no-op reload cycle.
+(def nonreloadable-file "src/toolkit/hotreload.clj")
+(def static-dir  "resources/public")
+
+(defn- reloadable-clj? [^java.io.File f]
+  (and (watcher/clj-file? f)
+       (not= (.getPath f) nonreloadable-file)))
 
 (repl/set-refresh-dirs refresh-dir)
 
@@ -32,8 +46,11 @@
                   (fn [w]
                     (or w
                         (component/start
-                         ((requiring-resolve 'toolkit.watcher/map->FileWatcher)
-                          {:dir refresh-dir :interval-ms 100 :on-change #(reload!)})))))
+                         (watcher/map->FileWatcher
+                          {:interval-ms 100
+                           :watches [{:dir refresh-dir :include? reloadable-clj?       :on-change reload!}
+                                     ;; note: edit this if we want to filter out large directories
+                                     {:dir static-dir  :include? (constantly true)     :on-change hr/reload-now!}]})))))
   (start-sys!))
 
 (defn stop! []

@@ -1,32 +1,59 @@
 (ns demo.server
   (:require
    ;; [clojure.core.async :refer [alt! chan close! go-loop timeout]]
+   [datastar.core :as d]
    [com.stuartsierra.component :as component]
-   ;; [datastar.core :as d]
-   ;; [hiccup2.core :as h]
+   [hiccup2.core :as h]
    [ring.util.http-response :as r]
    [org.httpkit.server :as hk]
    [reitit.ring :as ring]
-   #_[toolkit.hotreload :as hotreload]))
+   [toolkit.hotreload :as hotreload]))
 
-(defn handler [_]
-  {:status 200, :body "ok"})
+(def datastar-cdn "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js")
+
+(defn page [{:keys [head body dev?]}]
+  (-> (r/ok (str "<!doctype html>"
+                 (h/html
+                  [:html
+                   [:head
+                    head
+                    [:script {:type "module" :defer true :src datastar-cdn}]]
+                   [:body {:data-init "@get('/stream')"} body (when dev? hotreload/snippet)]])))
+      (r/content-type "text/html; charset=utf-8")))
+
+(defn index-page [app]
+  (page {:body (h/html
+                [:div @(:counter app)]
+                [:button {:data-on:click "@get('/inc')"} "click meeep"]
+                [:span (random-uuid)]
+                [:div#loading])
+         :dev? (:dev? app)}))
 
 (defn inc-handler [app]
   (fn [_]
+    (println "incrementing counter: " @(:counter app))
     (swap! (:counter app) inc)
-    (r/ok (str @(:counter app)))))
+    (index-page app)))
 
-(defn app-routes [app _dev?]
+(defn static-handler [dev?]
+  (if dev?
+    (ring/create-file-handler     {:path "/static" :root "resources/public"})
+    (ring/create-resource-handler {:path "/static" :root "public"})))
+
+(defn index-handler [app]
+  (fn [_] (index-page app)))
+
+(defn app-routes [app]
   (ring/ring-handler
    (ring/router
-    [["/all" handler]
+    [["/", (index-handler app)]
+     ["/stream" r/ok]
      ["/inc" (inc-handler app)]
-     ["/ping" {:name ::ping
-               :get handler
-               :post handler}]])))
+     (when (:dev? app) [hotreload/path hotreload/handler])])
+   (static-handler (:dev? app))))
 
-(defrecord App [counter bg-color]
+(defrecord App [counter bg-color dev?]
+  "Component representing app state."
   component/Lifecycle
   (start [this]
     (assoc this
@@ -36,26 +63,26 @@
     (assoc this :counter nil :bg-color nil)))
 
 (defrecord Server [port app dev? stop-fn]
+  "Component representing a web server."
   component/Lifecycle
   (start [this]
     (println (str "http://star.test:" port))
-    ;; `legacy-unsafe-remote-addr? false` ensures :remote-addr cannot be spoofed
-    ;; and will contain the true remote ip address.
+    ;; `legacy-unsafe-remote-addr? false` ensures that :remote-addr cannot be spoofed.
     (let [opts {:legacy-unsafe-remote-addr? false :port port}
-          routes (app-routes app dev?)]
+          routes (app-routes app)]
       (assoc this :stop-fn (hk/run-server routes opts))))
 
   (stop [this]
     (when stop-fn (stop-fn :timeout 100))
     (assoc this :stop-fn nil)))
 
-(defn prod-system [& [{:keys [port dev?]}]]
+(defn prod-system [{:keys [port dev?]}]
   (component/system-map
-   :app (map->App {})
+   :app (map->App {:dev? dev?})
    :server (component/using (map->Server {:port port :dev? dev?}) [:app])))
 
 (defn -main [& _]
-  (let [system (component/start (prod-system))
+  (let [system (component/start (prod-system {:port 8080}))
         done (promise)]
     (.addShutdownHook
      (Runtime/getRuntime)
