@@ -5,6 +5,7 @@
    [com.stuartsierra.component :as component]
    [hiccup2.core :as h]
    [ring.util.http-response :as r]
+   [ring.util.response :as resp]
    [org.httpkit.server :as hk]
    [reitit.ring :as ring]
    [toolkit.hotreload :as hotreload]))
@@ -19,7 +20,7 @@
                     head
                     [:script {:type "module" :defer true :src datastar-cdn}]]
                    [:body {:data-init "@get('/stream')"} body (when dev? hotreload/snippet)]])))
-      (r/content-type "text/html; charset=utf-8")))
+      (resp/content-type "text/html; charset=utf-8")))
 
 (defn index-page [app]
   (page {:body (h/html
