@@ -1,6 +1,8 @@
 .DS_Store
-.clj-kondo/
+.clj-kondo/.cache/
+.clj-kondo/imports/
 .cpcache/
 .lsp/
 /toolkit
-/myapp
+/proto
+*.key

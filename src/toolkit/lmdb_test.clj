@@ -1,5 +1,5 @@
 (ns toolkit.lmdb-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is]]
             [com.stuartsierra.component :as component]
             [toolkit.lmdb :as lmdb])
   (:import [java.io File]
@@ -302,11 +302,11 @@
   (with-env [env nil]
     ;; A decode that can produce nil — proves nil-hit is distinguished from miss.
     (let [nillable {:encode (fn [^String s] (.getBytes s "UTF-8"))
-                   :decode (fn [^bytes b]
-                             (let [s (String. b "UTF-8")]
-                               (when-not (= s "") s)))}
+                    :decode (fn [^bytes b]
+                              (let [s (String. b "UTF-8")]
+                                (when-not (= s "") s)))}
           d        (lmdb/open-dbi env "d" {:key-codec lmdb/string-codec
-                                            :val-codec nillable})]
+                                           :val-codec nillable})]
       (lmdb/put! env d "empty" "")
       (lmdb/put! env d "real"  "hello")
       (is (= "hello"   (lmdb/get env d "real" ::miss)))
@@ -388,8 +388,8 @@
     (let [d (lmdb/open-dbi env "d" ss)]
       (is (thrown? org.lmdbjava.Dbi$KeyExistsException
                    (lmdb/bulk-append! env d
-                                       [["a" "1"] ["c" "3"] ["b" "2"]]
-                                       {:presorted? true})))
+                                      [["a" "1"] ["c" "3"] ["b" "2"]]
+                                      {:presorted? true})))
       (is (zero? (lmdb/count-range env d (lmdb/all)))
           "txn aborted on throw — no partial writes committed"))))
 
