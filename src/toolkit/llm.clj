@@ -1,9 +1,11 @@
 ;; ============================================================
-;; llm/core.clj — generic driver. Knows nothing about providers.
+;; toolkit.llm — generic driver. Knows nothing about providers.
 ;; ============================================================
 
-(ns llm
+(ns toolkit.llm
   (:require [clojure.data.json :as json]
+            [malli.core :as m]
+            [malli.error :as me]
             [org.httpkit.client :as http]))
 
 (defn deep-merge [& maps]
@@ -11,18 +13,55 @@
          (fn [a b] (if (and (map? a) (map? b)) (deep-merge a b) b))
          maps))
 
-(defn build-payload
-  "Pure: unified request → final body map ready to be JSON-encoded.
-   Separated from query so it can be tested and inspected in isolation."
-  [{:keys [build-body]} request]
-  (deep-merge (build-body request) (:provider-extra request)))
+(def Request
+  [:map
+   [:model :string]
+   [:max-tokens pos-int?]
+   [:system {:optional true} :string]
+   [:temperature {:optional true} number?]
+   [:stop-sequences {:optional true} [:vector :string]]
+   [:provider-extra {:optional true} :map]
+   [:tools {:optional true}
+    [:vector
+     [:map
+      [:name :string]
+      [:description :string]
+      [:input-schema :map]]]]
+   [:messages
+    [:vector
+     [:map
+      [:role [:enum :user :assistant :tool]]
+      [:content
+       [:vector
+        [:multi {:dispatch :type}
+         [:text        [:map [:type [:= :text]] [:text :string]]]
+         [:image       [:map [:type [:= :image]]    [:media-type :string] [:data :string]]]
+         [:document    [:map [:type [:= :document]] [:media-type :string] [:data :string]]]
+         [:tool-call   [:map
+                        [:type [:= :tool-call]]
+                        [:id :string]
+                        [:name :string]
+                        [:arguments :map]]]
+         [:tool-result [:map
+                        [:type [:= :tool-result]]
+                        [:tool-call-id :string]
+                        [:content any?]
+                        [:error? {:optional true} :boolean]]]]]]]]]])
+
+(defn- validate-request! [request]
+  (when-let [explanation (m/explain Request request)]
+    (throw (ex-info "llm: invalid request"
+                    {:errors (me/humanize explanation)}))))
 
 (defn query
-  "Shell: performs the HTTP call. `provider` is a map of fns produced by
-   e.g. (anthropic/client api-key)."
-  [{:keys [http-spec parse-response] :as provider} request]
-  (let [{:keys [url headers]} (http-spec request)
-        body (build-payload provider request)
+  "Performs the HTTP call. `provider` is a map of two pure fns:
+     {:->request      (fn [request] {:url :headers :body})
+      :parse-response (fn [response-map] unified-result)}
+   produced by e.g. (anthropic/client api-key)."
+  [{:keys [->request parse-response]} request]
+  (validate-request! request)
+  (let [{:keys [url headers body]} (->request request)
+        body (deep-merge body (:provider-extra request))
         {:keys [status body error]}
         @(http/post url {:headers (merge {"Content-Type" "application/json"} headers)
                          :body    (json/write-str body)})]
@@ -33,30 +72,14 @@
     (parse-response (json/read-str body :key-fn keyword))))
 
 ;; ------------------------------------------------------------
-;; Unified request shape (documented; no spec yet):
-;;
-;; {:model    "..."
-;;  :system   "..."                                ; optional
-;;  :messages [{:role :user|:assistant|:tool
-;;              :content [part ...]}]
-;;  :tools    [{:name :description :input-schema}] ; optional
-;;  :output-schema {...}                           ; optional, opaque here
-;;  :max-tokens N
-;;  :temperature 0.7                               ; optional
-;;  :stop-sequences [...]                          ; optional
-;;  :provider-extra {...}}                         ; deep-merged into body
-;;
-;; Content parts:
-;;   {:type :text        :text "..."}
-;;   {:type :image       :media-type "image/png"      :data "<base64>"}
-;;   {:type :document    :media-type "application/pdf" :data "<base64>"}
-;;   {:type :tool-call   :id :name :arguments}
-;;   {:type :tool-result :tool-call-id :content :error?}
+;; Unified request shape: see `Request` schema above.
 ;;
 ;; Provider value (returned by adapter `client` fns):
-;;   {:build-body     (fn [request] body-map)
-;;    :parse-response (fn [response-map] unified-response)
-;;    :http-spec      (fn [request] {:url :headers})}
+;;   {:->request      (fn [request] {:url :headers :body})
+;;    :parse-response (fn [response-map] unified-response)}
+;;
+;; Both fns are pure. Inspect a wire request without calling out:
+;;   ((:->request provider) request)
 ;;
 ;; Unified response:
 ;;   {:raw original-parsed-response
@@ -65,30 +88,14 @@
 ;;    :tool-calls [{:id :name :arguments} ...]}
 ;; ------------------------------------------------------------
 
-;; ============================================================
-;; Example usage
-;; ============================================================
-
 (comment
-  (require '[llm.core :as llm]
-           '[llm.anthropic :as anthropic])
+  (require '[toolkit.llm :as llm]
+           '[toolkit.llm.anthropic :as anthropic]
+           '[clojure.string :as string])
 
-  (def claude (anthropic/client (System/getenv "ANTHROPIC_API_KEY")))
+  (def claude (anthropic/client (string/trim (slurp "claude.key"))))
 
-  ;; full call
   (llm/query claude
-             {:model      "claude-opus-4-6"
+             {:model      "claude-sonnet-4-6"
               :max-tokens 1024
-              :system     "be terse"
-              :messages   [{:role :user :content [{:type :text :text "hi"}]}]})
-
-  ;; inspect the exact JSON body without making a request
-  (llm/build-payload claude
-                     {:model      "claude-opus-4-6"
-                      :max-tokens 1024
-                      :messages   [{:role :user :content [{:type :text :text "hi"}]}]})
-
-  ;; test parse-response in isolation
-  ((:parse-response claude)
-   {:stop_reason "end_turn"
-    :content [{:type "text" :text "hello"}]}))
+              :messages   [{:role :user :content [{:type :text :text "hi"}]}]}))

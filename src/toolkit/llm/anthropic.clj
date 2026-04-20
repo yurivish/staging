@@ -1,6 +1,5 @@
-
 ;; ============================================================
-;; llm/anthropic.clj — Anthropic adapter.
+;; toolkit.llm.anthropic — Anthropic adapter.
 ;; ============================================================
 
 (ns toolkit.llm.anthropic
@@ -34,8 +33,7 @@
    :content (mapv build-part content)})
 
 (defn build-body
-  [{:keys [model system messages max-tokens temperature
-           stop-sequences tools output-schema]}]
+  [{:keys [model system messages max-tokens temperature stop-sequences tools]}]
   (cond-> {:model      model
            :max_tokens max-tokens
            :messages   (mapv build-message messages)}
@@ -47,9 +45,7 @@
                                   {:name         name
                                    :description  description
                                    :input_schema input-schema})
-                                tools))
-    output-schema  (assoc :output_config
-                          {:format {:type "json_schema" :schema output-schema}})))
+                                tools))))
 
 (defn parse-response [resp]
   {:raw         resp
@@ -63,16 +59,16 @@
                      (mapv (fn [{:keys [id name input]}]
                              {:id id :name name :arguments input})))})
 
-(defn- http-spec-fn [api-key base-url]
-  (fn [_request]
+(defn- ->request-fn [api-key base-url]
+  (fn [request]
     {:url     (str (or base-url "https://api.anthropic.com") "/v1/messages")
      :headers {"x-api-key"         api-key
-               "anthropic-version" "2023-06-01"}}))
+               "anthropic-version" "2023-06-01"}
+     :body    (build-body request)}))
 
 (defn client
   "Returns a provider value usable with llm/query."
   ([api-key] (client api-key nil))
   ([api-key base-url]
-   {:build-body     build-body
-    :parse-response parse-response
-    :http-spec      (http-spec-fn api-key base-url)}))
+   {:->request      (->request-fn api-key base-url)
+    :parse-response parse-response}))
