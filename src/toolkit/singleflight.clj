@@ -1,4 +1,5 @@
 (ns toolkit.singleflight)
+;; Inspired by https://cs.opensource.google/go/x/sync/+/master:singleflight/singleflight.go
 
 (defn group
   "Creates a new singleflight group — a namespace in which concurrent callers
