@@ -36,7 +36,7 @@
 (declare reload!)
 
 (defn- dev-system []
-  ((requiring-resolve 'demo.server/prod-system) {:port 8080 :dev? true}))
+  ((requiring-resolve 'demo.server/system) {:port 8080 :dev? true}))
 
 (defn- start-sys! [] (alter-var-root #'sys #(or % (component/start (dev-system)))))
 (defn- stop-sys!  [] (alter-var-root #'sys (fn [s] (some-> s component/stop) nil)))

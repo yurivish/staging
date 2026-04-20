@@ -1,6 +1,6 @@
 (ns demo.server
   (:require
-   [clojure.core.async :refer [alt! chan close! go-loop timeout]]
+   [clojure.core.async :refer [io-thread]]
    [toolkit.datastar.core :as d]
    [com.stuartsierra.component :as component]
    [hiccup2.core :as h]
@@ -12,15 +12,18 @@
 
 (def datastar-cdn "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js")
 
-(defn page [{:keys [head body dev?]}]
-  (-> (r/ok (str "<!doctype html>"
-                 (h/html
-                  [:html
-                   [:head
-                    head
-                    [:script {:type "module" :defer true :src datastar-cdn}]]
-                   [:body {:data-init "@get('/stream')"} body (when dev? hotreload/snippet)]])))
+(defn html
+  "Helper function for an HTML Ring response"
+  [args]
+  (-> (r/ok {::type :html :args args})
       (resp/content-type "text/html; charset=utf-8")))
+
+(defn page [{:keys [head body dev?]}]
+  (html
+   [:html
+    [:head head
+     [:script {:type "module" :defer true :src datastar-cdn}]]
+    [:body {:data-init "@get('/stream')"} body (when dev? hotreload/snippet)]]))
 
 (defn index-page [app]
   (page {:body (h/html
@@ -30,6 +33,9 @@
                 [:span (random-uuid)]
                 [:div#loading])
          :dev? (:dev? app)}))
+
+(defn stream-handler []
+  (fn [_] (r/ok "we are streaming.")))
 
 (defn inc-handler [app]
   (fn [_]
@@ -45,31 +51,43 @@
 (defn index-handler [app]
   (fn [_] (index-page app)))
 
-(defn loading-handler [_app]
+(defn loading-handler  []
   (fn [req]
-    (let [closed (chan)]
-      (d/sse-stream
-       req
-       {:on-open  (fn [sse]
-                    (go-loop [n 0]
-                      (d/patch-elements sse [:div#loading (str n)])
-                      (if (>= n 10)
-                        (d/sse-close! sse)
-                        (alt! closed        :done
-                              (timeout 500) (recur (inc n))))))
-        :on-close (fn [_sse _status] (close! closed))}))))
+    (d/sse-stream
+     req
+     {:on-open
+      (fn [sse]
+        (io-thread
+         (doseq [n (range 11) :while (d/sse-open? sse)]
+           (println n)
+           (d/patch-elements sse [:div#loading (str n)])
+           (Thread/sleep 100))
+         (d/sse-close! sse)))
+      :on-close (fn [_sse _status] (println "CLOSE"))})))
 
-(defn app-routes [app]
+(defn wrap-html
+  "Middleware that turns hiccup into HTML, allowinb a richer intermediate structure to be returned from HTML routes,
+  which eases testing and programmatic postprocessing."
+  [handler]
+  (fn [request]
+    (let [response (handler request)]
+    ; do we need contains?
+      (if (and (map? (:body response)) (= (::type (:body response)) :html))
+        (assoc response :body (str "<!doctype html>" (h/html (:args (:body response)))))
+        response))))
+
+(defn routes [app]
   (ring/ring-handler
    (ring/router
     [["/", (index-handler app)]
-     ["/stream" r/ok]
-     ["/loading" (loading-handler app)]
+     ["/stream" (stream-handler)]
+     ["/loading" (loading-handler)]
      ["/inc" (inc-handler app)]
      (when (:dev? app) [hotreload/path hotreload/handler])])
-   (static-handler (:dev? app))))
+   (static-handler (:dev? app))
+   {:middleware [wrap-html]}))
 
-;; Component representing app state.
+;; App state component
 (defrecord App [counter bg-color dev?]
   component/Lifecycle
   (start [this]
@@ -77,31 +95,45 @@
            :counter  (atom 0)
            :bg-color (atom "hsl(210, 70%, 85%)")))
   (stop [this]
-    (assoc this :counter nil :bg-color nil)))
+    (assoc this
+           :counter nil
+           :bg-color nil)))
 
-;; Component representing a web server.
-(defrecord Server [port app dev? stop-fn]
+;; Web server component
+(defrecord Server [port app stop-fn]
   component/Lifecycle
   (start [this]
     (println (str "http://star.test:" port))
     ;; `legacy-unsafe-remote-addr? false` ensures that :remote-addr cannot be spoofed.
-    (let [opts {:legacy-unsafe-remote-addr? false :port port}
-          routes (app-routes app)]
-      (assoc this :stop-fn (hk/run-server routes opts))))
+    (let [opts {:legacy-unsafe-remote-addr? false :port port}]
+      (assoc this :stop-fn (hk/run-server (routes app) opts))))
 
   (stop [this]
     (when stop-fn (stop-fn :timeout 100))
     (assoc this :stop-fn nil)))
 
-(defn prod-system [{:keys [port dev?]}]
+(defn system [{:keys [port dev?]}]
   (component/system-map
    :app (map->App {:dev? dev?})
-   :server (component/using (map->Server {:port port :dev? dev?}) [:app])))
+   :server (component/using (map->Server {:port port}) [:app])))
 
 (defn -main [& _]
-  (let [system (component/start (prod-system {:port 8080}))
+  (let [system (component/start (system {:port 8080}))
         done (promise)]
     (.addShutdownHook
      (Runtime/getRuntime)
      (Thread. #(do (component/stop system) (deliver done :bye))))
     @done))
+
+;; "-handler" suffix for (defn [& state-args] (fn [req] resp-map))
+;; "-page" suffix for functions that produce hiccup for an entire page
+;; something else for subtemplates
+;;
+;; html templates: fn -> html
+;; response fns: -> ring response map, eg. via r/ok
+;; handler fns: same as response fn, but directly per-route?
+;; need a naming convention to distinguish handler-makers from handlers
+
+;; solution: convention: all handlers take optional state arguments and return a handler (fn from req to response map).
+
+;; where do sse responses live? hmm. streaming vs not streaming...

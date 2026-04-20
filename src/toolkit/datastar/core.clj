@@ -14,6 +14,7 @@
 (def sse-response #'toolkit.datastar.sse/response)
 (def sse-send!    #'toolkit.datastar.sse/send!)
 (def sse-close!   #'toolkit.datastar.sse/close!)
+(def sse-open?    #'toolkit.datastar.sse/open?)
 
 (defn- elements-list
   "Given a hiccup html representation, return a string of datastar-style 'elements' data lines"

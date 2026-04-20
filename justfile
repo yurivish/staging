@@ -4,3 +4,6 @@ dev:
 
 run:
     clj -M:run
+
+prep:
+    clj -X:deps prep

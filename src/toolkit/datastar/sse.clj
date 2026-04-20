@@ -26,19 +26,23 @@
 ;; (forwards to http-kit's AsyncChannel); synchronous responses use a BufferSink
 ;; (accumulates into a ByteArrayOutputStream that the caller drains into a Ring body).
 (defprotocol SSESink
-  (sink-write! [this bytes close?]))
+  (sink-write! [this bytes close?])
+  (sink-open? [this]))
 
 ;; Sink for async SSE responses
 (defrecord ChannelSink [^AsyncChannel ch]
   SSESink
   (sink-write! [_ data close?]
-    (hk/send! ch data close?)))
+    (hk/send! ch data close?))
+  (sink-open? [_] (hk/open? ch)))
 
 ;; Sink for sync SSE responses
 (defrecord BufferSink [^ByteArrayOutputStream buf]
   SSESink
   (sink-write! [_ data _close?]
-    (when data (.write buf ^bytes data))))
+    (when data (.write buf ^bytes data)))
+  ;; From the producer's perspective a buffer sink never closes, so always return true.
+  (sink-open? [_] true))
 
 (defrecord UncompressedSSE
            [sink]
@@ -71,8 +75,20 @@
    (write-bytes! sse (.getBytes ^String s "UTF-8"))
    (send-bytes! sse nil close-after-send)))
 
-(defn close! [sse]
-  (send-bytes! sse nil true))
+(defn open?
+  "Returns true if the SSE stream can still accept writes.
+  Using this to gate SSE writes can result in a race reader-condition
+  in which one additional write will (safely) occur after the connection
+  has been closed. Since hk/send! on a closed channel is safe (it no-ops
+  and returns false), this is fine as an idiomatic use to prevent the
+  unnecessary final render in most cases."
+  [sse]
+  (sink-open? (:sink sse)))
+
+(defn close!
+  "Close an SSE connection. Idempotent."
+  [sse]
+  (when (open? sse) (send-bytes! sse nil true)))
 
 ;;
 ;; GZip
