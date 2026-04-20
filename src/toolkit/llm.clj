@@ -2,7 +2,7 @@
 ;; llm/core.clj — generic driver. Knows nothing about providers.
 ;; ============================================================
 
-(ns toolkit.llm.core
+(ns llm
   (:require [clojure.data.json :as json]
             [org.httpkit.client :as http]))
 
