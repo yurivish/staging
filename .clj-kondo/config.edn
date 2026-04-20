@@ -1,4 +1,5 @@
-{:lint-as {clojure.test.check.clojure-test/defspec clojure.core/def}
+{:lint-as {clojure.test.check.clojure-test/defspec clojure.core/def
+            org.httpkit.client/defreq              clojure.core/def}
  :hooks   {:analyze-call {toolkit.lmdb/with-txn      hooks.toolkit.lmdb/with-txn
                           toolkit.lmdb/with-ctx-txn  hooks.toolkit.lmdb/with-txn
                           toolkit.lmdb-test/with-env hooks.toolkit.lmdb/with-env}}}
