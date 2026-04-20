@@ -33,7 +33,6 @@
                      "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
          :main-opts ["-e" "(do (set! *warn-on-reflection* true) nil)"
                      "-m" "demo.server"]}
-
   :dev  {:extra-paths ["dev"]
          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"
                        "--add-opens=java.base/java.nio=ALL-UNNAMED"

@@ -5,3 +5,4 @@
 .lsp/
 /toolkit
 *.key
+.rebel_readline_history

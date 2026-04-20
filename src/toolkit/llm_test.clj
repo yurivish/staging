@@ -2,7 +2,7 @@
   "Offline tests for toolkit.llm + toolkit.llm.anthropic. No network calls —
    verifies the unified-request → wire-body translation and the wire-response
    → unified-response parse against fixture data."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is]]
             [toolkit.llm :as llm]
             [toolkit.llm.anthropic :as anthropic]))
 
