@@ -49,7 +49,7 @@
                          (watcher/map->FileWatcher
                           {:interval-ms 100
                            :watches [{:dir refresh-dir :include? reloadable-clj?       :on-change reload!}
-                                     ;; note: edit this if we want to filter out large directories
+                                     ;; note: edit this if we want to filter out any files or directories
                                      {:dir static-dir  :include? (constantly true)     :on-change hr/reload-now!}]})))))
   (start-sys!))
 

@@ -10,9 +10,6 @@
          ;; 2.8.x has a regression (#578/#579) where on-close never fires on client
          ;; disconnect — the fix (76b869f) only landed in the 2.9 line.
          http-kit/http-kit         {:mvn/version "2.9.0-beta3"}
-         ;; Still buggy; let's try the most recent [edit: needs prep which needs a jdk and lein...]
-         ;; io.github.http-kit/http-kit {:git/sha "3ba47b8e4fd195f57da3eca2923e50596a1c8aa9"}
-
          org.clojure/data.json     {:mvn/version "2.5.2"}
          hiccup/hiccup             {:mvn/version "2.0.0"}
          metosin/malli             {:mvn/version "0.20.1"}
