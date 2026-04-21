@@ -26,7 +26,7 @@
       (case (first op)
         :sub   (let [[_ pat q] op
                      id (count @subs)
-                     h  (fn [_ _]
+                     h  (fn [_ _ _]
                           (swap! delivered
                                  update (dec (count @delivered))
                                  update :fired conj id))

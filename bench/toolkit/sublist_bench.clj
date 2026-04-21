@@ -1,0 +1,119 @@
+(ns toolkit.sublist-bench
+  "sublist (subscription routing trie) benchmark scenarios.
+
+   Dataset: ~75% literal patterns, ~20% single-`*`, ~5% trailing-`>`,
+   with ~25% placed in queue groups (8 rotating queue names). The
+   first-token pool (16 buckets) ensures `<first>.>` reverse-match
+   queries hit a meaningful fraction at each scale."
+  (:require [clojure.string :as str]
+            [toolkit.bench :as b]
+            [toolkit.sublist :as sl])
+  (:import [java.util Random]))
+
+(set! *warn-on-reflection* true)
+
+(def ^:private sizes [1000 10000 100000])
+(def ^:private ^:const max-size 100000)
+
+(defn- rand-token ^String [^Random r ^long max-len]
+  (let [len (inc (.nextInt r (int max-len)))
+        sb  (StringBuilder. len)]
+    (dotimes [_ len]
+      (.append sb (char (+ (int \a) (.nextInt r 26)))))
+    (.toString sb)))
+
+(def ^:private first-tokens
+  (into [] (for [i (range 16)]
+             (apply str (repeat (inc (rem i 3))
+                                (char (+ (int \a) i)))))))
+
+(defn- rand-subject ^String [^Random r]
+  (let [first-tok (nth first-tokens (.nextInt r 16))
+        n-more    (inc (.nextInt r 4))
+        toks      (into [first-tok] (repeatedly n-more #(rand-token r 4)))]
+    (str/join "." toks)))
+
+(defn- rand-pattern ^String [^Random r]
+  (let [toks (vec (str/split (rand-subject r) #"\."))
+        n    (count toks)
+        roll (.nextInt r 20)]
+    (cond
+      (< roll 15) (str/join "." toks)                          ; literal
+      (< roll 19) (let [mid (quot n 2)]
+                    (str/join "." (assoc toks mid "*")))        ; middle *
+      :else       (str/join "." (conj (pop toks) ">")))))       ; trailing >
+
+(def ^:private all-patterns
+  (delay
+    (let [r (Random. 73)]
+      (into [] (repeatedly (+ max-size 1000) #(rand-pattern r))))))
+
+(defn- build-sublist [patterns]
+  (let [sl-ref (sl/make)
+        r      (Random. 11)]
+    (dotimes [i (count patterns)]
+      (let [p (nth patterns i)]
+        (if (zero? (.nextInt r 4))
+          (sl/insert! sl-ref p i {:queue (str "q" (rem i 8))})
+          (sl/insert! sl-ref p i))))
+    sl-ref))
+
+(defn- literal-from-pattern ^String [^String p]
+  (->> (str/split p #"\." -1)
+       (mapv (fn [t] (if (or (= t "*") (= t ">")) "x" t)))
+       (str/join ".")))
+
+(defn- miss-subject ^String [^Random r]
+  (str "ZZZZ." (rand-subject r)))
+
+(defn- fixture [n]
+  (let [patterns (subvec @all-patterns 0 n)
+        sl-ref   (build-sublist patterns)
+        r        (Random. (+ 101 n))
+        hit      (literal-from-pattern (nth patterns (quot n 2)))
+        miss     (miss-subject r)
+        ;; Literal subject starting with a pool first-token — exercises
+        ;; the `*` / `>` branches of walk-match against a dense subtree.
+        fanout   (str (nth first-tokens 0) "."
+                      (rand-token r 4) "." (rand-token r 4))
+        rev-pat  (str (nth first-tokens 0) ".>")]
+    {:n n :sl sl-ref :hit hit :miss miss :fanout fanout :rev-pat rev-pat}))
+
+(defn run []
+  (b/banner "sublist benchmarks")
+  (print "building fixtures") (flush)
+  (let [fxs (mapv (fn [n] (print ".") (flush) [n (fixture n)]) sizes)]
+    (println " done")
+
+    (b/header "match (literal subject, one likely hit)")
+    (doseq [[n fx] fxs]
+      (b/bench-case (format "n=%d" n) #(sl/match (:sl fx) (:hit fx))))
+
+    (b/header "match-miss (no matching subs)")
+    (doseq [[n fx] fxs]
+      (b/bench-case (format "n=%d" n) #(sl/match (:sl fx) (:miss fx))))
+
+    (b/header "match-fanout (first-token bucket; exercises *, >)")
+    (doseq [[n fx] fxs]
+      (b/bench-case (format "n=%d" n) #(sl/match (:sl fx) (:fanout fx))))
+
+    (b/header "has-interest? hit (short-circuit on first match)")
+    (doseq [[n fx] fxs]
+      (b/bench-case (format "n=%d" n) #(sl/has-interest? (:sl fx) (:hit fx))))
+
+    (b/header "has-interest? miss (worst-case negative walk)")
+    (doseq [[n fx] fxs]
+      (b/bench-case (format "n=%d" n) #(sl/has-interest? (:sl fx) (:miss fx))))
+
+    (b/header "reverse-match (wildcard query)")
+    (doseq [[n fx] fxs]
+      (b/bench-case (format "n=%d" n) #(sl/reverse-match (:sl fx) (:rev-pat fx))))
+
+    (b/header "count-subs (O(n) full walk)")
+    (doseq [[n fx] fxs]
+      (b/bench-case (format "n=%d" n) #(sl/count-subs (:sl fx))))
+
+    (b/header "bulk-insert (build sublist from empty; per-op time = total / n)")
+    (doseq [n sizes]
+      (let [patterns (subvec @all-patterns 0 n)]
+        (b/bench-case (format "n=%d" n) #(build-sublist patterns))))))

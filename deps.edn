@@ -52,6 +52,16 @@
                       "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
          :exec-fn    cognitect.test-runner.api/test
          :exec-args  {:dirs ["src"] :patterns [".*-test$"]}}
+  ;; Benchmarks (criterium). Kept on a separate :bench classpath so prod
+  ;; and :test dep graphs are unchanged.
+  ;;   clojure -M:bench           — full suite
+  ;;   clojure -M:bench stree     — stree scenarios only
+  ;;   clojure -M:bench sublist   — sublist scenarios only
+  :bench {:extra-paths ["bench"]
+          :extra-deps  {criterium/criterium {:mvn/version "0.4.6"}}
+          :jvm-opts    ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
+          :main-opts   ["-m" "toolkit.bench"]}
   :rebel {:extra-deps {com.bhauman/rebel-readline {:mvn/version "0.1.7"}}
           :main-opts  ["-m" "rebel-readline.main"]}
   ;; Check for outdated deps: clojure -M:outdated
