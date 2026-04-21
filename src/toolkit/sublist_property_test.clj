@@ -4,9 +4,11 @@
    (subs, subject) inputs. A round-trip property checks that insert-then-
    remove returns to the empty-node structure."
   (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [toolkit.exhaustigen :as ex]
             [toolkit.stree :as stree]
             [toolkit.sublist :as sl]))
 
@@ -160,3 +162,136 @@
                                              (filter #(sl/has-interest? sl %)))
                                        entries)]
                     (= expected @!got)))))
+
+;; --- exhaustigen-driven tests ---
+;;
+;; Enumerate small combinatorial spaces deterministically. These cover
+;; the narrow-alphabet shapes that the defspec generators can skip past
+;; on any given run.
+
+(defn- token-tuples
+  "All length-n tuples of items from `xs` (cartesian product)."
+  [xs n]
+  (if (zero? n)
+    [[]]
+    (vec (for [t (token-tuples xs (dec n))
+               x xs]
+           (conj t x)))))
+
+(defn- build-patterns
+  "All pattern strings of lengths `lens` over `pat-alpha`, optionally
+   with a trailing `>` token. `pat-alpha` should be literals plus \"*\"."
+  [pat-alpha lens]
+  (vec (for [n        lens
+             toks     (token-tuples pat-alpha n)
+             trailing [nil ">"]]
+         (let [base (str/join "." toks)]
+           (if trailing (str base "." trailing) base)))))
+
+(defn- build-subjects
+  [alpha lens]
+  (vec (for [n    lens
+             toks (token-tuples alpha n)]
+         (str/join "." toks))))
+
+;; Curated 8-pattern set spanning literal, pwc, fwc and mixed shapes —
+;; small enough that 2^8 subsets × 6 subjects = 1536 cases is cheap.
+(def ^:private tiny-sub-patterns
+  ["a" "b" "*" ">" "a.b" "a.*" "*.b" "a.>"])
+
+(def ^:private tiny-query-subjects
+  (build-subjects ["a" "b"] [1 2]))
+
+(deftest match-equals-oracle-exhaustive
+  ;; 2^8 × 6 = 1536 deterministic cases. Covers single-sub trees,
+  ;; two-token collisions, fwc-only interest, and wildcard-only trees.
+  (let [g     (ex/make)
+        cases (atom 0)
+        fail  (atom nil)]
+    (loop []
+      (when (and (not @fail) (not (ex/done!? g)))
+        (let [pat-idxs (ex/subset g (count tiny-sub-patterns))
+              subj-idx (ex/pick g (count tiny-query-subjects))
+              subs     (mapv (fn [i] [(nth tiny-sub-patterns i) (inc i) nil]) pat-idxs)
+              subject  (nth tiny-query-subjects subj-idx)
+              sl       (sl/make)]
+          (apply-inserts sl subs)
+          (let [expected (naive-match subs subject)
+                got      (groups->sets (sl/match sl subject))]
+            (when (not= expected got)
+              (reset! fail {:subs subs :subject subject
+                            :expected expected :got got})))
+          (swap! cases inc))
+        (recur)))
+    (is (nil? @fail) (str "mismatch: " @fail))
+    (when-not @fail
+      (is (= (* (bit-shift-left 1 (count tiny-sub-patterns))
+                (count tiny-query-subjects))
+             @cases)))))
+
+;; Pattern universe for pure-function property tests. With {a,b,*}
+;; token-alphabet over 1–3 token lengths plus optional trailing ">",
+;; there are 4 + 12 + 36 = 52 patterns and 52^2 = 2704 ordered pairs.
+(def ^:private all-patterns
+  (build-patterns ["a" "b" "*"] [1 2 3]))
+
+(def ^:private all-subjects
+  (build-subjects ["a" "b"] [1 2 3]))
+
+(defn- pattern-pair-loop
+  "Exhaustively runs `f` over every ordered pair of patterns. Returns
+   nil on pass or a failing [a b extra] vector."
+  [patterns f]
+  (let [n    (count patterns)
+        g    (ex/make)
+        fail (atom nil)]
+    (loop []
+      (when (and (not @fail) (not (ex/done!? g)))
+        (let [a (nth patterns (ex/pick g n))
+              b (nth patterns (ex/pick g n))]
+          (when-let [info (f a b)]
+            (reset! fail info)))
+        (recur)))
+    @fail))
+
+(deftest subjects-collide-symmetric-exhaustive
+  ;; Exhaustive proof of commutativity over the 52-pattern universe.
+  (let [fail (pattern-pair-loop all-patterns
+                                (fn [a b]
+                                  (when (not= (sl/subjects-collide? a b)
+                                              (sl/subjects-collide? b a))
+                                    {:a a :b b
+                                     :ab (sl/subjects-collide? a b)
+                                     :ba (sl/subjects-collide? b a)})))]
+    (is (nil? fail) (str "asymmetric collision: " fail))))
+
+(deftest subjects-collide-literal-case-exhaustive
+  ;; For a literal subject `lit` and any pattern `pat`,
+  ;; `subjects-collide?` reduces to `subject-matches-filter?`.
+  (let [g    (ex/make)
+        fail (atom nil)]
+    (loop []
+      (when (and (not @fail) (not (ex/done!? g)))
+        (let [lit (nth all-subjects (ex/pick g (count all-subjects)))
+              pat (nth all-patterns (ex/pick g (count all-patterns)))]
+          (when (not= (sl/subjects-collide? lit pat)
+                      (sl/subject-matches-filter? lit pat))
+            (reset! fail {:lit lit :pat pat})))
+        (recur)))
+    (is (nil? @fail) (str "collide≠matches-filter for literal: " @fail))))
+
+(deftest subject-matches-filter-vs-match-tokens-exhaustive
+  ;; `subject-matches-filter?` on a literal subject must agree with the
+  ;; naive oracle token matcher.
+  (let [g    (ex/make)
+        fail (atom nil)]
+    (loop []
+      (when (and (not @fail) (not (ex/done!? g)))
+        (let [lit (nth all-subjects (ex/pick g (count all-subjects)))
+              pat (nth all-patterns (ex/pick g (count all-patterns)))]
+          (when (not= (sl/subject-matches-filter? lit pat)
+                      (match-tokens? (str/split pat #"\.")
+                                     (str/split lit #"\.")))
+            (reset! fail {:lit lit :pat pat})))
+        (recur)))
+    (is (nil? @fail) (str "matches-filter≠oracle for literal: " @fail))))

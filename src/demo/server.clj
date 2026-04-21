@@ -13,9 +13,9 @@
    [toolkit.hotreload :as hotreload]
    [toolkit.sqlite :as sqlite]
    [toolkit.web :as web])
-  (:import
-   [dev.langchain4j.model.anthropic AnthropicStreamingChatModel #_AnthropicChatModel]
-   [dev.langchain4j.model.chat.response StreamingChatResponseHandler]))
+  #_(:import
+     [dev.langchain4j.model.anthropic AnthropicStreamingChatModel #_AnthropicChatModel]
+     [dev.langchain4j.model.chat.response StreamingChatResponseHandler]))
 
 ;; (def model
 ;;   (-> (AnthropicChatModel/builder)
