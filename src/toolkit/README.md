@@ -204,6 +204,43 @@ escape-hatch, and auto-grow on `MapFullException` — see the
 `future work` comment block at the bottom of `lmdb.clj` for where
 they'd slot in.
 
+### `toolkit.data`
+
+Fan-out loaders for a flat "directory of shards" layout:
+
+```
+base/
+  shard-a/data.parquet
+  shard-a/meta.json
+  shard-b/data.parquet
+  shard-b/meta.json
+```
+
+Each helper maps the named file across every immediate subdirectory and
+returns a seq of `[subdir-name payload]` pairs, read in parallel.
+
+```clojure
+(require '[toolkit.data :as data])
+
+(data/list-files "data" "meta.json")
+;; => ("data/shard-a/meta.json" "data/shard-b/meta.json")
+
+(data/load-parquet "data" "data.parquet" {:column-allowlist ["id" "score"]})
+;; => (["shard-a" <ds>] ["shard-b" <ds>])
+
+(data/load-json "data" "meta.json")
+;; => (["shard-a" {...}] ["shard-b" {...}])
+```
+
+Public:
+- `list-files` — seq of file paths; filters out subdirs where the file is missing.
+- `load-parquet` — opts forwarded to `tech.v3.libs.parquet/parquet->ds`.
+- `load-json` — opts map forwarded as kwargs to `clojure.data.json/read` (e.g. `{:key-fn keyword}`).
+
+Parallelism is `pmap`; loads are IO-bound and safe to overlap. `pmap` is
+lazy, so realize the seq (`doall` / `into []`) if you want the work to
+start before the first take.
+
 ### `toolkit.llm`
 
 Provider-agnostic client for chat-completion LLM APIs. v1 supports
