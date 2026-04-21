@@ -1,5 +1,6 @@
 (ns toolkit.zorder-test
   (:require [clojure.test :refer [deftest is]]
+            [toolkit.frng :as frng]
             [toolkit.zorder :as z]))
 
 (deftest litmax-bigmin-2d-simple
@@ -56,53 +57,85 @@
       (in-rect-2d? z lo hi) z
       :else (recur (dec z)))))
 
-(deftest bigmin-litmax-2d-exhaustive
-  ;; Exhaustively test all valid (min, max, div) triples on a 16x16 grid,
-  ;; cross-checking against a brute-force oracle.
-  (let [coord-max 15]
-    (doseq [x0 (range (inc coord-max))
-            y0 (range (inc coord-max))]
-      (let [lo (z/encode-2 x0 y0)]
-        (doseq [x1 (range x0 (inc coord-max))
-                y1 (range y0 (inc coord-max))]
-          (let [hi (z/encode-2 x1 y1)]
-            (doseq [div (range (inc lo) hi)
-                    :when (not (in-rect-2d? div lo hi))]
-              (let [got-bigmin (z/bigmin lo hi div 2)
-                    want-bigmin (brute-force-bigmin-2d lo hi div)]
-                (is (some? want-bigmin)
-                    (format "brute-force found no BigMin for lo=%d hi=%d div=%d" lo hi div))
-                (is (= want-bigmin got-bigmin)
-                    (format "BigMin(%d, %d, %d, 2) = %d, want %d" lo hi div got-bigmin want-bigmin)))
-              (let [got-litmax (z/litmax lo hi div 2)
-                    want-litmax (brute-force-litmax-2d lo hi div)]
-                (is (some? want-litmax)
-                    (format "brute-force found no LitMax for lo=%d hi=%d div=%d" lo hi div))
-                (is (= want-litmax got-litmax)
-                    (format "LitMax(%d, %d, %d, 2) = %d, want %d" lo hi div got-litmax want-litmax))))))))))
+(defn- brute-force-bigmin-3d [^long lo ^long hi ^long div]
+  (loop [z (inc div)]
+    (cond
+      (> z hi) nil
+      (in-rect-3d? z lo hi) z
+      :else (recur (inc z)))))
 
-(deftest bigmin-litmax-3d-spot
-  (doseq [[x0 y0 z0 x1 y1 z1] [[0 0 0 3 3 3]
-                                [1 2 3 5 6 4]
-                                [0 0 0 7 7 7]]]
-    (let [lo (z/encode-3 x0 y0 z0)
-          hi (z/encode-3 x1 y1 z1)]
-      (doseq [div (range (inc lo) hi)
-              :when (not (in-rect-3d? div lo hi))]
-        (let [got (z/bigmin lo hi div 3)
-              want (loop [zc (inc div)]
-                     (cond (> zc hi) nil
-                           (in-rect-3d? zc lo hi) zc
-                           :else (recur (inc zc))))]
-          (is (some? want))
-          (is (= want got)))
-        (let [got (z/litmax lo hi div 3)
-              want (loop [zc (dec div)]
-                     (cond (< zc lo) nil
-                           (in-rect-3d? zc lo hi) zc
-                           :else (recur (dec zc))))]
-          (is (some? want))
-          (is (= want got)))))))
+(defn- brute-force-litmax-3d [^long lo ^long hi ^long div]
+  (loop [z (dec div)]
+    (cond
+      (< z lo) nil
+      (in-rect-3d? z lo hi) z
+      :else (recur (dec z)))))
+
+(defn- run-frng-sim!
+  "Run an frng simulation via `frng/search` under clojure.test. On failure,
+   surface the `{:size :seed}` replay recipe in the assertion message."
+  [test-fn opts]
+  (let [result (frng/search test-fn opts)]
+    (is (= :pass result)
+        (when (map? result)
+          (let [{:keys [size seed ^Throwable ex]} (:fail result)]
+            (str "simulation failed at size=" size " seed=" seed
+                 " — replay via (frng/run-once <sim> {:size " size
+                 " :seed " seed "}) — cause: " (.getMessage ex)))))))
+
+(defn- bigmin-litmax-2d-sim [frng]
+  (let [coord-max 63]
+    (loop []
+      (let [x0 (frng/int-inclusive frng coord-max)
+            y0 (frng/int-inclusive frng coord-max)
+            x1 (frng/range-inclusive frng x0 coord-max)
+            y1 (frng/range-inclusive frng y0 coord-max)
+            lo (z/encode-2 x0 y0)
+            hi (z/encode-2 x1 y1)]
+        (when (> hi (inc lo))
+          (let [div (frng/range-inclusive frng (inc lo) (dec hi))]
+            (when-not (in-rect-2d? div lo hi)
+              (let [got  (z/bigmin lo hi div 2)
+                    want (brute-force-bigmin-2d lo hi div)]
+                (assert (= want got)
+                        (format "BigMin(%d, %d, %d, 2) = %d, want %d" lo hi div got want)))
+              (let [got  (z/litmax lo hi div 2)
+                    want (brute-force-litmax-2d lo hi div)]
+                (assert (= want got)
+                        (format "LitMax(%d, %d, %d, 2) = %d, want %d" lo hi div got want))))))
+        (recur)))))
+
+(defn- bigmin-litmax-3d-sim [frng]
+  ;; Keep the per-axis range small enough that the brute-force oracle
+  ;; stays cheap — Z-codes are 3*bits wide, so 0..15 already gives codes up to 4095.
+  (let [coord-max 15]
+    (loop []
+      (let [x0 (frng/int-inclusive frng coord-max)
+            y0 (frng/int-inclusive frng coord-max)
+            z0 (frng/int-inclusive frng coord-max)
+            x1 (frng/range-inclusive frng x0 coord-max)
+            y1 (frng/range-inclusive frng y0 coord-max)
+            z1 (frng/range-inclusive frng z0 coord-max)
+            lo (z/encode-3 x0 y0 z0)
+            hi (z/encode-3 x1 y1 z1)]
+        (when (> hi (inc lo))
+          (let [div (frng/range-inclusive frng (inc lo) (dec hi))]
+            (when-not (in-rect-3d? div lo hi)
+              (let [got  (z/bigmin lo hi div 3)
+                    want (brute-force-bigmin-3d lo hi div)]
+                (assert (= want got)
+                        (format "BigMin(%d, %d, %d, 3) = %d, want %d" lo hi div got want)))
+              (let [got  (z/litmax lo hi div 3)
+                    want (brute-force-litmax-3d lo hi div)]
+                (assert (= want got)
+                        (format "LitMax(%d, %d, %d, 3) = %d, want %d" lo hi div got want))))))
+        (recur)))))
+
+(deftest bigmin-litmax-2d-frng
+  (run-frng-sim! bigmin-litmax-2d-sim {:attempts 30 :max-size 8192}))
+
+(deftest bigmin-litmax-3d-frng
+  (run-frng-sim! bigmin-litmax-3d-sim {:attempts 30 :max-size 8192}))
 
 (deftest dim-mask-basic
   ;; x-mask-2d is public-adjacent — re-derive here to avoid leaking internals.
