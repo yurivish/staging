@@ -4,12 +4,10 @@
             [toolkit.dev :as dev]
             [toolkit.hotreload :as hr]
             [toolkit.watcher :as watcher]
-            ;; Eager-load so compile errors surface at REPL start. Aliases
-            ;; for these are installed below via `install-toolkit-aliases!`
-            ;; — not here — because tools.namespace/refresh remove-ns's and
-            ;; reloads each ns, leaving ns-decl aliases pointing at the old
-            ;; (now-orphaned) Namespace object. Re-installing after every
-            ;; refresh keeps `data/foo` etc. resolving to fresh Vars.
+            ;; Eager-load the toolkit namespaces (without :as) so they're
+            ;; available at the REPL as `toolkit.data/foo` etc. Qualified
+            ;; lookup goes through find-ns on every call, so it survives
+            ;; tools.namespace refresh — no post-refresh alias fixup needed.
             [toolkit.data]
             [toolkit.datastar.core]
             [toolkit.datastar.sse]
@@ -24,34 +22,8 @@
             [toolkit.sublist]
             [toolkit.web]
             ;; dev-system resolves demo.server factories dynamically (see
-            ;; the toolkit README for why) — just eager-load here.
+            ;; the toolkit README) — just eager-load here.
             [demo.server]))
-
-(def ^:private toolkit-aliases
-  '{data         toolkit.data
-    d            toolkit.datastar.core
-    sse          toolkit.datastar.sse
-    h2           toolkit.h2
-    llm          toolkit.llm
-    anthropic    toolkit.llm.anthropic
-    lmdb         toolkit.lmdb
-    pubsub       toolkit.pubsub
-    singleflight toolkit.singleflight
-    sqlite       toolkit.sqlite
-    stree        toolkit.stree
-    sublist      toolkit.sublist
-    web          toolkit.web})
-
-(defn- install-toolkit-aliases! []
-  (let [user-ns (find-ns 'user)]
-    (doseq [[a ns-sym] toolkit-aliases]
-      (when-let [n (find-ns ns-sym)]
-        ;; .addAlias throws if the alias already points to a different ns,
-        ;; which is exactly the post-refresh case. Remove first.
-        (.removeAlias user-ns a)
-        (.addAlias user-ns a n)))))
-
-(install-toolkit-aliases!)
 
 (def refresh-dir "src")
 ;; Path excluded from the autoreload watcher. dev/user.clj is outside
@@ -102,10 +74,7 @@
   (alter-var-root #'fw (fn [w] (some-> w component/stop) nil)))
 
 (defn reload! []
-  (dev/reload! {:start start-sys! :stop stop-sys! :lock lock
-                :before-start (fn []
-                                (install-toolkit-aliases!)
-                                (hr/arm!))}))
+  (dev/reload! {:start start-sys! :stop stop-sys! :lock lock :before-start hr/arm!}))
 
 ;; Auto-start on load. `clojure -M:dev` explicitly calls `-e (user/start!)`,
 ;; but `clojure -M:dev:rebel` (what `just dev` runs) loses that because

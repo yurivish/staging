@@ -1,6 +1,7 @@
 (ns toolkit.stree-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [toolkit.frng :as frng]
             [toolkit.stree :as st]))
 
 ;; --- helpers ---
@@ -16,6 +17,19 @@
   (count (collect tree filter)))
 
 (defn- leaf? [n] (contains? n :suffix))
+
+(defn- run-frng-sim!
+  "Run a frng simulation via `frng/search` under clojure.test. On failure,
+   emit the replay recipe `{:size :seed}` in the assertion message so CI
+   logs are enough to re-run the minimized case via `frng/run-once`."
+  [test-fn opts]
+  (let [result (frng/search test-fn opts)]
+    (is (= :pass result)
+        (when (map? result)
+          (let [{:keys [size seed ^Throwable ex]} (:fail result)]
+            (str "simulation failed at size=" size " seed=" seed
+                 " — replay via (frng/run-once <test-fn> {:size " size
+                 " :seed " seed "}) — cause: " (.getMessage ex)))))))
 
 ;; --- basics / split ---
 
@@ -213,19 +227,36 @@
               "foo.bar"   42} @seen)))))
 
 (deftest match-random-double-pwc
-  ;; Large-ish match test (stree.go:454 used 10k; we use 2k for speed).
-  (let [t (st/make)
-        n 2000]
-    (dotimes [i n]
-      (st/insert! t (str "foo." (rand-int 20) "." i) 42))
-    (is (= n (count-match t "foo.*.*")))
-    (let [seen-2     (count-match t "*.2.*")
-          verified-2 (atom 0)]
-      (st/iter-ordered t (fn [s _v]
-                           (when (= "2" (nth (str/split s #"\.") 1))
-                             (swap! verified-2 inc))
-                           true))
-      (is (= seen-2 @verified-2)))))
+  ;; Simulation: insert "foo.<a>.<i>" with `a` drawn from a small range so
+  ;; per-bucket counts stay meaningful. Invariants (checked once the finite
+  ;; RNG exhausts): total `foo.*.*` matches == inserts; per-`a` `*.<a>.*`
+  ;; matches == oracle tally for that bucket.
+  (run-frng-sim!
+    (fn [frng]
+      (let [t      (st/make)
+            counts (atom {})
+            total  (atom 0)]
+        (try
+          (loop []
+            (let [a   (frng/int-inclusive frng 5)
+                  idx (swap! total inc)]
+              (st/insert! t (str "foo." a "." idx) 42)
+              (swap! counts update a (fnil inc 0)))
+            (recur))
+          (catch clojure.lang.ExceptionInfo e
+            (if-not (:toolkit.frng/out-of-entropy (ex-data e))
+              (throw e)
+              (do
+                (assert (= @total (count-match t "foo.*.*"))
+                        (str "total mismatch: oracle=" @total
+                             " stree=" (count-match t "foo.*.*")))
+                (doseq [[a c] @counts]
+                  (let [got (count-match t (str "*." a ".*"))]
+                    (assert (= c got)
+                            (str "per-a mismatch for " a
+                                 ": oracle=" c " stree=" got)))))))))
+      nil)
+    {:attempts 30 :max-size 8192}))
 
 (deftest iter-ordered-walk-and-early-stop
   (let [t (st/make)]
@@ -314,21 +345,49 @@
       (is (= 0 (count-match t filt)) (str "filter should not match: " filt)))))
 
 (deftest random-track-entries
-  ;; Reduced scale vs Go's 1000; plenty for regression signal.
-  (let [t          (st/make)
-        alphabet   "abcdef0123456789"
-        rand-tok   (fn [] (apply str (repeatedly (+ 2 (rand-int 4))
-                                                 #(rand-nth alphabet))))
-        rand-subj  (fn [] (str/join "." (repeatedly (inc (rand-int 6)) rand-tok)))
-        subjects   (atom #{})]
-    (dotimes [_ 400]
-      (let [s (rand-subj)]
-        (when-not (@subjects s)
-          (swap! subjects conj s)
-          (st/insert! t s 22))))
-    (is (= (count @subjects) (st/size t)))
-    (doseq [s @subjects]
-      (is (= [22 true] (st/lookup t s))))))
+  ;; Simulation: interleave insert / lookup-present / lookup-absent under a
+  ;; swarm-weighted mix. Invariants are checked inline on every step so any
+  ;; divergence shows up immediately, and frng's entropy-size search
+  ;; minimizes the failing seed automatically.
+  (run-frng-sim!
+    (fn [frng]
+      (let [t            (st/make)
+            alphabet     "abcdef0123456789"
+            alpha-max    (dec (count alphabet))
+            rand-tok     (fn [] (apply str (repeatedly (+ 2 (frng/int-inclusive frng 3))
+                                                       #(nth alphabet (frng/int-inclusive frng alpha-max)))))
+            rand-subj    (fn [] (str/join "." (repeatedly (inc (frng/int-inclusive frng 5)) rand-tok)))
+            inserted     (atom [])
+            inserted-set (atom #{})
+            weights      (frng/swarm-weights frng [:insert :lookup-present :lookup-absent])]
+        (loop []
+          (case (frng/weighted frng weights)
+            :insert
+            (let [s (rand-subj)]
+              (when-not (@inserted-set s)
+                (st/insert! t s 22)
+                (swap! inserted conj s)
+                (swap! inserted-set conj s))
+              (assert (= (count @inserted-set) (st/size t))
+                      (str "size mismatch after insert of " s
+                           ": oracle=" (count @inserted-set)
+                           " stree=" (st/size t))))
+
+            :lookup-present
+            (when (seq @inserted)
+              (let [s (nth @inserted (frng/index frng @inserted))
+                    r (st/lookup t s)]
+                (assert (= [22 true] r)
+                        (str "present lookup failed: " s " → " r))))
+
+            :lookup-absent
+            (let [s (rand-subj)]
+              (when-not (@inserted-set s)
+                (let [r (st/lookup t s)]
+                  (assert (= [nil false] r)
+                          (str "absent lookup unexpectedly hit: " s " → " r))))))
+          (recur))))
+    {:attempts 30 :max-size 16384}))
 
 (deftest long-tokens-with-prefix-absorption
   ;; Regression: stree.go:688. Tokens longer than Go's internal 24-byte
