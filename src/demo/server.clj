@@ -13,15 +13,41 @@
    [toolkit.hotreload :as hotreload]
    [toolkit.sqlite :as sqlite]
    [toolkit.web :as web])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]))
+  (:import
+   [dev.langchain4j.model.anthropic AnthropicStreamingChatModel AnthropicChatModel]
+   [dev.langchain4j.model.chat.response StreamingChatResponseHandler]))
+
+(def api-key (string/trim (slurp "claude.key")))
 
 (def model
-  (-> (AnthropicChatModel/builder)
-      (.apiKey (System/getenv (string/trim (slurp "claude.key"))))
+  (-> (AnthropicStreamingChatModel/builder)
+      (.apiKey api-key)
       (.modelName "claude-sonnet-4-5")
       (.build)))
 
-(println (.chat model "In one sentence: what is Clojure?"))
+(def done (promise))
+
+(.chat model
+       "In one sentence: what is Clojure?"
+       (reify StreamingChatResponseHandler
+         (onPartialResponse [_ chunk]
+           (print chunk)
+           (flush))
+         (onCompleteResponse [_ response]
+           (println)               ;; trailing newline
+           (deliver done :ok))
+         (onError [_ err]
+           (deliver done err))))
+
+@done
+
+;; (def model
+;;   (-> (AnthropicChatModel/builder)
+;;       (.apiKey key)
+;;       (.modelName "claude-sonnet-4-5")
+;;       (.build)))
+
+;; (println (.chat model "In one sentence: what is Clojure?"))
 
 (System/exit 0)
 

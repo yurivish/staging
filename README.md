@@ -40,3 +40,39 @@ need to articulate the practices, too - set up dev/user.clj, use hot reload, how
 
 - [SCS](https://github.com/alexedwards/scs)-equivalent sessions in terms of robustness and security.
 -
+
+# AI next steps
+
+Current provider coverage via langchain4j 1.13.0 (see `deps.edn`):
+
+- **Anthropic** — `langchain4j-anthropic` → `AnthropicChatModel`
+- **OpenAI** — `langchain4j-open-ai` → `OpenAiChatModel`
+- **Gemini (API-key)** — `langchain4j-google-ai-gemini` → `GoogleAiGeminiChatModel`
+  (for GCP/Vertex auth swap in `langchain4j-vertex-ai-gemini` →
+  `VertexAiGeminiChatModel` instead)
+
+## Local Ollama
+
+Ollama exposes an OpenAI-compatible endpoint at
+`http://localhost:11434/v1`, so no extra dependency is needed — reuse
+`OpenAiChatModel` with the base URL overridden:
+
+```clojure
+(-> (OpenAiChatModel/builder)
+    (.baseUrl "http://localhost:11434/v1")
+    (.apiKey "ollama")          ; any non-blank string; Ollama ignores it
+    (.modelName "llama3.2")     ; whatever is `ollama pull`ed locally
+    (.build))
+```
+
+If you need Ollama-native features the OpenAI shim doesn't expose
+(model management, some streaming options), add
+`dev.langchain4j/langchain4j-ollama` and use `OllamaChatModel` — note
+that module is still on the `-beta` track.
+
+## Logging
+
+`org.slf4j/slf4j-nop` is pinned in main deps to silence the
+"No SLF4J providers" warning that langchain4j triggers. Swap it for
+`ch.qos.logback/logback-classic` (full-featured) or
+`org.slf4j/slf4j-simple` (minimal stderr) if you want real log output.

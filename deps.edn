@@ -27,8 +27,19 @@
          com.github.seancorfield/next.jdbc {:mvn/version "1.3.1093"}
          com.github.seancorfield/honeysql  {:mvn/version "2.7.1368"}
          org.xerial/sqlite-jdbc            {:mvn/version "3.53.0.0"}
-         dev.langchain4j/langchain4j           {:mvn/version "1.13.0"}
-         dev.langchain4j/langchain4j-anthropic {:mvn/version "1.13.0"}}
+         dev.langchain4j/langchain4j                  {:mvn/version "1.13.0"}
+         dev.langchain4j/langchain4j-anthropic        {:mvn/version "1.13.0"}
+         dev.langchain4j/langchain4j-open-ai          {:mvn/version "1.13.0"}
+         ;; Gemini via Google AI Studio (API-key auth). For GCP/Vertex
+         ;; auth use `langchain4j-vertex-ai-gemini` instead.
+         dev.langchain4j/langchain4j-google-ai-gemini {:mvn/version "1.13.0"}
+         ;; SLF4J provider. Silences the "No SLF4J providers were found"
+         ;; warning that langchain4j (and other transitive users) trigger.
+         ;; `slf4j-nop` discards all log output; swap it for
+         ;;   ch.qos.logback/logback-classic — full-featured, configurable
+         ;;   org.slf4j/slf4j-simple         — minimal stderr logger
+         ;; if you want actual log output.
+         org.slf4j/slf4j-nop                   {:mvn/version "2.0.17"}}
  ;; brotli4j calls System.loadLibrary, which trips JDK 24+ restricted-method warnings.
  ;; Granting native access to the unnamed module silences them.
  ;;
