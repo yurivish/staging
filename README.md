@@ -35,3 +35,8 @@ need to articulate the practices, too - set up dev/user.clj, use hot reload, how
        (d/sse-close! sse)))
     :on-close (fn [_sse _status] (println "CLOSE"))}))
   ```
+
+# Goals
+
+- [SCS](https://github.com/alexedwards/scs)-equivalent sessions in terms of robustness and security.
+-
