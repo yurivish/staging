@@ -3,6 +3,7 @@
    [clojure.core.async :refer [io-thread]]
    [clojure.data.json :as json]
    [com.stuartsierra.component :as component]
+   [clojure.string :as string]
    [hiccup2.core :as h]
    [ring.middleware.session.memory :as session-mem]
    [ring.util.http-response :as r]
@@ -11,7 +12,18 @@
    [toolkit.datastar.core :as d]
    [toolkit.hotreload :as hotreload]
    [toolkit.sqlite :as sqlite]
-   [toolkit.web :as web]))
+   [toolkit.web :as web])
+  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]))
+
+(def model
+  (-> (AnthropicChatModel/builder)
+      (.apiKey (System/getenv (string/trim (slurp "claude.key"))))
+      (.modelName "claude-sonnet-4-5")
+      (.build)))
+
+(println (.chat model "In one sentence: what is Clojure?"))
+
+(System/exit 0)
 
 ;; Conventions
 ;;

@@ -66,18 +66,23 @@
 (defn- miss-subject ^String [^Random r]
   (str "ZZZZ." (rand-subject r)))
 
+;; Query inputs are pinned across sizes so only the tree varies. The
+;; hit index is well below the smallest sweep size; miss/fanout use
+;; fixed seeds. rev-pat is literal, no RNG needed.
+(def ^:private ^:const hit-index 17)
+(def ^:private fixed-miss (miss-subject (Random. 7)))
+(def ^:private fixed-fanout
+  (let [r (Random. 9)]
+    (str (nth first-tokens 0) "."
+         (rand-token r 4) "." (rand-token r 4))))
+(def ^:private fixed-rev-pat (str (nth first-tokens 0) ".>"))
+
 (defn- fixture [n]
   (let [patterns (subvec @all-patterns 0 n)
         sl-ref   (build-sublist patterns)
-        r        (Random. (+ 101 n))
-        hit      (literal-from-pattern (nth patterns (quot n 2)))
-        miss     (miss-subject r)
-        ;; Literal subject starting with a pool first-token — exercises
-        ;; the `*` / `>` branches of walk-match against a dense subtree.
-        fanout   (str (nth first-tokens 0) "."
-                      (rand-token r 4) "." (rand-token r 4))
-        rev-pat  (str (nth first-tokens 0) ".>")]
-    {:n n :sl sl-ref :hit hit :miss miss :fanout fanout :rev-pat rev-pat}))
+        hit      (literal-from-pattern (nth patterns hit-index))]
+    {:n n :sl sl-ref :hit hit :miss fixed-miss
+     :fanout fixed-fanout :rev-pat fixed-rev-pat}))
 
 (defn run []
   (b/banner "sublist benchmarks")

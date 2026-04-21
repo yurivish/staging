@@ -53,29 +53,34 @@
     (doseq [s subjects] (st/insert! t s 1))
     t))
 
-(defn- star-pattern ^String [^String subject]
-  (let [toks (str/split subject #"\.")
-        mid  (quot (count toks) 2)]
-    (str/join "." (assoc (vec toks) mid "*"))))
-
-(defn- fanout-pattern ^String [^String subject]
-  (str (first (str/split subject #"\.")) ".>"))
-
 (defn- miss-subject ^String [^Random r]
   (str "ZZZZ." (rand-subject r)))
 
+;; Pattern choices are deterministic across sizes so match counts scale
+;; predictably with n. `star-pattern` uses a fixed bucket + trailing `*`
+;; so it matches exactly the 2-token subjects in that bucket (≈ n/64);
+;; `fanout-pattern` uses the same bucket + `>` so it matches every subject
+;; in the bucket (≈ n/16).
+(def ^:private star-pattern   (str (nth first-tokens 0) ".*"))
+(def ^:private fanout-pattern (str (nth first-tokens 0) ".>"))
+
+;; Query inputs are pinned across sizes so only the tree varies between
+;; rows. `hit-index` is well below the smallest sweep size so the same
+;; subject is present in every tree; `miss` is derived from a fixed seed.
+(def ^:private ^:const hit-index 17)
+(def ^:private fixed-miss (miss-subject (Random. 7)))
+
 (defn- fixture [n]
-  (let [subs       (subvec @all-subjects 0 n)
-        tree       (build-tree subs)
-        hit        (nth subs (quot n 2))
-        miss       (miss-subject (Random. (+ 99 n)))]
+  (let [subs (subvec @all-subjects 0 n)
+        tree (build-tree subs)
+        hit  (nth subs hit-index)]
     {:n       n
      :tree    tree
      :subs    subs
      :hit     hit
-     :miss    miss
-     :star    (star-pattern hit)
-     :fanout  (fanout-pattern hit)}))
+     :miss    fixed-miss
+     :star    star-pattern
+     :fanout  fanout-pattern}))
 
 (def ^:private noop-cb (fn [_ _] true))
 

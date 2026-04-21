@@ -32,8 +32,7 @@
    Mutating operations use `swap!` with pure recursive helpers; the
    helpers return `[new-node old-value updated?]` tuples which the swap
    wrapper unpacks to update size."
-  (:refer-clojure :exclude [])
-  (:require [clojure.string :as str]))
+  (:refer-clojure :exclude []))
 
 ;; --- constants (match stree/util.go:18-20,48) ---
 
@@ -505,12 +504,21 @@
   "Walks every entry whose subject is matched by the wildcard filter and
    invokes `(cb subject value)` for each. `*` matches a single token,
    `>` matches one or more trailing tokens. Callback return value is
-   ignored (no early termination, matches Go stree.go:116-125)."
+   ignored (no early termination, matches Go stree.go:116-125).
+
+   Fast path: a filter containing no `*` / `>` bytes is a literal — at
+   most one entry can match, so dispatch to `lookup`. gen-parts would
+   otherwise produce a single-literal parts vector and the full walker
+   would do the same work as a lookup plus extra bookkeeping."
   [st ^String filter cb]
-  (let [root (:root @st)]
-    (when (and root filter (pos? (.length filter)) cb)
-      (let [parts (gen-parts filter)]
-        (do-match root parts "" (has-fwc? parts) cb)))))
+  (when (and filter (pos? (.length filter)) cb)
+    (if (and (neg? (.indexOf filter (int pwc)))
+             (neg? (.indexOf filter (int fwc))))
+      (let [[v found?] (lookup st filter)]
+        (when found? (cb filter v)))
+      (when-let [root (:root @st)]
+        (let [parts (gen-parts filter)]
+          (do-match root parts "" (has-fwc? parts) cb))))))
 
 ;; --- iter ---
 
