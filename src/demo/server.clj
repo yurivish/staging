@@ -10,6 +10,7 @@
    [reitit.ring :as ring]
    [toolkit.datastar.core :as d]
    [toolkit.hotreload :as hotreload]
+   [toolkit.sqlite :as sqlite]
    [toolkit.web :as web]))
 
 ;; Conventions
@@ -101,7 +102,7 @@
                     :session-store (session-mem/memory-store (:sessions app))})})))
 
 ;; App state component
-(defrecord App [counter bg-color sessions dev?]
+(defrecord App [counter bg-color sessions sqlite dev?]
   component/Lifecycle
   (start [this]
     (assoc this
@@ -130,9 +131,10 @@
     (when stop-fn (stop-fn :timeout 100))
     (assoc this :stop-fn nil)))
 
-(defn system [{:keys [port dev?]}]
+(defn system [{:keys [port dev? db-path]}]
   (component/system-map
-   :app (map->App {:dev? dev?})
+   :sqlite (sqlite/map->Sqlite {:path (or db-path "demo.sqlite")})
+   :app    (component/using (map->App {:dev? dev?}) [:sqlite])
    :server (component/using (map->Server {:port port}) [:app])))
 
 (defn -main [& _]
