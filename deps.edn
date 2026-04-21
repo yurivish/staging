@@ -15,6 +15,8 @@
          metosin/malli             {:mvn/version "0.20.1"}
          metosin/reitit            {:mvn/version "0.10.1"}
          metosin/ring-http-response {:mvn/version "0.9.5"}
+         ring/ring-core             {:mvn/version "1.14.1"}
+         ring/ring-anti-forgery     {:mvn/version "1.4.0"}
          com.stuartsierra/component {:mvn/version "1.1.0"}
          com.aayushatharva.brotli4j/brotli4j
          {:mvn/version "1.22.0"}

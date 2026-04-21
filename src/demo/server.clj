@@ -4,6 +4,11 @@
    [toolkit.datastar.core :as d]
    [com.stuartsierra.component :as component]
    [hiccup2.core :as h]
+   [ring.middleware.anti-forgery :as anti-forgery]
+   [ring.middleware.keyword-params :as kparams]
+   [ring.middleware.params :as params]
+   [ring.middleware.session :as session]
+   [ring.middleware.session.memory :as session-mem]
    [ring.util.http-response :as r]
    [ring.util.response :as resp]
    [org.httpkit.server :as hk]
@@ -98,6 +103,38 @@
         (assoc response :body (str "<!doctype html>" (h/html (:args (:body response)))))
         response))))
 
+(defn csrf-token
+  "Read the current request's CSRF token. Bound by wrap-anti-forgery; nil outside a request."
+  [] anti-forgery/*anti-forgery-token*)
+
+(defn rotate-session
+  "Force a new session id on auth-state changes (login, logout, privilege change).
+  Ring has no built-in regeneration; assoc-ing a fresh :session rotates the id and
+  prevents session fixation. Call on every auth transition."
+  [response new-session-data]
+  (assoc response :session new-session-data))
+
+(defn- wrap-stack [app]
+  ;; Order is outermost → innermost: session must see every inner request;
+  ;; anti-forgery needs :session and :form-params already attached.
+  [#(session/wrap-session
+     %
+     {:store       (session-mem/memory-store (:sessions app))
+      :cookie-name "demo-session"
+      ;; HttpOnly: blocks JS access (XSS token theft).
+      ;; SameSite=Lax: blocks cross-site POST CSRF while allowing top-level nav.
+      ;; Secure: prod-only — browsers won't set Secure cookies over http://localhost.
+      :cookie-attrs {:http-only true
+                     :same-site :lax
+                     :secure    (not (:dev? app))
+                     :path      "/"}})
+   kparams/wrap-keyword-params
+   params/wrap-params
+   ;; CSRF: default :read-token checks X-CSRF-Token / X-XSRF-Token headers and
+   ;; __anti-forgery-token params. DataStar @post can send the header directly.
+   anti-forgery/wrap-anti-forgery
+   wrap-html])
+
 (defn routes [app]
   (let [dev? (:dev? app)]
     (ring/ring-handler
@@ -108,20 +145,24 @@
        ["/inc" (inc-handler app)]
        (when dev? [hotreload/path hotreload/handler])])
      (static-handler dev?)
-     {:middleware [wrap-html]})))
+     {:middleware (wrap-stack app)})))
 
 ;; App state component
-(defrecord App [counter bg-color dev?]
+(defrecord App [counter bg-color sessions dev?]
   component/Lifecycle
   (start [this]
     (assoc this
            :counter  (atom 0)
-           :bg-color (atom "hsl(210, 70%, 85%)")))
+           :bg-color (atom "hsl(210, 70%, 85%)")
+           ;; In-memory session store; survives requests, not restarts. Swap for a
+           ;; TTL-capable store in prod (ring-ttl-session, or an lmdb-backed one).
+           :sessions (atom {})))
 
   (stop [this]
     (assoc this
            :counter nil
-           :bg-color nil)))
+           :bg-color nil
+           :sessions nil)))
 
 ;; Web server component
 (defrecord Server [port app stop-fn]
