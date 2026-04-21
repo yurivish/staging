@@ -94,19 +94,33 @@
    See https://github.com/starfederation/datastar/blob/main/sdk/ADR.md#serversenteventgeneratorexecutescript"
   [sse script & [opts]] (send-event! sse (execute-script-core script opts)))
 
-(defn read-signals
-  "See https://github.com/starfederation/datastar/blob/main/sdk/ADR.md#readsignals"
+(defn- datastar-request?
+  "DataStar sets `Datastar-Request: true` on every signal-carrying request, so
+  we gate body/query parsing on it instead of sniffing Content-Type — tighter
+  signal and avoids touching non-DataStar JSON bodies the app may receive."
   [request]
-  (case (:request-method request)
-    (:get :delete)
-    (some-> request :query-params :datastar (json/read-str :key-fn keyword))
+  (= "true" (some-> request :headers (get "datastar-request") string/lower-case)))
 
-    (:post :put :patch)
-    (or (:json-params request)
-      ;; modern versions of clojure garbage-collect unused keywords, so this does not risk memory exhaustion
-        (some-> request :body io/reader (json/read :key-fn keyword)))
+(defn read-signals
+  "See https://github.com/starfederation/datastar/blob/main/sdk/ADR.md#readsignals
+  Optionally takes a `cached-params-key`: on body-bearing methods, looks there
+  first before consuming the single-use Ring body. Pass whichever key your
+  upstream pre-parser uses (e.g. :body-params for Muuntaja, :json-params for
+  ring-json)."
+  ([request] (read-signals request nil))
+  ([request cached-params-key]
+   (case (:request-method request)
+     (:get :delete)
+     (when (datastar-request? request)
+       (some-> request :query-params :datastar (json/read-str :key-fn keyword)))
 
-    nil))
+     (:post :put :patch)
+     (when (datastar-request? request)
+       (or (some-> cached-params-key request)
+           ;; modern versions of clojure garbage-collect unused keywords, so this does not risk memory exhaustion
+           (json/read (io/reader (:body request)) :key-fn keyword)))
+
+     nil)))
 
 ;; perf opportunities:
 ;; - maintain the data as a vector through to the event->bytes method

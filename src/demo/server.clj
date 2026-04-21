@@ -1,6 +1,7 @@
 (ns demo.server
   (:require
    [clojure.core.async :refer [io-thread]]
+   [clojure.data.json :as json]
    [toolkit.datastar.core :as d]
    [com.stuartsierra.component :as component]
    [hiccup2.core :as h]
@@ -45,12 +46,16 @@
 
 (def static-path "/static")
 
+(declare csrf-token)
+
 (defn page [{:keys [head body dev?]}]
   (html
    [:html
     [:head head
      [:script {:type "module" :defer true :src (str static-path "/datastar-pro.js")}]]
-    [:body {:data-init "@get('/stream')"} body (when dev? hotreload/snippet)]]))
+    [:body {:data-init    "@get('/stream')"
+            :data-signals (json/write-str {:csrf (csrf-token)})}
+     body (when dev? hotreload/snippet)]]))
 
 (defn index-page [app]
   (page {:body (h/html
@@ -114,6 +119,22 @@
   [response new-session-data]
   (assoc response :session new-session-data))
 
+(defn- wrap-cache-signals
+  "Parse DataStar signals once and cache on :body-params. Downstream readers
+  (CSRF, any handler that wants signals) read :body-params directly — the Ring
+  body is single-use. Parses every DataStar request regardless of downstream use."
+  [handler]
+  (fn [req]
+    (handler (if-let [signals (d/read-signals req)]
+               (assoc req :body-params signals)
+               req))))
+
+(defn- read-csrf-from-signals
+  "wrap-anti-forgery :read-token that pulls the CSRF value out of the cached
+  signals (see wrap-cache-signals) instead of the X-CSRF-Token header."
+  [req]
+  (some-> req :body-params :csrf))
+
 (defn- wrap-stack [app]
   ;; Order is outermost → innermost: session must see every inner request;
   ;; anti-forgery needs :session and :form-params already attached.
@@ -130,9 +151,10 @@
                      :path      "/"}})
    kparams/wrap-keyword-params
    params/wrap-params
-   ;; CSRF: default :read-token checks X-CSRF-Token / X-XSRF-Token headers and
-   ;; __anti-forgery-token params. DataStar @post can send the header directly.
-   anti-forgery/wrap-anti-forgery
+   wrap-cache-signals
+   ;; CSRF token is shipped as a DataStar signal (see `page`), so wrap-anti-forgery
+   ;; reads from the parsed signals rather than the default X-CSRF-Token header.
+   #(anti-forgery/wrap-anti-forgery % {:read-token read-csrf-from-signals})
    wrap-html])
 
 (defn routes [app]
