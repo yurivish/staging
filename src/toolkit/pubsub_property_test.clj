@@ -4,9 +4,12 @@
    invoked forms a valid `pick-one` of what a naive matcher would return
    at that moment. Multiplicity-aware — `:fired` is a vector in call
    order so a duplicate-delivery bug can't hide behind set equality."
-  (:require [clojure.test.check.clojure-test :refer [defspec]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
+            [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [toolkit.frng :as frng]
             [toolkit.pubsub :as ps]
             [toolkit.sublist-property-test :as spt]))
 
@@ -67,3 +70,113 @@
 (defspec delivery-set-valid 100
   (prop/for-all [ops gen-ops]
     (every? valid-delivery? (run-ops ops))))
+
+;; --- frng-driven simulation ---
+;;
+;; Same invariants, but driven step-by-step so we can (a) check delivery
+;; correctness *per-pub* (localizing failures), (b) explicitly verify that
+;; unsubbed handlers never fire again, and (c) run longer interleavings
+;; than the batch defspec's 40-op cap. On failure, frng/search reports
+;; `{:size :seed}` so the case can be replayed via frng/run-once.
+
+(defn- frng-literal [frng]
+  (apply str (repeatedly (inc (frng/int-inclusive frng 3))
+                         #(char (+ (int \a) (frng/int-inclusive frng 25))))))
+
+(defn- frng-subject [frng]
+  (str/join "." (repeatedly (inc (frng/int-inclusive frng 4))
+                            #(frng-literal frng))))
+
+(defn- frng-pattern [frng]
+  (let [n         (inc (frng/int-inclusive frng 3))
+        tok       #(if (zero? (frng/int-inclusive frng 4))
+                     "*"
+                     (frng-literal frng))
+        toks      (vec (repeatedly n tok))
+        trailing? (zero? (frng/int-inclusive frng 3))]
+    (str/join "." (if trailing? (conj toks ">") toks))))
+
+(defn- frng-queue [frng]
+  (when (zero? (frng/int-inclusive frng 3))
+    (frng-literal frng)))
+
+(defn- pubsub-sim [frng]
+  (let [pubsub   (ps/make)
+        ;; Never shrink: kept so we can verify unsubbed handlers stay silent.
+        all-subs (atom [])
+        weights  (frng/swarm-weights frng [:sub :unsub :pub])]
+    (loop []
+      (case (frng/weighted frng weights)
+        :sub
+        (let [pat   (frng-pattern frng)
+              q     (frng-queue frng)
+              id    (count @all-subs)
+              fired (atom 0)
+              alive (atom true)
+              h     (fn [_ _ _] (swap! fired inc))
+              u     (ps/sub pubsub pat h (when q {:queue q}))]
+          (swap! all-subs conj {:id id :pattern pat :queue q
+                                :unsub u :fired fired :alive? alive}))
+
+        :unsub
+        (let [live-idxs (into [] (keep-indexed (fn [i s] (when @(:alive? s) i)))
+                              @all-subs)]
+          (when (seq live-idxs)
+            (let [i (nth live-idxs (frng/index frng live-idxs))
+                  s (nth @all-subs i)]
+              ((:unsub s))
+              (reset! (:alive? s) false))))
+
+        :pub
+        (let [subj    (frng-subject frng)
+              all     @all-subs
+              before  (mapv #(deref (:fired %)) all)]
+          (ps/pub pubsub subj ::msg)
+          (let [after   (mapv #(deref (:fired %)) all)
+                delta   (mapv - after before)
+                fired-ids (into #{}
+                                (comp (map-indexed (fn [i d] (when (pos? d) i)))
+                                      (filter some?))
+                                delta)
+                live-triples (into []
+                                   (comp (filter #(deref (:alive? %)))
+                                         (map (fn [{:keys [pattern id queue]}]
+                                                [pattern id queue])))
+                                   all)
+                {:keys [plain groups]} (spt/naive-match live-triples subj)
+                expected-all (into plain (mapcat val groups))
+                dead-fired   (keep-indexed
+                               (fn [i d]
+                                 (when (and (pos? d) (not @(:alive? (nth all i))))
+                                   i))
+                               delta)]
+            (assert (every? #(<= % 1) delta)
+                    (str "duplicate delivery on " subj " — deltas=" delta))
+            (assert (empty? dead-fired)
+                    (str "dead sub fired on " subj ": " (vec dead-fired)))
+            (assert (every? fired-ids plain)
+                    (str "plain miss on " subj ": missing=" (vec (remove fired-ids plain))))
+            (assert (every? (fn [[_ members]]
+                              (or (empty? members)
+                                  (= 1 (count (filter fired-ids members)))))
+                            groups)
+                    (str "queue group invariant failed on " subj
+                         ": fired=" fired-ids " groups=" groups))
+            (assert (every? expected-all fired-ids)
+                    (str "extras on " subj ": " (vec (remove expected-all fired-ids)))))))
+      (recur))))
+
+(defn- run-frng-sim!
+  "Run a frng simulation via `frng/search` under clojure.test. On failure,
+   include the replay recipe `{:size :seed}` in the assertion message."
+  [test-fn opts]
+  (let [result (frng/search test-fn opts)]
+    (is (= :pass result)
+        (when (map? result)
+          (let [{:keys [size seed ^Throwable ex]} (:fail result)]
+            (str "simulation failed at size=" size " seed=" seed
+                 " — replay via (frng/run-once <test-fn> {:size " size
+                 " :seed " seed "}) — cause: " (.getMessage ex)))))))
+
+(deftest delivery-invariants-frng
+  (run-frng-sim! pubsub-sim {:attempts 30 :max-size 8192}))
