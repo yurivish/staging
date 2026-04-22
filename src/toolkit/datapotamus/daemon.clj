@@ -85,6 +85,10 @@
                            fw registry pending stop-ch done-ch]
   component/Lifecycle
   (start [this]
+    ;; interval-ms is the filewatcher's poll period. debounce-ms must be
+    ;; comfortably larger than it — otherwise filewatcher events can
+    ;; straddle the debounce window and trigger duplicate spawns for the
+    ;; same drop. 50ms here; `make` enforces debounce-ms >= stable-gap-ms.
     (let [fw' (-> (fw/make {:interval-ms 50 :safety-gap-ms stable-gap-ms
                             :changes-buffer 64})
                   (fw/watch-dir-recursive watch-dir)
@@ -120,6 +124,32 @@
            :stop-ch nil :done-ch nil)))
 
 (defn make
+  "Build a PipelineDaemon. Required keys: `:watch-dir` `:datasource`
+   `:events-ch` `:pipeline`.
+
+   Timing tunables (all in ms):
+
+   `:stable-gap-ms` — trailing-edge window the filewatcher waits before
+     trusting a file's mtime. Default 3000 (chosen to survive coarse-mtime
+     filesystems; see `toolkit.filewatcher` — FAT has 2s resolution). Lower
+     it to ~200 on modern filesystems for snappier turnaround.
+
+   `:debounce-ms` — how long the daemon waits with no new event for a slug
+     before spawning a run. Coalesces the filewatcher's rapid-fire events
+     (one per 50ms poll tick while the file is dirty) into a single spawn.
+     Must exceed `toolkit.filewatcher`'s poll interval (50ms) by a clear
+     margin; defaults to `:stable-gap-ms`, which is already comfortable.
+
+   `:idle-complete-ms` — how long the runner sits in quiescence on
+     `report-chan` before declaring a run :completed. Default 500. Raise
+     it if procs legitimately pause (e.g., LLM calls); lower it for
+     snappier test suites.
+
+   Supersede: if a new event for the same slug debounces into a spawn
+   while an earlier run for that slug is in flight, the earlier run's
+   `cancel-ch` is closed and it transitions to :cancelled. Sink writes
+   already performed are NOT rolled back — filter queries by
+   `runs.state = 'completed'` if that matters."
   [{:keys [stable-gap-ms debounce-ms idle-complete-ms]
     :or {stable-gap-ms 3000 idle-complete-ms 500} :as opts}]
   (map->PipelineDaemon (assoc opts
