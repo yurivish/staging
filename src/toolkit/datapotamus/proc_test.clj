@@ -8,16 +8,16 @@
    :run-id (random-uuid) :data data})
 
 (deftest derive-carries-run-fresh-ids-new-data
-  (let [p (msg 10) c (proc/derive p 9)]
+  (let [p (msg 10) c (proc/derive-msg p 9)]
     (is (= (:run-id p) (:run-id c)))
     (is (not= (:msg-id p) (:msg-id c)))
     (is (not= (:data-id p) (:data-id c)))
     (is (= 9 (:data c)))))
 
 (deftest send-out-event-shape
-  (let [p (msg 10) c (proc/derive p 9)
+  (let [p (msg 10) c (proc/derive-msg p 9)
         e (proc/send-out-event :a c :parent-msg-ids [(:msg-id p)]
-                                :to-step-id :b :provenance {:idx 0})]
+                               :to-step-id :b :provenance {:idx 0})]
     (is (= :send-out (:kind e)))
     (is (= :a (:step-id e)))
     (is (= :b (:to-step-id e)))

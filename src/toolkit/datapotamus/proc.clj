@@ -5,7 +5,7 @@
 
 (defn- now [] (System/currentTimeMillis))
 
-(defn derive [parent new-data]
+(defn derive-msg [parent new-data]
   {:msg-id (random-uuid) :data-id (random-uuid)
    :run-id (:run-id parent) :data new-data})
 
@@ -44,7 +44,7 @@
     ([s _] s)
     ([s _ m]
      (try
-       (let [c (derive m (:data (f m)))
+       (let [c (derive-msg m (:data (f m)))
              evs [(recv-event step-id m)
                   (send-out-event step-id c :parent-msg-ids [(:msg-id m)])
                   (success-event step-id c)]]

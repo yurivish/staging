@@ -10,7 +10,7 @@
 
 (set! *warn-on-reflection* true)
 
-(defn- ^Path ->path [^String s] (Paths/get s (into-array String [])))
+(defn- ->path ^Path [^String s] (Paths/get s (into-array String [])))
 
 (defn- stat [^Path p]
   (when-let [^BasicFileAttributes attrs
@@ -31,17 +31,17 @@
                          {:state :cancelled
                           :finished-at (System/currentTimeMillis)}))
     (store/insert-run! datasource
-      {:run-id rid :pipeline-id (:pipeline-id pipeline)
-       :input-path abs-path :input-slug slug
-       :input-mtime (:mtime s) :input-size (:size s)
-       :state :pending :started-at (System/currentTimeMillis)})
+                       {:run-id rid :pipeline-id (:pipeline-id pipeline)
+                        :input-path abs-path :input-slug slug
+                        :input-mtime (:mtime s) :input-size (:size s)
+                        :state :pending :started-at (System/currentTimeMillis)})
     (a/thread
       (try
         (runner/run-pipeline!
-          {:datasource datasource :events-ch events-ch :run-id rid
-           :pipeline pipeline
-           :seed {:data {:path abs-path :slug slug}}
-           :idle-complete-ms idle-complete-ms})
+         {:datasource datasource :events-ch events-ch :run-id rid
+          :pipeline pipeline
+          :seed {:data {:path abs-path :slug slug}}
+          :idle-complete-ms idle-complete-ms})
         (finally (reg/remove-if-matches! registry slug rid))))))
 
 (defn- handle! [{:keys [watch-dir registry] :as ctx} {:keys [path dir?]}]
@@ -52,7 +52,7 @@
       (try
         (doseq [^Path child (iterator-seq (.iterator (Files/walk root no-opts)))
                 :when (not (Files/isDirectory child
-                             ^"[Ljava.nio.file.LinkOption;" (into-array LinkOption [])))]
+                                              ^"[Ljava.nio.file.LinkOption;" (into-array LinkOption [])))]
           (let [abs  (str child)
                 slug (str (.relativize (->path watch-dir) child))]
             (when-not (reg/current registry slug)
@@ -68,7 +68,7 @@
   component/Lifecycle
   (start [this]
     (let [fw' (-> (fw/make {:interval-ms 50 :safety-gap-ms stable-gap-ms
-                             :changes-buffer 64})
+                            :changes-buffer 64})
                   (fw/watch-dir-recursive watch-dir)
                   fw/start)
           r    (reg/make)
