@@ -51,6 +51,6 @@
          [s {:out [c] ::flow/report evs}])
        (catch Throwable ex
          (throw (ex-info (ex-message ex)
-                          (assoc (ex-data ex)
-                                 ::failure-event (failure-event step-id m ex))
-                          ex)))))))
+                         (assoc (ex-data ex)
+                                ::failure-event (failure-event step-id m ex))
+                         ex)))))))
