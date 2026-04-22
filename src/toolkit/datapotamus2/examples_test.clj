@@ -3,25 +3,29 @@
    demonstrating one capability; the suite ordered simplest → most
    sophisticated."
   (:require [clojure.test :refer [deftest is testing]]
+            [com.stuartsierra.dependency :as dep]
             [toolkit.datapotamus2.core :as dp2]
-            [toolkit.datapotamus2.combinators :as c]))
+            [toolkit.datapotamus2.combinators :as c]
+            [toolkit.pubsub :as pubsub]))
 
 (defn- events-of [result kind]
   (filterv #(= kind (:kind %)) (:events result)))
 
-(defn- build-dag
-  "Fold events into {msg-id → {:parents [...] :kind ...}}. Roots have
-   empty :parents; every other node lists its parents."
+(defn- events->dag
+  "Fold events into a stuartsierra dependency graph + a {msg-id → kind}
+   map. Each msg depends on its parents (per :parent-msg-ids)."
   [events]
-  (reduce (fn [g e]
+  (reduce (fn [{:keys [g kinds]} e]
             (case (:kind e)
-              :seed     (assoc g (:msg-id e) {:parents [] :kind :seed})
-              :send-out (assoc g (:msg-id e) {:parents (vec (:parent-msg-ids e))
-                                              :kind :send-out})
-              :merge    (assoc g (:msg-id e) {:parents (vec (:parent-msg-ids e))
-                                              :kind :merge})
-              g))
-          {} events))
+              :seed     {:g (dep/depend g (:msg-id e) ::root)
+                         :kinds (assoc kinds (:msg-id e) :seed)}
+              (:send-out :merge)
+              {:g (reduce (fn [g p] (dep/depend g (:msg-id e) p))
+                          g (:parent-msg-ids e))
+               :kinds (assoc kinds (:msg-id e) (:kind e))}
+              {:g g :kinds kinds}))
+          {:g (dep/graph) :kinds {}}
+          events))
 
 (deftest linear-chain
   (let [spec {:procs {:inc  (c/wrap :inc inc)
@@ -200,17 +204,16 @@
               :conns [[[:split :out] [:fi :in]]
                       [[:fi :out]    [:sink :in]]]}
         result (dp2/run! (dp2/instrument spec) {:entry :split :data :x})
-        dag    (build-dag (:events result))]
-    (testing "every non-root msg's parents exist in the DAG"
-      (doseq [[mid {:keys [parents]}] dag]
-        (doseq [p parents]
-          (is (contains? dag p) (str "parent " p " of " mid " missing")))))
-    (testing "exactly one root node (the seed)"
-      (is (= 1 (count (filterv (fn [[_ v]] (empty? (:parents v))) dag)))))
-    (testing "exactly one merge node, with three parents"
-      (let [merges-in-dag (filterv (fn [[_ v]] (= :merge (:kind v))) dag)]
-        (is (= 1 (count merges-in-dag)))
-        (is (= 3 (count (:parents (second (first merges-in-dag)))))))) ))
+        {:keys [g kinds]} (events->dag (:events result))]
+    (testing "graph is acyclic (topo-sort succeeds)"
+      (is (some? (dep/topo-sort g))))
+    (testing "exactly one real root (the seed) attached to the ::root sentinel"
+      (let [roots (dep/immediate-dependents g ::root)]
+        (is (= 1 (count roots)))))
+    (testing "exactly one merge node, with three immediate parents"
+      (let [merge-ids (for [[mid k] kinds :when (= :merge k)] mid)]
+        (is (= 1 (count merge-ids)))
+        (is (= 3 (count (dep/immediate-dependencies g (first merge-ids)))))))))
 
 (deftest multiplicity-frequencies
   ;; Demonstrates the frequencies-based assertion style (per user memory).
@@ -226,3 +229,81 @@
       (is (= {:split 3}
              (frequencies (map :step-id
                                (filterv :port (events-of result :send-out)))))))))
+
+;; -----------------------------------------------------------------------------
+;; Pubsub-based tracing examples
+;; -----------------------------------------------------------------------------
+
+(deftest watcher-custom-subscriber
+  ;; External observer: subscribes a handler against the pubsub; it fires
+  ;; synchronously as events are published by wrap-procs.
+  (let [ps (pubsub/make)
+        recv-count (atom 0)
+        u (pubsub/sub ps "recv.flow.run-A.>"
+                      (fn [_ _ _] (swap! recv-count inc)))
+        spec (dp2/instrument
+              {:procs {:split (c/fan-out :split 3)
+                       :sink  (c/absorb-sink :sink)}
+               :conns [[[:split :out] [:sink :in]]]
+               :entry :split}
+              {:pubsub ps :flow-id "run-A"})
+        result (dp2/run! spec {:data :x})]
+    (u)
+    (is (= :completed (:state result)))
+    (is (= 4 @recv-count))))      ; split + 3 sinks = 4 :recv events
+
+(deftest multi-flow-shared-pubsub
+  ;; One pubsub, two concurrent flows. Events distinguishable by flow-id.
+  (let [ps (pubsub/make)
+        tallies (atom {})
+        u (pubsub/sub ps "recv.flow.*.>"
+                      (fn [_ ev _]
+                        (swap! tallies update (first (:flow-path ev)) (fnil inc 0))))
+        spec-A (dp2/instrument
+                {:procs {:a (c/wrap :a inc) :sa (c/absorb-sink :sa)}
+                 :conns [[[:a :out] [:sa :in]]]
+                 :entry :a}
+                {:pubsub ps :flow-id "A"})
+        spec-B (dp2/instrument
+                {:procs {:b (c/wrap :b dec) :sb (c/absorb-sink :sb)}
+                 :conns [[[:b :out] [:sb :in]]]
+                 :entry :b}
+                {:pubsub ps :flow-id "B"})
+        ra (dp2/run! spec-A {:data 1})
+        rb (dp2/run! spec-B {:data 2})]
+    (u)
+    (is (= :completed (:state ra)))
+    (is (= :completed (:state rb)))
+    (is (= {"A" 2 "B" 2} @tallies))))      ; 2 :recv events per flow
+
+(deftest nested-flow-namespaced
+  ;; Nested flow as data — no subflow combinator. Step-ids can collide
+  ;; between outer and inner; the flow-path in subjects + event bodies
+  ;; namespaces them.
+  (let [ps (pubsub/make)
+        inner {:procs {:inc  (c/wrap :inc #(+ % 100))
+                       :done (c/absorb-sink :done)}
+               :conns [[[:inc :out] [:done :in]]]
+               :entry :inc :output :done}
+        outer {:procs {:inc  (c/wrap :inc inc)        ; SAME step-id as inner's :inc
+                       :sub  inner                     ; <-- nested flow is data
+                       :sink (c/absorb-sink :sink)}
+               :conns [[[:inc :out] [:sub :in]]
+                       [[:sub :out] [:sink :in]]]
+               :entry :inc}
+        outer-recvs (atom [])
+        inner-recvs (atom [])
+        u1 (pubsub/sub ps "recv.flow.outer.step.inc"
+                       (fn [_ ev _] (swap! outer-recvs conj ev)))
+        u2 (pubsub/sub ps "recv.flow.outer.flow.sub.step.inc"
+                       (fn [_ ev _] (swap! inner-recvs conj ev)))
+        result (dp2/run! (dp2/instrument outer {:pubsub ps :flow-id "outer"})
+                         {:data 5})]
+    (u1) (u2)
+    (is (= :completed (:state result)))
+    (is (= 1 (count @outer-recvs)))
+    (is (= 1 (count @inner-recvs)))
+    (is (= ["outer"]       (:flow-path (first @outer-recvs))))
+    (is (= ["outer" "sub"] (:flow-path (first @inner-recvs))))
+    (is (= 5 (:data (first @outer-recvs))))            ; outer's :inc received seed 5
+    (is (= 6 (:data (first @inner-recvs))))))          ; inner's :inc received 6 (5+1 from outer's inc)

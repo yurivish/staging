@@ -18,6 +18,7 @@
          ring/ring-core             {:mvn/version "1.15.4"}
          ring/ring-anti-forgery     {:mvn/version "1.4.0"}
          com.stuartsierra/component {:mvn/version "1.2.0"}
+         com.stuartsierra/dependency {:mvn/version "1.0.0"}
          com.aayushatharva.brotli4j/brotli4j
          {:mvn/version "1.22.0"}
          ;; lmdbjava bundles native libs for linux/mac/windows; no JNI
