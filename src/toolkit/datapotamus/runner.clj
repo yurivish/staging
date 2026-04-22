@@ -12,9 +12,6 @@
 (defn- forward! [ch run-id evs]
   (doseq [e evs] (a/>!! ch (assoc e :run-id run-id))))
 
-(defn- delta [evs]
-  (reduce (fn [n e] (case (:kind e) :send-out (inc n) :recv (dec n) n)) 0 evs))
-
 (defn run-pipeline!
   "Runs `pipeline` to completion, failure, or idle-quiescence. Returns the final run map."
   [{:keys [datasource events-ch run-id pipeline seed idle-complete-ms]
@@ -31,7 +28,7 @@
       (emit! events-ch run-id :run-started)
       (flow/resume g)
       @(flow/inject g [entry :in] [seed-msg])
-      (loop [in-flight 1]
+      (loop []
         (let [timeout (a/timeout idle-complete-ms)
               [v ch] (a/alts!! [report-chan error-chan timeout])]
           (cond
@@ -52,7 +49,7 @@
             (and (= ch report-chan) (some? v))
             (let [evs (if (sequential? v) v [v])]
               (forward! events-ch run-id evs)
-              (recur (long (+ in-flight (delta evs)))))
+              (recur))
 
             (= ch timeout)
             (do (flow/stop g)
@@ -62,7 +59,7 @@
                                      :finished-at (System/currentTimeMillis)})
                 (store/get-run datasource run-id))
 
-            :else (recur in-flight))))
+            :else (recur))))
       (catch Throwable ex
         (try (flow/stop g) (catch Throwable _))
         (store/update-run! datasource run-id
