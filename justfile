@@ -7,3 +7,6 @@ run:
 
 prep:
     clj -X:deps prep
+
+lint path="src":
+    clojure -M:kondo --lint {{path}}

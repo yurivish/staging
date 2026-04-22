@@ -1,5 +1,5 @@
 (ns toolkit.spline-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -147,10 +147,10 @@
 
 (defspec internal-points-appear-as-anchors 50
   (prop/for-all [pts (gen/vector gen-point 4 20)]
-    (let [tris (vec (spline/quad-beziers pts))
-          starts (set (map first tris))
-          ends   (set (map last tris))]
-      (every? (fn [i]
-                (or (contains? starts (nth pts i))
-                    (contains? ends   (nth pts i))))
-              (range 1 (dec (count pts)))))))
+                (let [tris (vec (spline/quad-beziers pts))
+                      starts (set (map first tris))
+                      ends   (set (map last tris))]
+                  (every? (fn [i]
+                            (or (contains? starts (nth pts i))
+                                (contains? ends   (nth pts i))))
+                          (range 1 (dec (count pts)))))))
