@@ -181,20 +181,44 @@
     (testing "no failure events (retries succeeded before exhaustion)"
       (is (empty? (events-of result :failure))))))
 
-(deftest failure-propagates-to-failed-state
+(deftest failure-surfaces-as-event-not-run-level
+  ;; A throw in a step-fn is a message-level failure: it surfaces as a
+  ;; :failure event, the failed msg does not propagate downstream, and
+  ;; the run as a whole still completes. retry exhausts its attempts
+  ;; and the final throw reaches wrap-proc's catch.
   (let [permafail (fn [_] (throw (ex-info "boom" {:reason :permafail})))
         spec {:procs {:try  (c/retry :try permafail 2)
                       :sink (c/absorb-sink :sink)}
               :conns [[[:try :out] [:sink :in]]]}
         result (dp2/run! (dp2/instrument spec) {:entry :try :data 42})]
-    (testing "run fails"
-      (is (= :failed (:state result))))
+    (testing "run completes (failure is message-level, not run-level)"
+      (is (= :completed (:state result)))
+      (is (nil? (:error result))))
     (testing "exactly one :failure event for :try"
       (let [fs (events-of result :failure)]
         (is (= 1 (count fs)))
         (is (= :try (:step-id (first fs))))
         (is (= "boom" (get-in (first fs) [:error :message])))))
-    (testing "sink never received"
+    (testing "failed msg does not propagate to sink"
+      (is (empty? (filterv #(= :sink (:step-id %)) (events-of result :recv)))))))
+
+(deftest uncaught-failure-continues-run
+  ;; Isolates wrap-proc's swallow from retry. A plain throw in step-fn
+  ;; yields :failure + run completion, with no downstream emission.
+  (let [spec {:procs {:boom (c/wrap :boom (fn [_] (throw (ex-info "oops" {}))))
+                      :sink (c/absorb-sink :sink)}
+              :conns [[[:boom :out] [:sink :in]]]}
+        result (dp2/run! (dp2/instrument spec) {:entry :boom :data 1})]
+    (testing "run completes"
+      (is (= :completed (:state result)))
+      (is (nil? (:error result))))
+    (testing "exactly one :failure event for :boom"
+      (let [fs (events-of result :failure)]
+        (is (= 1 (count fs)))
+        (is (= :boom (:step-id (first fs))))))
+    (testing ":recv was emitted for :boom (counter balance relies on this)"
+      (is (= 1 (count (filterv #(= :boom (:step-id %)) (events-of result :recv))))))
+    (testing "failed msg does not propagate to sink"
       (is (empty? (filterv #(= :sink (:step-id %)) (events-of result :recv)))))))
 
 (deftest provenance-dag-is-well-formed

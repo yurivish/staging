@@ -131,26 +131,28 @@
                           ms))))]
     resolved-merges))
 
-(defn- build-events [step-id m output]
-  (let [ports      (port-output-keys output)
-        port-ids   (into #{} (mapcat (fn [p] (map :msg-id (get output p)))) ports)
-        derivs     (->> (get output ::derivations)
-                        ;; dedup: a msg that appears in a port output is not
-                        ;; also emitted as a nil-port derivation.
-                        (remove #(port-ids (:msg-id %))))
-        merges     (get output ::merges)
-        ev-recv    [(recv-event step-id m)]
-        ev-merges  (mapv (fn [{:keys [msg-id parents]}]
-                           (merge-event step-id msg-id parents))
-                         merges)
-        ev-derivs  (mapv (fn [c] (send-out-event step-id nil c)) derivs)
-        ev-sends   (into []
-                         (mapcat
-                          (fn [p]
-                            (map (fn [c] (send-out-event step-id p c)) (get output p))))
-                         ports)
-        ev-success [(success-event step-id m)]]
-    (into [] cat [ev-recv ev-merges ev-derivs ev-sends ev-success])))
+(defn- build-middle-events
+  "Events between :recv and :success: merges, nil-port derivations, and
+   port send-outs. :recv and :success are emitted by wrap-proc directly
+   so that :recv can be published unconditionally before user-fn runs."
+  [step-id output]
+  (let [ports     (port-output-keys output)
+        port-ids  (into #{} (mapcat (fn [p] (map :msg-id (get output p)))) ports)
+        derivs    (->> (get output ::derivations)
+                       ;; dedup: a msg that appears in a port output is not
+                       ;; also emitted as a nil-port derivation.
+                       (remove #(port-ids (:msg-id %))))
+        merges    (get output ::merges)
+        ev-merges (mapv (fn [{:keys [msg-id parents]}]
+                          (merge-event step-id msg-id parents))
+                        merges)
+        ev-derivs (mapv (fn [c] (send-out-event step-id nil c)) derivs)
+        ev-sends  (into []
+                        (mapcat
+                         (fn [p]
+                           (map (fn [c] (send-out-event step-id p c)) (get output p))))
+                        ports)]
+    (into [] cat [ev-merges ev-derivs ev-sends])))
 
 (defn- strip-dp2-keys [out]
   (reduce-kv (fn [m k v] (if (dp2-key? k) m (assoc m k v))) {} out))
@@ -176,16 +178,20 @@
     ([arg] (user-step-fn arg))
     ([s arg] (user-step-fn s arg))
     ([s in-id m]
+     ;; :recv is emitted unconditionally before user-fn runs so that a
+     ;; throw balances against :failure in the completion counter.
+     (emit (recv-event step-id m))
      (try
-       (let [[s' raw]  (user-step-fn s in-id m)
-             resolved  (resolve-output-nils (or raw {}) (:msg-id m))
-             events    (build-events step-id m resolved)
-             port-map  (strip-dp2-keys resolved)]
-         (doseq [ev events] (emit ev))
+       (let [[s' raw]      (user-step-fn s in-id m)
+             resolved      (resolve-output-nils (or raw {}) (:msg-id m))
+             middle-events (build-middle-events step-id resolved)
+             port-map      (strip-dp2-keys resolved)]
+         (doseq [ev middle-events] (emit ev))
+         (emit (success-event step-id m))
          [s' port-map])
        (catch Throwable ex
          (emit (failure-event step-id m ex))
-         (throw ex))))))
+         [s {}])))))
 
 ;; --- counter logic ----------------------------------------------------------
 
