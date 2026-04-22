@@ -38,3 +38,15 @@
       (Thread/sleep 100)
       (is (= 3 (count (store/get-events *ds* run-id nil))))
       (finally (component/stop tc)))))
+
+(deftest collector-keeps-running-across-flush-cycles
+  (let [run-id (random-uuid) _ (seed *ds* run-id)
+        tc (component/start (trace/make {:datasource *ds* :batch-size 10 :flush-ms 20}))
+        ch (:events-ch tc)]
+    (try
+      (a/>!! ch {:event-id (random-uuid) :run-id run-id :at 1 :kind :recv})
+      (Thread/sleep 80)
+      (a/>!! ch {:event-id (random-uuid) :run-id run-id :at 2 :kind :recv})
+      (Thread/sleep 80)
+      (is (= 2 (count (store/get-events *ds* run-id nil))))
+      (finally (component/stop tc)))))

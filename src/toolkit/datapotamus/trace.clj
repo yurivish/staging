@@ -16,12 +16,16 @@
           (loop [batch [] timer (a/timeout flush-ms)]
             (let [[v ch] (a/alts!! [events-ch timer stop-ch])]
               (cond
-                (or (= ch stop-ch) (nil? v))
-                (store/insert-events! datasource batch)
-
                 (= ch timer)
                 (do (store/insert-events! datasource batch)
                     (recur [] (a/timeout flush-ms)))
+
+                (or (= ch stop-ch) (nil? v))
+                (store/insert-events! datasource
+                  (loop [acc batch]
+                    (if-let [e (a/poll! events-ch)]
+                      (recur (conj acc e))
+                      acc)))
 
                 :else
                 (let [batch' (conj batch v)]
