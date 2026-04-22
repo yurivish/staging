@@ -44,27 +44,45 @@
           :idle-complete-ms idle-complete-ms})
         (finally (reg/remove-if-matches! registry slug rid))))))
 
-(defn- handle! [{:keys [watch-dir registry] :as ctx} {:keys [path dir?]}]
+(defn- schedule-spawn!
+  "Coalesce the filewatcher's rapid-fire events: record the latest seen
+   event for `slug`, then after `debounce-ms` of silence for that slug,
+   spawn a single run. If another event arrives first, that one resets
+   the clock and this goroutine is a no-op."
+  [{:keys [pending debounce-ms] :as ctx} slug ^String abs-path]
+  (let [gen (:gen (get (swap! pending update slug
+                                (fn [m]
+                                  {:gen (inc (:gen m 0)) :path abs-path}))
+                       slug))]
+    (a/go
+      (a/<! (a/timeout debounce-ms))
+      (let [cur (get @pending slug)]
+        (when (and cur (= gen (:gen cur)))
+          (swap! pending dissoc slug)
+          (spawn-run! ctx slug (:path cur)))))))
+
+(defn- handle! [{:keys [watch-dir] :as ctx} {:keys [path dir?]}]
   (if dir?
-    ;; Directory change: find files whose slugs have no live registry entry.
+    ;; Directory change: schedule spawns for every file under this subtree.
+    ;; The debouncer in schedule-spawn! deduplicates with later per-file events.
     (let [root (->path path)
           ^"[Ljava.nio.file.FileVisitOption;" no-opts (into-array java.nio.file.FileVisitOption [])]
       (try
         (doseq [^Path child (iterator-seq (.iterator (Files/walk root no-opts)))
                 :when (not (Files/isDirectory child
                                               ^"[Ljava.nio.file.LinkOption;" (into-array LinkOption [])))]
-          (let [abs  (str child)
-                slug (str (.relativize (->path watch-dir) child))]
-            (when-not (reg/current registry slug)
-              (spawn-run! ctx slug abs))))
+          (schedule-spawn! ctx
+                           (str (.relativize (->path watch-dir) child))
+                           (str child)))
         (catch Throwable _ nil)))
     ;; File content change.
-    (let [slug (str (.relativize (->path watch-dir) (->path path)))]
-      (spawn-run! ctx slug path))))
+    (schedule-spawn! ctx
+                     (str (.relativize (->path watch-dir) (->path path)))
+                     path)))
 
 (defrecord PipelineDaemon [watch-dir datasource events-ch pipeline
-                           stable-gap-ms idle-complete-ms
-                           fw registry stop-ch done-ch]
+                           stable-gap-ms debounce-ms idle-complete-ms
+                           fw registry pending stop-ch done-ch]
   component/Lifecycle
   (start [this]
     (let [fw' (-> (fw/make {:interval-ms 50 :safety-gap-ms stable-gap-ms
@@ -72,11 +90,14 @@
                   (fw/watch-dir-recursive watch-dir)
                   fw/start)
           r    (reg/make)
+          pend (atom {})
           stop (a/chan)
           done (a/chan)
           ctx  {:watch-dir watch-dir :datasource datasource
                 :events-ch events-ch :pipeline pipeline
-                :idle-complete-ms idle-complete-ms :registry r}]
+                :idle-complete-ms idle-complete-ms
+                :debounce-ms debounce-ms
+                :registry r :pending pend}]
       (a/thread
         (try
           (loop []
@@ -89,16 +110,19 @@
                          (println "datapotamus daemon error:" (ex-message ex)))))
                 (recur))))
           (finally (a/close! done))))
-      (assoc this :fw fw' :registry r :stop-ch stop :done-ch done)))
+      (assoc this :fw fw' :registry r :pending pend
+             :stop-ch stop :done-ch done)))
   (stop [this]
     (when stop-ch (a/close! stop-ch))
     (when done-ch (a/<!! done-ch))
     (when fw (fw/stop fw))
-    (assoc this :fw nil :registry nil :stop-ch nil :done-ch nil)))
+    (assoc this :fw nil :registry nil :pending nil
+           :stop-ch nil :done-ch nil)))
 
 (defn make
-  [{:keys [stable-gap-ms idle-complete-ms]
+  [{:keys [stable-gap-ms debounce-ms idle-complete-ms]
     :or {stable-gap-ms 3000 idle-complete-ms 500} :as opts}]
   (map->PipelineDaemon (assoc opts
                               :stable-gap-ms stable-gap-ms
+                              :debounce-ms (or debounce-ms stable-gap-ms)
                               :idle-complete-ms idle-complete-ms)))
