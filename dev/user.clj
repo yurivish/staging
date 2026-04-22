@@ -81,3 +81,45 @@
 ;; rebel-readline's `:main-opts` replaces ours when aliases combine. Starting
 ;; here is idempotent — the `fw`/`sys` defonces guard repeat calls.
 (start!)
+
+;; ---- datapotamus ---------------------------------------------------------
+(require '[clojure.java.io :as dp-io]
+         '[com.stuartsierra.component :as dp-c]
+         '[next.jdbc :as dp-jdbc]
+         '[toolkit.datapotamus.daemon :as dp-daemon]
+         '[toolkit.datapotamus.demo :as dp-demo]
+         '[toolkit.datapotamus.store :as dp-store]
+         '[toolkit.datapotamus.trace :as dp-trace])
+
+(defonce dp (atom nil))
+
+(defn dp-start! []
+  (let [db  (.getAbsolutePath (dp-io/file "data/dp.sqlite"))
+        in  (.getAbsolutePath (dp-io/file "data/in"))
+        _   (dp-io/make-parents (dp-io/file in "x"))
+        ds  (dp-jdbc/get-datasource {:dbtype "sqlite" :dbname db})
+        _   (dp-store/migrate! ds)
+        _   (dp-jdbc/execute! ds
+              ["CREATE TABLE IF NOT EXISTS results (
+                 rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id TEXT, msg_id TEXT, data_id TEXT,
+                 written_at INTEGER, data TEXT)"])
+        tc  (dp-c/start (dp-trace/make {:datasource ds :batch-size 50 :flush-ms 100}))
+        dae (dp-c/start (dp-daemon/make
+                          {:watch-dir in :datasource ds
+                           :events-ch (:events-ch tc)
+                           :pipeline (dp-demo/pipeline {:datasource ds})
+                           :stable-gap-ms 500 :idle-complete-ms 300}))]
+    (reset! dp {:ds ds :tc tc :dae dae :in in :db db})
+    (println "datapotamus watching" in "db" db)))
+
+(defn dp-stop! []
+  (when-let [{:keys [dae tc]} @dp]
+    (dp-c/stop dae) (dp-c/stop tc) (reset! dp nil)
+    (println "datapotamus stopped")))
+
+(defn dp-runs [] (dp-store/list-runs (:ds @dp) 10))
+
+(defn dp-events []
+  (when-let [r (first (dp-runs))]
+    (dp-store/get-events (:ds @dp) (:run-id r) nil)))
