@@ -35,7 +35,7 @@
                       :sink (c/absorb-sink :sink)}
               :conns [[[:inc :out] [:dbl :in]]
                       [[:dbl :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :inc :data 5})]
+        result (dp2/run! spec {:in :inc :data 5})]
     (testing "run completes"
       (is (= :completed (:state result)))
       (is (nil? (:error result))))
@@ -61,7 +61,7 @@
   (let [spec {:procs {:split (c/fan-out :split 3)
                       :sink  (c/absorb-sink :sink)}
               :conns [[[:split :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :split :data :x})]
+        result (dp2/run! spec {:in :split :data :x})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "three children emitted from fan-out"
@@ -92,7 +92,7 @@
                       :even-sink (c/absorb-sink :even-sink)}
               :conns [[[:route :odd]  [:odd-sink  :in]]
                       [[:route :even] [:even-sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :route :data [1 2 3 4 5]})]
+        result (dp2/run! spec {:in :route :data [1 2 3 4 5]})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "odds routed to :odd-sink (3: 1, 3, 5), evens to :even-sink (2: 2, 4)"
@@ -108,7 +108,7 @@
                       :sink  (c/absorb-sink :sink)}
               :conns [[[:split :out] [:fi :in]]
                       [[:fi :out]    [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :split :data :x})]
+        result (dp2/run! spec {:in :split :data :x})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "exactly one merge event with three parents"
@@ -132,23 +132,24 @@
   ;; output flows back to the agent's :tool-result port — a back-edge in
   ;; the graph. No new framework concept — just another conn.
   (let [calls      (atom 0)
-        agent-step (fn ([] {:params {}
-                            :ins  {:user-in "" :tool-result ""}
-                            :outs {:tool-call "" :final ""}})
-                       ([_] {}) ([s _] s)
-                       ([s _ m]
-                        (let [n (swap! calls inc)]
-                          (if (< n 4)
-                            [s {:tool-call [(dp2/child-with-data m :query)]}]
-                            [s {:final     [(dp2/child-with-data m :done)]}]))))
+        agent-step (fn [_ctx]
+                     (fn ([] {:params {}
+                              :ins  {:user-in "" :tool-result ""}
+                              :outs {:tool-call "" :final ""}})
+                         ([_] {}) ([s _] s)
+                         ([s _ m]
+                          (let [n (swap! calls inc)]
+                            (if (< n 4)
+                              [s {:tool-call [(dp2/child-with-data m :query)]}]
+                              [s {:final     [(dp2/child-with-data m :done)]}])))))
         spec {:procs {:agent agent-step
                       :tool  (c/wrap :tool (fn [_] :tool-response))
                       :sink  (c/absorb-sink :sink)}
               :conns [[[:agent :tool-call] [:tool  :in]]
                       [[:tool  :out]       [:agent :tool-result]]
                       [[:agent :final]     [:sink  :in]]]}
-        result (dp2/run! (dp2/instrument spec)
-                         {:entry :agent :port :user-in :data :question})]
+        result (dp2/run! spec
+                         {:in :agent :port :user-in :data :question})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "agent recv'd 4 times (1 initial + 3 tool results)"
@@ -174,7 +175,7 @@
         spec {:procs {:try  (c/retry :try flaky 3)
                       :sink (c/absorb-sink :sink)}
               :conns [[[:try :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :try :data 42})]
+        result (dp2/run! spec {:in :try :data 42})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "retries are invisible in the trace (exactly one recv per step)"
@@ -192,7 +193,7 @@
         spec {:procs {:try  (c/retry :try permafail 2)
                       :sink (c/absorb-sink :sink)}
               :conns [[[:try :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :try :data 42})]
+        result (dp2/run! spec {:in :try :data 42})]
     (testing "run completes (failure is message-level, not run-level)"
       (is (= :completed (:state result)))
       (is (nil? (:error result))))
@@ -210,7 +211,7 @@
   (let [spec {:procs {:boom (c/wrap :boom (fn [_] (throw (ex-info "oops" {}))))
                       :sink (c/absorb-sink :sink)}
               :conns [[[:boom :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :boom :data 1})]
+        result (dp2/run! spec {:in :boom :data 1})]
     (testing "run completes"
       (is (= :completed (:state result)))
       (is (nil? (:error result))))
@@ -229,7 +230,7 @@
                       :sink  (c/absorb-sink :sink)}
               :conns [[[:split :out] [:fi :in]]
                       [[:fi :out]    [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :split :data :x})
+        result (dp2/run! spec {:in :split :data :x})
         {:keys [g kinds]} (events->dag (:events result))]
     (testing "graph is acyclic (topo-sort succeeds)"
       (is (some? (dep/topo-sort g))))
@@ -246,7 +247,7 @@
   (let [spec {:procs {:split (c/fan-out :split 3)
                       :sink  (c/absorb-sink :sink)}
               :conns [[[:split :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :split :data :x})]
+        result (dp2/run! spec {:in :split :data :x})]
     (testing "each step's :recv, :success, :send-out frequencies"
       (is (= {:split 1 :sink 3}
              (frequencies (map :step-id (events-of result :recv)))))
@@ -267,13 +268,11 @@
         recv-count (atom 0)
         u (pubsub/sub ps "recv.flow.run-A.>"
                       (fn [_ _ _] (swap! recv-count inc)))
-        spec (dp2/instrument
-              {:procs {:split (c/fan-out :split 3)
-                       :sink  (c/absorb-sink :sink)}
-               :conns [[[:split :out] [:sink :in]]]
-               :entry :split}
-              {:pubsub ps :flow-id "run-A"})
-        result (dp2/run! spec {:data :x})]
+        flow {:procs {:split (c/fan-out :split 3)
+                      :sink  (c/absorb-sink :sink)}
+              :conns [[[:split :out] [:sink :in]]]
+              :in :split}
+        result (dp2/run! flow {:pubsub ps :flow-id "run-A" :data :x})]
     (u)
     (is (= :completed (:state result)))
     (is (= 4 @recv-count))))      ; split + 3 sinks = 4 :recv events
@@ -285,18 +284,14 @@
         u (pubsub/sub ps "recv.flow.*.>"
                       (fn [_ ev _]
                         (swap! tallies update (first (:flow-path ev)) (fnil inc 0))))
-        spec-A (dp2/instrument
-                {:procs {:a (c/wrap :a inc) :sa (c/absorb-sink :sa)}
-                 :conns [[[:a :out] [:sa :in]]]
-                 :entry :a}
-                {:pubsub ps :flow-id "A"})
-        spec-B (dp2/instrument
-                {:procs {:b (c/wrap :b dec) :sb (c/absorb-sink :sb)}
-                 :conns [[[:b :out] [:sb :in]]]
-                 :entry :b}
-                {:pubsub ps :flow-id "B"})
-        ra (dp2/run! spec-A {:data 1})
-        rb (dp2/run! spec-B {:data 2})]
+        flow-A {:procs {:a (c/wrap :a inc) :sa (c/absorb-sink :sa)}
+                :conns [[[:a :out] [:sa :in]]]
+                :in :a}
+        flow-B {:procs {:b (c/wrap :b dec) :sb (c/absorb-sink :sb)}
+                :conns [[[:b :out] [:sb :in]]]
+                :in :b}
+        ra (dp2/run! flow-A {:pubsub ps :flow-id "A" :data 1})
+        rb (dp2/run! flow-B {:pubsub ps :flow-id "B" :data 2})]
     (u)
     (is (= :completed (:state ra)))
     (is (= :completed (:state rb)))
@@ -321,7 +316,7 @@
         spec {:procs {:work factory
                       :sink (c/absorb-sink :sink)}
               :conns [[[:work :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :work :data 4})]
+        result (dp2/run! spec {:in :work :data 4})]
     (testing "run completes and sink received the final value"
       (is (= :completed (:state result)))
       (is (= 50 (:data (first (filterv #(= :sink (:step-id %))
@@ -357,7 +352,7 @@
         spec {:procs {:work factory
                       :sink (c/absorb-sink :sink)}
               :conns [[[:work :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :work :data 1})]
+        result (dp2/run! spec {:in :work :data 1})]
     (testing "inner span's scope contains the outer span"
       (let [inner-start (first (filterv #(= :inner (:span-name %))
                                         (events-of result :span-start)))
@@ -383,7 +378,7 @@
         spec {:procs {:work factory
                       :sink (c/absorb-sink :sink)}
               :conns [[[:work :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :work :data 7})]
+        result (dp2/run! spec {:in :work :data 7})]
     (testing "run completes (message-level failure, not run-level)"
       (is (= :completed (:state result))))
     (testing "exactly one :span-failure and one step :failure"
@@ -411,10 +406,8 @@
                               (fn [ctx']
                                 (trace ctx' :inner {} (fn [_] :ok))))
                        [s {}])))
-        spec (dp2/instrument
-              {:procs {:work factory} :conns [] :entry :work}
-              {:pubsub ps :flow-id "run-T"})
-        result (dp2/run! spec {:data :x})]
+        flow {:procs {:work factory} :conns [] :in :work}
+        result (dp2/run! flow {:pubsub ps :flow-id "run-T" :data :x})]
     (u)
     (is (= :completed (:state result)))
     (is (= #{"span-start.flow.run-T.step.work.span.outer"
@@ -422,28 +415,26 @@
            (set @subjects)))))
 
 (deftest nested-flow-namespaced
-  ;; Nested flow as data — no subflow combinator. Step-ids can collide
-  ;; between outer and inner; the flow-path in subjects + event bodies
-  ;; namespaces them.
+  ;; Subflow embedded as data in :procs. Step-ids can collide between
+  ;; outer and inner; flattening namespaces inner procs (e.g. :sub.inc)
+  ;; and scope composition gives inner events a distinct subject path.
   (let [ps (pubsub/make)
-        inner {:procs {:inc  (c/wrap :inc #(+ % 100))
-                       :done (c/absorb-sink :done)}
-               :conns [[[:inc :out] [:done :in]]]
-               :entry :inc :output :done}
+        inner {:procs {:inc (c/wrap :inc #(+ % 100))}
+               :conns []
+               :in :inc :out :inc}
         outer {:procs {:inc  (c/wrap :inc inc)        ; SAME step-id as inner's :inc
-                       :sub  inner                     ; <-- nested flow is data
+                       :sub  inner                     ; <-- subflow is data
                        :sink (c/absorb-sink :sink)}
                :conns [[[:inc :out] [:sub :in]]
                        [[:sub :out] [:sink :in]]]
-               :entry :inc}
+               :in :inc}
         outer-recvs (atom [])
         inner-recvs (atom [])
         u1 (pubsub/sub ps "recv.flow.outer.step.inc"
                        (fn [_ ev _] (swap! outer-recvs conj ev)))
         u2 (pubsub/sub ps "recv.flow.outer.flow.sub.step.inc"
                        (fn [_ ev _] (swap! inner-recvs conj ev)))
-        result (dp2/run! (dp2/instrument outer {:pubsub ps :flow-id "outer"})
-                         {:data 5})]
+        result (dp2/run! outer {:pubsub ps :flow-id "outer" :data 5})]
     (u1) (u2)
     (is (= :completed (:state result)))
     (is (= 1 (count @outer-recvs)))
@@ -469,7 +460,7 @@
                        [s {:out [(dp2/child-with-data m :ok)]}])))
         spec {:procs {:only factory :sink (c/absorb-sink :sink)}
               :conns [[[:only :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :only :data :x})
+        result (dp2/run! spec {:in :only :data :x})
         spans  (concat (events-of result :span-start) (events-of result :span-success))]
     (is (seq spans))
     (is (every? #(= :only (:step-id %)) spans))
@@ -490,7 +481,7 @@
                       :sink-b (c/absorb-sink :sink-b)}
               :conns [[[:work :a] [:sink-a :in]]
                       [[:work :b] [:sink-b :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :work :data 5})]
+        result (dp2/run! spec {:in :work :data 5})]
     (is (= 6  (:data (first (filterv #(= :sink-a (:step-id %)) (events-of result :recv))))))
     (is (= 50 (:data (first (filterv #(= :sink-b (:step-id %)) (events-of result :recv))))))
     (is (= {:compute-a 1 :compute-b 1}
@@ -505,15 +496,14 @@
                                    ([s _ m]
                                     (let [v (trace ctx :nested-op {:src :inner}
                                                    (fn [_] (* (:data m) 2)))]
-                                      [s {:out [(dp2/child-with-data m v)]}]))))
-                      :done (c/absorb-sink :done)}
-               :conns [[[:work :out] [:done :in]]]
-               :entry :work :output :done}
+                                      [s {:out [(dp2/child-with-data m v)]}]))))}
+               :conns []
+               :in :work :out :work}
         outer {:procs {:sub  inner
                        :sink (c/absorb-sink :sink)}
                :conns [[[:sub :out] [:sink :in]]]
-               :entry :sub}
-        result (dp2/run! (dp2/instrument outer {:flow-id "F"}) {:data 5})
+               :in :sub}
+        result (dp2/run! outer {:flow-id "F" :data 5})
         span   (first (events-of result :span-start))]
     (is (= :completed (:state result)))
     (is (= :nested-op (:span-name span)))
@@ -531,7 +521,7 @@
                          [s {:out [(dp2/child-with-data m v)]}]))))
         spec {:procs {:step factory :sink (c/absorb-sink :sink)}
               :conns [[[:step :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :step :data 1})
+        result (dp2/run! spec {:in :step :data 1})
         events (:events result)
         idx-of (fn [pred] (first (keep-indexed (fn [i e] (when (pred e) i)) events)))
         recv-i (idx-of #(and (= :recv (:kind %)) (= :step (:step-id %))))
@@ -542,46 +532,99 @@
 
 (deftest factory-ctx-has-scope-and-step-id
   ;; Factory is called once per proc with a ctx carrying the proc's
-  ;; identity. :scope includes the step entry.
+  ;; identity. Scope lives on the pubsub's prefix.
   (let [captured (atom nil)
         factory  (fn [ctx]
-                   (reset! captured (select-keys ctx [:step-id :scope]))
+                   (reset! captured {:step-id (:step-id ctx)
+                                     :scope   (:prefix (:pubsub ctx))})
                    (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
                        ([_] {}) ([s _] s)
                        ([s _ _] [s {}])))
         spec  {:procs {:my-step factory}
                :conns []
-               :entry :my-step}
-        _     (dp2/run! (dp2/instrument spec {:flow-id "F"}) {:data :x})]
+               :in :my-step}
+        _     (dp2/run! spec {:flow-id "F" :data :x})]
     (is (= {:step-id :my-step
             :scope   [[:flow "F"] [:step :my-step]]}
            @captured))))
 
-(deftest mixed-proc-kinds
-  ;; Combinator factory, user factory, and bare step-fn in one spec;
-  ;; auto-detection handles all three.
+(deftest multiple-factory-styles
+  ;; Combinator factory, user-written factory, and another ad-hoc factory
+  ;; all compose in one flow.
   (let [combinator-factory (c/wrap :a inc)
         user-factory       (fn [_ctx]
                              (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
                                  ([_] {}) ([s _] s)
                                  ([s _ m]
                                   [s {:out [(dp2/child-with-data m (* (:data m) 10))]}])))
-        bare-stepfn        (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                               ([_] {}) ([s _] s)
-                               ([s _ m]
-                                [s {:out [(dp2/child-with-data m (dec (:data m)))]}]))
+        third-factory      (fn [_ctx]
+                             (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
+                                 ([_] {}) ([s _] s)
+                                 ([s _ m]
+                                  [s {:out [(dp2/child-with-data m (dec (:data m)))]}])))
         spec {:procs {:a    combinator-factory
                       :b    user-factory
-                      :c    bare-stepfn
+                      :c    third-factory
                       :sink (c/absorb-sink :sink)}
               :conns [[[:a :out] [:b :in]]
                       [[:b :out] [:c :in]]
                       [[:c :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :a :data 5})]
+        result (dp2/run! spec {:in :a :data 5})]
     (is (= :completed (:state result)))
     ;; 5 → a(inc) → 6 → b(*10) → 60 → c(dec) → 59
     (is (= 59 (:data (first (filterv #(= :sink (:step-id %))
                                      (events-of result :recv))))))))
+
+;; -----------------------------------------------------------------------------
+;; Long-running handle API: start! / inject! / await-quiescent! / stop!
+;; -----------------------------------------------------------------------------
+
+(deftest long-running-multiple-injects
+  ;; Start a flow, inject several messages over time, await quiescence
+  ;; between batches, then stop cleanly.
+  (let [flow {:procs {:inc  (c/wrap :inc inc)
+                      :sink (c/absorb-sink :sink)}
+              :conns [[[:inc :out] [:sink :in]]]
+              :in :inc}
+        h (dp2/start! flow)]
+    (dp2/inject! h {:data 1})
+    (dp2/await-quiescent! h)
+    (is (= {:sent 2 :recv 2 :completed 2} (dp2/counters h)))
+
+    (dp2/inject! h {:data 10})
+    (dp2/inject! h {:data 100})
+    (dp2/await-quiescent! h)
+    (is (= {:sent 6 :recv 6 :completed 6} (dp2/counters h)))
+
+    (let [result (dp2/stop! h)]
+      (is (= :completed (:state result)))
+      (is (= [2 11 101]
+             (mapv :data (filterv #(= :sink (:step-id %))
+                                  (events-of result :recv))))))))
+
+(deftest cancellation-via-cancel-promise
+  ;; A step can poll (:cancel ctx); when stop! is called, the promise
+  ;; is delivered. The step sees it and can exit early.
+  (let [observed (atom nil)
+        factory  (fn [{:keys [cancel] :as _ctx}]
+                   (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
+                       ([_] {}) ([s _] s)
+                       ([s _ m]
+                        (reset! observed (realized? cancel))
+                        [s {:out [(dp2/child-with-data m (:data m))]}])))
+        flow    {:procs {:step factory :sink (c/absorb-sink :sink)}
+                 :conns [[[:step :out] [:sink :in]]]
+                 :in :step}
+        h (dp2/start! flow)
+        {:keys [::dp2/cancel]} h]
+    (dp2/inject! h {:data :x})
+    (dp2/await-quiescent! h)
+    (is (false? @observed) "cancel promise not delivered while running")
+    (is (false? (realized? cancel)) "cancel promise unrealized during run")
+
+    (dp2/stop! h)
+    (is (true? (realized? cancel)) "cancel promise delivered on stop!")
+    (is (= :stopped @cancel))))
 
 ;; -----------------------------------------------------------------------------
 ;; Podcast-domain examples (E1–E5)
@@ -659,8 +702,8 @@
                          [s {:out [(dp2/child-with-data m (mapv :summary done))]}]))))
         spec {:procs {:process process :sink (c/absorb-sink :sink)}
               :conns [[[:process :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec)
-                         {:entry :process :data {:url "https://example.com/feed.xml"}})]
+        result (dp2/run! spec
+                         {:in :process :data {:url "https://example.com/feed.xml"}})]
     (testing "run completes, sink received the summaries"
       (is (= :completed (:state result)))
       (is (= ["summary-e1" "summary-e2" "summary-e3"]
@@ -699,7 +742,7 @@
                       [[:process :out] [:merge   :in]]
                       [[:merge   :out] [:sink    :in]]]}
         podcasts [{:url "https://a"} {:url "https://b"} {:url "https://c"}]
-        result   (dp2/run! (dp2/instrument spec) {:entry :split :data podcasts})]
+        result   (dp2/run! spec {:in :split :data podcasts})]
     (testing "run completes; sink receives one merged msg"
       (is (= :completed (:state result)))
       (is (= 1 (count (filterv #(= :sink (:step-id %)) (events-of result :recv))))))
@@ -731,7 +774,7 @@
                          [s {:out [(dp2/child-with-data m results)]}]))))
         spec {:procs {:episode factory :sink (c/absorb-sink :sink)}
               :conns [[[:episode :out] [:sink :in]]]}
-        result (dp2/run! (dp2/instrument spec) {:entry :episode :data {:id :e1}})
+        result (dp2/run! spec {:in :episode :data {:id :e1}})
         out    (:data (first (filterv #(= :sink (:step-id %)) (events-of result :recv))))]
     (testing "run completes; sink received a vector of analysis maps"
       (is (= :completed (:state result)))
@@ -773,7 +816,7 @@
         feed [{:keywords [:climate :election] :stance  1 :score 0.8}
               {:keywords [:tech :election]    :stance -1 :score 0.9}
               {:keywords [:climate :economy]  :stance  0 :score 0.5}]
-        result (dp2/run! (dp2/instrument spec) {:entry :agg :data feed})
+        result (dp2/run! spec {:in :agg :data feed})
         out    (:data (first (filterv #(= :sink (:step-id %)) (events-of result :recv))))]
     (testing "run completes; aggregation results are correct"
       (is (= :completed (:state result)))
@@ -821,7 +864,7 @@
                       [[:process :out] [:merge   :in]]
                       [[:merge   :out] [:sink    :in]]]}
         podcasts [{:url "https://a"} {:url "https://b"}]
-        result   (dp2/run! (dp2/instrument spec) {:entry :split :data podcasts})]
+        result   (dp2/run! spec {:in :split :data podcasts})]
     (testing "run completes; sink received one merged msg"
       (is (= :completed (:state result)))
       (is (= 1 (count (filterv #(= :sink (:step-id %)) (events-of result :recv))))))

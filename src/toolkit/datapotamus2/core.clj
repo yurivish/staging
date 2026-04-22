@@ -1,39 +1,38 @@
 (ns toolkit.datapotamus2.core
-  "Datapotamus2 core: envelope helpers, the `instrument` transformation,
-   and `run!` runner.
+  "Datapotamus2: a thin layer over clojure.core.async.flow adding a
+   scope-prefixed pubsub for trace emission and a span primitive for
+   observing sequential work inside a step.
 
-   Step-fns are **factories** that take a ctx and return the flow step-fn:
+   A **flow** is a map:
 
-     (defn my-step [ctx]
-       (fn ([] {:params {} :ins {:in \"\"} :outs {:out \"\"}})
-           ([_] {}) ([s _] s)
-           ([s _ m] ...)))
+     {:procs  {sid (fn [ctx] step-fn), ...}
+      :conns  [[[from-sid from-port] [to-sid to-port]], ...]
+      :in  sid         ; required for run!
+      :out sid}        ; optional; when this flow is composed into a
+                          ; larger one, :out's :out port is the flow's
+                          ; external output.
 
-   `instrument` materializes each proc by calling `(p ctx)` before handing
-   the resulting step-fn to `clojure.core.async.flow`. The ctx carries only
-   what can't be obtained lexically:
+   Every step-fn is a **factory** — a one-arg fn that takes a ctx and
+   returns a 4-arity core.async.flow process-fn. ctx carries:
 
-     :pubsub   — the shared event bus
-     :scope    — tagged path of containers, e.g. [[:flow fid] [:step sid]]
-     :step-id  — this proc's step-id
-     :emit     — raw publisher, (fn [scope ev])
-     :trace    — span helper, (fn [ctx span-name metadata body-fn])
+     :pubsub   — ScopedPubsub prefixed with this step's scope
+     :step-id  — this step's id, as it appears in trace events
+     :trace    — span helper (see `trace-span`)
 
-   A nested flow spec (a `:procs` value that is itself a map with
-   `:procs`/`:conns`) is recursed into — `instrument` handles arbitrary
-   depth automatically.
+   Subjects compose uniformly across flow / step / span:
 
-   Subjects are kind-first and built from the tagged scope:
+     recv.flow.<fid>.step.<sid>
+     recv.flow.<fid>.step.<sid>.span.<name>
+     recv.flow.<fid>.flow.<sub>.step.<sid>
 
-     <kind>.flow.<fid1>.step.<sid>                   top-level step
-     <kind>.flow.<fid1>.flow.<sub>.step.<sid>        nested flow
-     <kind>.flow.<fid1>.step.<sid>.span.<name>       span inside a step
-     <kind>.flow.<fid1>.run                          run-level
+   Subflows — a `:procs` entry that is itself a flow map — are flattened
+   at instrument time, not driven per message. References to a subflow's
+   id in outer conns resolve to its `:in` (for to-endpoints) or
+   `:out` (for from-endpoints). Subflow inner steps get namespaced
+   graph ids (e.g. `:sub.inc`) and a `[:flow <sub>]` scope segment, so
+   their trace events nest correctly under the outer flow.
 
-   `wrap-proc` synthesizes :recv / :send-out / :merge / :success / :failure
-   events and publishes each one synchronously. `trace` synthesizes
-   :span-start / :span-success / :span-failure events around user code
-   inside a step; these are inert to the completion counter."
+   `run!` drives a flow to completion with a single seeded message."
   (:refer-clojure :exclude [run!])
   (:require [clojure.core.async :as a]
             [clojure.core.async.flow :as flow]
@@ -101,9 +100,7 @@
 
 ;; --- output-map helpers -----------------------------------------------------
 
-(defn- resolve-msg-nils
-  "Replace a nil in :parent-msg-ids with [input-msg-id]."
-  [m input-id]
+(defn- resolve-msg-nils [m input-id]
   (cond-> m
     (or (nil? (:parent-msg-ids m))
         (some nil? (:parent-msg-ids m)))
@@ -113,9 +110,7 @@
                 [input-id]
                 (mapv #(or % input-id) ps))))))
 
-(defn- port-output-keys
-  "Port keys in the output map — anything that's a simple (unqualified) keyword."
-  [out]
+(defn- port-output-keys [out]
   (filter (fn [k] (and (keyword? k) (not (namespace k)))) (keys out)))
 
 (defn- dp2-key? [k]
@@ -141,11 +136,7 @@
                           ms))))]
     resolved-merges))
 
-(defn- build-middle-events
-  "Events between :recv and :success: merges, nil-port derivations, and
-   port send-outs. :recv and :success are emitted by wrap-proc directly
-   so that :recv can be published unconditionally before user-fn runs."
-  [step-id output]
+(defn- build-middle-events [step-id output]
   (let [ports     (port-output-keys output)
         port-ids  (into #{} (mapcat (fn [p] (map :msg-id (get output p)))) ports)
         derivs    (->> (get output ::derivations)
@@ -180,20 +171,25 @@
   (->> (cons (name kind) (concat (scope->segments scope) ["run"]))
        (str/join ".")))
 
-(defn- flow-path-of
-  "Extract the list of flow-ids from a scope (preserves outer-to-inner order).
-   Provided on every event body for consumers that just want flow ancestry."
-  [scope]
+(defn- flow-path-of [scope]
   (mapv (fn [[_ id]] (if (keyword? id) (name id) id))
         (filter (fn [[k _]] (= k :flow)) scope)))
 
-;; --- emit -------------------------------------------------------------------
+;; --- scoped pubsub ----------------------------------------------------------
 
-(defn- make-emit [pubsub]
-  (fn [scope ev]
-    (pubsub/pub pubsub
-                (subject-for scope (:kind ev))
-                (assoc ev :scope scope :flow-path (flow-path-of scope)))))
+(defrecord ScopedPubsub [raw prefix])
+
+(defn- scoped-pubsub [raw prefix]
+  (->ScopedPubsub raw (vec prefix)))
+
+(defn- sp-pub [^ScopedPubsub sp ev]
+  (let [prefix (.prefix sp)]
+    (pubsub/pub (.raw sp)
+                (subject-for prefix (:kind ev))
+                (assoc ev :scope prefix :flow-path (flow-path-of prefix)))))
+
+(defn- sp-extend [^ScopedPubsub sp segment]
+  (->ScopedPubsub (.raw sp) (conj (.prefix sp) segment)))
 
 ;; --- trace (spans) ----------------------------------------------------------
 
@@ -201,50 +197,47 @@
   "Run body-fn within a span scope. Emits :span-start, then either
    :span-success or :span-failure, and rethrows on failure.
 
-   body-fn receives an inner ctx whose :scope is extended with
+   body-fn receives an inner ctx whose pubsub's scope is extended with
    [:span span-name]; nested `trace-span` calls made from inside body-fn
    therefore nest correctly.
 
    Span events are observability only — they fall through the completion
    counter's `case` and do not affect run completion."
-  [{:keys [emit scope step-id] :as ctx} span-name metadata body-fn]
-  (let [inner-scope (conj (vec scope) [:span span-name])
-        inner-ctx   (assoc ctx :scope inner-scope)]
-    (emit inner-scope
-          {:kind :span-start :step-id step-id :span-name span-name
-           :metadata metadata :at (now)})
+  [{:keys [pubsub step-id] :as ctx} span-name metadata body-fn]
+  (let [inner-sp  (sp-extend pubsub [:span span-name])
+        inner-ctx (assoc ctx :pubsub inner-sp)]
+    (sp-pub inner-sp {:kind :span-start :step-id step-id :span-name span-name
+                      :metadata metadata :at (now)})
     (try
       (let [result (body-fn inner-ctx)]
-        (emit inner-scope
-              {:kind :span-success :step-id step-id :span-name span-name
-               :result result :at (now)})
+        (sp-pub inner-sp {:kind :span-success :step-id step-id :span-name span-name
+                          :result result :at (now)})
         result)
       (catch Throwable ex
-        (emit inner-scope
-              {:kind :span-failure :step-id step-id :span-name span-name
-               :error {:message (ex-message ex) :data (ex-data ex)}
-               :at (now)})
+        (sp-pub inner-sp {:kind :span-failure :step-id step-id :span-name span-name
+                          :error {:message (ex-message ex) :data (ex-data ex)}
+                          :at (now)})
         (throw ex)))))
 
 ;; --- wrap-proc --------------------------------------------------------------
 
-(defn- wrap-proc [step-id step-scope emit user-step-fn]
+(defn- wrap-proc [trace-sid step-sp user-step-fn]
   (fn
     ([] (user-step-fn))
     ([arg] (user-step-fn arg))
     ([s arg] (user-step-fn s arg))
     ([s in-id m]
-     (emit step-scope (recv-event step-id m))
+     (sp-pub step-sp (recv-event trace-sid m))
      (try
        (let [[s' raw]      (user-step-fn s in-id m)
              resolved      (resolve-output-nils (or raw {}) (:msg-id m))
-             middle-events (build-middle-events step-id resolved)
+             middle-events (build-middle-events trace-sid resolved)
              port-map      (strip-dp2-keys resolved)]
-         (doseq [ev middle-events] (emit step-scope ev))
-         (emit step-scope (success-event step-id m))
+         (doseq [ev middle-events] (sp-pub step-sp ev))
+         (sp-pub step-sp (success-event trace-sid m))
          [s' port-map])
        (catch Throwable ex
-         (emit step-scope (failure-event step-id m ex))
+         (sp-pub step-sp (failure-event trace-sid m ex))
          [s {}])))))
 
 ;; --- counter logic ----------------------------------------------------------
@@ -262,175 +255,255 @@
 (defn- done? [{:keys [sent recv completed]}]
   (and (pos? sent) (= sent recv) (= recv completed)))
 
-;; --- instrument -------------------------------------------------------------
+;; --- instrument (flattening) ------------------------------------------------
 
-(declare instrument-with-ctx run-inner)
-
-(defn- nested-spec? [v]
+(defn- subflow? [v]
   (and (map? v) (contains? v :procs) (contains? v :conns)))
 
-(defn- arities
-  "Set of arities a fn responds to (via any invoke-shaped Java method).
-   Pattern borrowed from Jepsen (EPL), which handles invoke/invokeStatic/
-   doInvoke uniformly across AOT and primitive-typed compilations."
-  [f]
-  (into #{}
-        (keep (fn [^java.lang.reflect.Method m]
-                (when (re-find #"invoke" (.getName m))
-                  (alength (.getParameterTypes m)))))
-        (-> f class .getDeclaredMethods)))
+(defn- prefix-sid [prefix sid]
+  (keyword (str (name prefix) "." (name sid))))
 
-(defn- factory?
-  "A factory responds to exactly one arity (ctx)."
-  [p]
-  (= #{1} (arities p)))
+(defn- prefix-endpoint [prefix [sid port]]
+  [(prefix-sid prefix sid) port])
 
-(defn- instrument-proc [sid p outer-ctx emit]
-  (let [step-scope (conj (vec (:scope outer-ctx)) [:step sid])]
-    (cond
-      (nested-spec? p)
-      (let [inner-scope (conj (vec (:scope outer-ctx)) [:flow (name sid)])
-            inner-ctx   (assoc outer-ctx :scope inner-scope)
-            inner-inst  (instrument-with-ctx p inner-ctx)
-            step-fn     (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                            ([_] {}) ([s _] s)
-                            ([s _ m]
-                             (let [outs (run-inner inner-inst inner-ctx (:data m))]
-                               [s {:out (mapv #(child-with-data m %) outs)}])))]
-        (wrap-proc sid step-scope emit step-fn))
+(defn- prefix-ref
+  "Prefix a flow-boundary ref (either a step-id keyword or a [sid port]
+   vector) with `prefix`."
+  [prefix ref]
+  (if (vector? ref)
+    [(prefix-sid prefix (first ref)) (second ref)]
+    (prefix-sid prefix ref)))
 
-      (factory? p)
-      (let [proc-ctx {:pubsub  (:pubsub outer-ctx)
-                      :scope   step-scope
-                      :step-id sid
-                      :emit    emit
-                      :trace   trace-span}
-            step-fn  (p proc-ctx)]
-        (wrap-proc sid step-scope emit step-fn))
+(defn- instrument-step [trace-sid factory step-sp cancel-p]
+  (let [proc-ctx {:pubsub step-sp :step-id trace-sid
+                  :trace  trace-span :cancel cancel-p}
+        step-fn  (factory proc-ctx)]
+    (wrap-proc trace-sid step-sp step-fn)))
 
-      :else
-      (wrap-proc sid step-scope emit p))))
+(declare instrument-flow)
 
-(defn- instrument-with-ctx [spec outer-ctx]
-  (let [emit   (make-emit (:pubsub outer-ctx))
-        procs' (into {}
-                 (for [[sid p] (:procs spec)]
-                   [sid (instrument-proc sid p outer-ctx emit)]))]
-    (assoc spec :procs procs' ::ctx outer-ctx)))
+(defn- inline-subflow
+  "Recursively instrument a subflow with extended scope, rename its graph
+   ids to avoid collision in the outer graph, and return the inlined
+   pieces plus entry/output aliases."
+  [sid subflow outer-sp cancel-p]
+  (let [inner-sp      (sp-extend outer-sp [:flow (name sid)])
+        inner-inst    (instrument-flow subflow inner-sp cancel-p)
+        renamed-procs (into {}
+                        (for [[k v] (:procs inner-inst)]
+                          [(prefix-sid sid k) v]))
+        renamed-conns (mapv (fn [[from to]]
+                              [(prefix-endpoint sid from)
+                               (prefix-endpoint sid to)])
+                            (:conns inner-inst))
+        in-ref        (prefix-ref sid (:in subflow))
+        out-ref       (prefix-ref sid (or (:out subflow) (:in subflow)))]
+    {:procs renamed-procs
+     :conns renamed-conns
+     :in in-ref
+     :out out-ref}))
 
-(defn instrument
-  "Wrap every proc's factory and materialize its step-fn for synchronous
-   trace emission. Nested flow specs are expanded recursively.
+(defn- resolve-endpoint
+  "Resolve a conn endpoint against `aliases`. If `sid` is a subflow alias,
+   use the alias's `:in`/`:out` target: if that target is `[sid port]`,
+   substitute it wholesale (the subflow's declared boundary port wins);
+   if it's a bare sid, keep the outer conn's port."
+  [aliases which [sid port]]
+  (if-let [a (get aliases sid)]
+    (let [target (get a which)]
+      (if (vector? target) target [target port]))
+    [sid port]))
 
-   Options:
-     :pubsub    existing pubsub instance (default: fresh via pubsub/make)
-     :flow-id   this flow's id, a string (default: fresh uuid)"
-  ([spec] (instrument spec {}))
-  ([spec opts]
-   (let [fid (or (:flow-id opts) (str (random-uuid)))
-         ctx {:pubsub (or (:pubsub opts) (pubsub/make))
-              :scope  [[:flow fid]]}]
-     (instrument-with-ctx spec ctx))))
+(defn- resolve-flow-ref
+  "Resolve the flow's own :in/:out field against `aliases`. If it
+   references a subflow, replace with that subflow's resolved boundary
+   ref; otherwise return as-is."
+  [ref aliases which]
+  (let [sid (if (vector? ref) (first ref) ref)]
+    (if-let [a (get aliases sid)]
+      (get a which)
+      ref)))
 
-;; --- run! -------------------------------------------------------------------
+(defn- instrument-flow [flow outer-sp cancel-p]
+  (let [{:keys [procs inner-conns aliases]}
+        (reduce (fn [acc [sid p]]
+                  (if (subflow? p)
+                    (let [{:keys [procs conns in out]}
+                          (inline-subflow sid p outer-sp cancel-p)]
+                      (-> acc
+                          (update :procs merge procs)
+                          (update :inner-conns into conns)
+                          (assoc-in [:aliases sid] {:in in :out out})))
+                    (let [step-sp (sp-extend outer-sp [:step sid])
+                          wrapped (instrument-step sid p step-sp cancel-p)]
+                      (assoc-in acc [:procs sid] wrapped))))
+                {:procs {} :inner-conns [] :aliases {}}
+                (:procs flow))
+        resolved-conns (mapv (fn [[from to]]
+                               [(resolve-endpoint aliases :out from)
+                                (resolve-endpoint aliases :in to)])
+                             (:conns flow))
+        in-resolved  (when-let [r (:in flow)]  (resolve-flow-ref r aliases :in))
+        out-resolved (when-let [r (:out flow)] (resolve-flow-ref r aliases :out))]
+    (cond-> (assoc flow
+                   :procs procs
+                   :conns (into resolved-conns inner-conns))
+      (:in flow)  (assoc :in  in-resolved)
+      (:out flow) (assoc :out out-resolved))))
 
-(defn- build-graph [spec]
+;; --- start! / inject! / quiescent? / stop! ---------------------------------
+
+(defn- build-graph [flow]
   (flow/create-flow
-   {:procs (into {} (map (fn [[sid pfn]] [sid {:proc (flow/process pfn)}])) (:procs spec))
-    :conns (:conns spec)}))
+   {:procs (into {} (map (fn [[sid pfn]] [sid {:proc (flow/process pfn)}])) (:procs flow))
+    :conns (:conns flow)}))
 
 (defn- scope->glob [scope]
   (str "*." (str/join "." (scope->segments scope)) ".>"))
 
-(defn- run-inner
-  "Drive an already-instrumented nested spec to completion with a fresh
-   seed, return a vector of data values that the inner's :output step
-   received (via :recv events). The inner spec's :output should be a
-   terminal sink that absorbs the final msgs."
-  [inner-spec inner-ctx seed-data]
-  (let [{:keys [pubsub scope]} inner-ctx
-        entry      (:entry inner-spec)
-        output     (:output inner-spec)
-        counters   (atom {:sent 1 :recv 0 :completed 0})
-        done-p     (promise)
-        outputs    (atom [])
-        inner-path (flow-path-of scope)
-        main-sub   (pubsub/sub pubsub (scope->glob scope)
-                               (fn [_ ev _]
-                                 (when (and (= :recv (:kind ev))
-                                            (= output (:step-id ev))
-                                            (= inner-path (:flow-path ev)))
-                                   (swap! outputs conj (:data ev)))
-                                 (let [c' (swap! counters update-counters ev)]
-                                   (when (done? c')
-                                     (deliver done-p :completed)))))
-        g (build-graph inner-spec)
-        {:keys [error-chan]} (flow/start g)
-        seed (new-msg seed-data)]
-    (flow/resume g)
-    @(flow/inject g [entry :in] [seed])
-    (a/thread (when-let [ex (a/<!! error-chan)]
-                (deliver done-p [:failed ex])))
-    (let [signal @done-p]
-      (flow/stop g)
-      (main-sub)
-      (when (not= :completed signal)
-        (throw (or (second signal)
-                   (ex-info "inner flow failed" {}))))
-      @outputs)))
+(defn start!
+  "Instantiate a flow and start it running. Returns a handle for
+   `inject!` / `quiescent?` / `status` / `stop!`.
 
-(defn run!
-  "Run an instrumented spec to completion. Seeds a single msg into
-   [entry :in] where entry comes from opts or the spec. Returns:
-
-     {:state :completed | :failed
-      :events [event-map ...]
-      :counters {:sent :recv :completed}
-      :error  Throwable or nil}
-
-   Completion is purely counter-driven: when sent == recv == completed,
-   the run is done. No timeouts. Because pubsub delivery is synchronous
-   on the wrap-proc's thread, every step's events are fully processed
-   by subscribers before flow routes its output to the next step — which
-   means counter balance genuinely means quiescence, not a timing artifact.
+   No messages are seeded. Call `inject!` to add inputs. Unlike `run!`,
+   this does not block.
 
    Opts:
-     :entry        entry step-id (required if not in spec's :entry)
-     :data         seed data
-     :subscribers  {pattern handler-fn} — extra pubsub subscriptions set up
-                   for the duration of the run"
-  [spec {:keys [entry port data subscribers]
-         :or {port :in subscribers {}}}]
-  (let [{:keys [pubsub scope]} (::ctx spec)
-        entry       (or entry (:entry spec))
-        fid         (first (flow-path-of scope))
-        events      (atom [])
-        counters    (atom {:sent 1 :recv 0 :completed 0})
-        done-p      (promise)
-        main-sub    (pubsub/sub pubsub (scope->glob scope)
-                                (fn [_ ev _]
-                                  (swap! events conj ev)
-                                  (let [c' (swap! counters update-counters ev)]
-                                    (when (done? c')
-                                      (deliver done-p :completed)))))
-        user-unsubs (mapv (fn [[pat h]] (pubsub/sub pubsub pat h)) subscribers)
-        g (build-graph spec)
-        {:keys [error-chan]} (flow/start g)
-        seed (new-msg data)]
-    (pubsub/pub pubsub (run-subject-for scope :run-started)
-                {:kind :run-started :flow-path [fid] :scope scope :at (now)})
+     :pubsub       existing pubsub instance (default: fresh)
+     :flow-id      this flow's id (default: fresh uuid)
+     :subscribers  {pattern handler-fn} — extra subscriptions that live
+                   for the handle's lifetime"
+  ([flow] (start! flow {}))
+  ([flow opts]
+   (let [fid         (or (:flow-id opts) (str (random-uuid)))
+         raw-ps      (or (:pubsub opts) (pubsub/make))
+         subscribers (:subscribers opts {})
+         outer-sp    (scoped-pubsub raw-ps [[:flow fid]])
+         cancel-p    (promise)
+         instrumented (instrument-flow flow outer-sp cancel-p)
+         scope       [[:flow fid]]
+         events      (atom [])
+         counters    (atom {:sent 0 :recv 0 :completed 0})
+         quiescent-p (atom (promise))
+         main-sub    (pubsub/sub raw-ps (scope->glob scope)
+                                 (fn [_ ev _]
+                                   (swap! events conj ev)
+                                   (let [c' (swap! counters update-counters ev)]
+                                     (when (done? c')
+                                       (deliver @quiescent-p :quiescent)))))
+         user-unsubs (mapv (fn [[pat h]] (pubsub/sub raw-ps pat h)) subscribers)
+         g           (build-graph instrumented)
+         {:keys [error-chan]} (flow/start g)
+         err-p       (promise)]
+     (pubsub/pub raw-ps (run-subject-for scope :run-started)
+                 {:kind :run-started :flow-path [fid] :scope scope :at (now)})
+     (flow/resume g)
+     (a/thread (when-let [ex (a/<!! error-chan)] (deliver err-p ex)))
+     {::flow        instrumented
+      ::graph       g
+      ::pubsub      raw-ps
+      ::scope       scope
+      ::fid         fid
+      ::cancel      cancel-p
+      ::events      events
+      ::counters    counters
+      ::quiescent-p quiescent-p
+      ::main-sub    main-sub
+      ::user-unsubs user-unsubs
+      ::err-p       err-p})))
+
+(defn inject!
+  "Seed a message into the running flow. Returns the handle.
+
+   Args:
+     :in  step-id (required unless the flow declares :in)
+     :port   port keyword (default :in)
+     :data   seed data"
+  [handle {:keys [in port data]}]
+  (let [{::keys [flow graph pubsub scope fid counters quiescent-p]} handle
+        ref              (or in (:in flow))
+        [flow-in flow-port] (if (vector? ref) ref [ref :in])
+        port             (or port flow-port)
+        seed             (new-msg data)]
+    ;; Fresh promise for the next quiescence window; bump :sent before
+    ;; injecting so any :recv the inner sub sees can't beat us.
+    (swap! quiescent-p (fn [p] (if (realized? p) (promise) p)))
+    (swap! counters update :sent inc)
     (pubsub/pub pubsub (run-subject-for scope :seed)
                 {:kind :seed :flow-path [fid] :scope scope
                  :msg-id (:msg-id seed) :data-id (:data-id seed)
-                 :entry entry :port port :at (now)})
-    (flow/resume g)
-    @(flow/inject g [entry port] [seed])
-    (a/thread (when-let [ex (a/<!! error-chan)]
-                (deliver done-p [:failed ex])))
-    (let [signal @done-p]
-      (flow/stop g)
-      (main-sub)
-      (doseq [u user-unsubs] (u))
-      (if (= :completed signal)
-        {:state :completed :events @events :counters @counters :error nil}
-        {:state :failed :events @events :counters @counters :error (second signal)}))))
+                 :in flow-in :port port :at (now)})
+    @(flow/inject graph [flow-in port] [seed])
+    handle))
+
+(defn counters
+  "Current counter snapshot {:sent :recv :completed}."
+  [handle]
+  @(::counters handle))
+
+(defn events
+  "Snapshot of events collected so far."
+  [handle]
+  @(::events handle))
+
+(defn quiescent?
+  "True iff the handle's counters currently balance and at least one
+   message has been injected."
+  [handle]
+  (done? (counters handle)))
+
+(defn await-quiescent!
+  "Block until the handle reaches quiescence or the underlying graph
+   errors. Returns :quiescent, [:failed ex], or :timeout (with timeout-ms).
+
+   Implemented by polling both promises every 10ms — avoids go-blocks
+   and doesn't leak waiting threads across repeated calls on a handle."
+  ([handle] (await-quiescent! handle nil))
+  ([handle timeout-ms]
+   (let [{::keys [quiescent-p err-p]} handle
+         deadline (when timeout-ms (+ (System/currentTimeMillis) timeout-ms))]
+     (loop []
+       (cond
+         (realized? err-p)
+         [:failed @err-p]
+
+         (and deadline (>= (System/currentTimeMillis) deadline))
+         :timeout
+
+         :else
+         (let [current @quiescent-p
+               v       (deref current 10 ::pending)]
+           (if (= ::pending v) (recur) v)))))))
+
+(defn stop!
+  "Tear down the flow graph, deliver the cancel promise, and return a
+   final result map {:state :events :counters :error}."
+  [handle]
+  (let [{::keys [graph main-sub user-unsubs cancel err-p events counters]} handle]
+    (when-not (realized? cancel) (deliver cancel :stopped))
+    (flow/stop graph)
+    (main-sub)
+    (doseq [u user-unsubs] (u))
+    (let [err (when (realized? err-p) @err-p)]
+      {:state    (if err :failed :completed)
+       :events   @events
+       :counters @counters
+       :error    err})))
+
+(defn run!
+  "Convenience: start, inject one message, wait for quiescence, stop.
+
+   Opts:
+     :in        entry step-id (required if not in flow's :in)
+     :port         entry port (default :in)
+     :data         seed data
+     :pubsub       existing pubsub instance (default: fresh)
+     :flow-id      this flow's id (default: fresh uuid)
+     :subscribers  {pattern handler-fn} — extra pubsub subscriptions"
+  [flow opts]
+  (let [handle (start! flow (select-keys opts [:pubsub :flow-id :subscribers]))]
+    (inject! handle (select-keys opts [:in :port :data]))
+    (let [signal (await-quiescent! handle)]
+      (-> (stop! handle)
+          (assoc :state (if (= :quiescent signal) :completed :failed))
+          (cond-> (vector? signal) (assoc :error (second signal)))))))
