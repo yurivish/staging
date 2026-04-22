@@ -30,4 +30,6 @@
                      (get res (keyword (name table) "rowid"))
                      (:next.jdbc/update-count res))
            ref {:kind :sqlite :location (str (name table) ":" rowid)}]
-       [s {::flow/report [(proc/sink-wrote-event step-id m ref)]}]))))
+       [s {::flow/report [(proc/recv-event step-id m)
+                          (proc/sink-wrote-event step-id m ref)
+                          (proc/success-event step-id m)]}]))))

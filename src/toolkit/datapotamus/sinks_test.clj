@@ -32,11 +32,15 @@
            :run-id (random-uuid) :data 9}
         _ (sfn) s (sfn {})
         [_ out] (sfn s :in m)
-        ev (first (::flow/report out))]
+        report (::flow/report out)
+        [recv sw success] report]
     (is (empty? (:out out)))
-    (is (= :sink-wrote (:kind ev)))
-    (is (= :sqlite (get-in ev [:payload-ref :kind])))
-    (is (re-matches #"results:\d+" (get-in ev [:payload-ref :location])))
+    (is (= 3 (count report)))
+    (is (= :recv       (:kind recv)))
+    (is (= :sink-wrote (:kind sw)))
+    (is (= :success    (:kind success)))
+    (is (= :sqlite (get-in sw [:payload-ref :kind])))
+    (is (re-matches #"results:\d+" (get-in sw [:payload-ref :location])))
     (is (= 1 (count (jdbc/execute! *ds*
                       ["SELECT * FROM results WHERE run_id=?"
                        (str (:run-id m))]))))))
