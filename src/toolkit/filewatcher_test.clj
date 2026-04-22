@@ -6,11 +6,9 @@
    possible, so detection is robust to coarse-mtime filesystems."
   (:require
     [clojure.core.async :as a]
-    [clojure.java.io :as io]
-    [clojure.test :refer [deftest is testing]]
+    [clojure.test :refer [deftest is]]
     [toolkit.filewatcher :as fw])
   (:import
-    [java.io File]
     [java.nio.file Files Path]
     [java.nio.file.attribute FileAttribute FileTime]))
 
@@ -19,7 +17,7 @@
 (def ^:private no-attrs (into-array FileAttribute []))
 (def ^:private take-timeout-ms 1500)
 
-(defn- ^Path temp-dir []
+(defn- temp-dir ^Path []
   (Files/createTempDirectory "fw-test-" no-attrs))
 
 (defn- delete-tree! [^Path root]

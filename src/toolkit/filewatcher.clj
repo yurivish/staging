@@ -78,7 +78,7 @@
     [java.io File]
     [java.nio.file Files LinkOption Path]
     [java.nio.file FileVisitOption]
-    [java.nio.file.attribute BasicFileAttributes FileTime]
+    [java.nio.file.attribute BasicFileAttributes]
     [java.util.concurrent Executors ScheduledExecutorService TimeUnit]))
 
 (set! *warn-on-reflection* true)
@@ -112,17 +112,17 @@
 
 ;; --- Path canonicalization ---
 
-(defn- ^Path as-path [x]
+(defn- as-path ^Path [x]
   (cond
     (instance? Path x) x
     (instance? File x) (.toPath ^File x)
     :else              (.toPath (io/file x))))
 
-(defn- ^Path canonical
+(defn- canonical
   "Canonicalizes to an absolute, normalized Path. Does not resolve
    symlinks (matches Go's filepath.WalkDir default). Works for
    non-existent paths."
-  [x]
+  ^Path [x]
   (.normalize (.toAbsolutePath (as-path x))))
 
 ;; --- Modkey ---

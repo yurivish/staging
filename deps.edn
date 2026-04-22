@@ -124,4 +124,7 @@
   ;; Upgrade in place:        clojure -M:outdated --upgrade
   :outdated {:deps      {com.github.liquidz/antq {:mvn/version "RELEASE"}
                          org.slf4j/slf4j-nop     {:mvn/version "2.0.17"}}
-             :main-opts ["-m" "antq.core"]}}}
+             :main-opts ["-m" "antq.core"]}
+  ;; Lint: clojure -M:kondo --lint src
+  :kondo {:deps      {clj-kondo/clj-kondo {:mvn/version "2026.04.15"}}
+          :main-opts ["-m" "clj-kondo.main"]}}}

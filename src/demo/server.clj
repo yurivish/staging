@@ -3,7 +3,6 @@
    [clojure.core.async :refer [io-thread]]
    [clojure.data.json :as json]
    [com.stuartsierra.component :as component]
-   [clojure.string :as string]
    [hiccup2.core :as h]
    [ring.middleware.session.memory :as session-mem]
    [ring.util.http-response :as r]
