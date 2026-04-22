@@ -13,8 +13,10 @@
   (doseq [e evs] (a/>!! ch (assoc e :run-id run-id))))
 
 (defn run-pipeline!
-  "Runs `pipeline` to completion, failure, or idle-quiescence. Returns the final run map."
-  [{:keys [datasource events-ch run-id pipeline seed idle-complete-ms]
+  "Runs `pipeline` to completion, failure, idle-quiescence, or external cancel.
+   Pass `:cancel-ch` to enable supersede: closing the channel stops the flow
+   and transitions the run to :cancelled. Returns the final run map."
+  [{:keys [datasource events-ch run-id pipeline seed idle-complete-ms cancel-ch]
     :or {idle-complete-ms 500}}]
   (let [{:keys [entry procs conns]} pipeline
         g (flow/create-flow
@@ -22,7 +24,8 @@
              :conns conns})
         {:keys [report-chan error-chan]} (flow/start g)
         seed-msg {:msg-id (random-uuid) :data-id (random-uuid)
-                  :run-id run-id :data (:data seed)}]
+                  :run-id run-id :data (:data seed)}
+        never (a/chan)]
     (try
       (store/update-run! datasource run-id {:state :running})
       (emit! events-ch run-id :run-started)
@@ -30,7 +33,8 @@
       @(flow/inject g [entry :in] [seed-msg])
       (loop []
         (let [timeout (a/timeout idle-complete-ms)
-              [v ch] (a/alts!! [report-chan error-chan timeout])]
+              [v ch] (a/alts!! [report-chan error-chan timeout
+                                (or cancel-ch never)])]
           (cond
             (and (= ch error-chan) (some? v))
             (let [ex (::flow/ex v)
@@ -50,6 +54,14 @@
             (let [evs (if (sequential? v) v [v])]
               (forward! events-ch run-id evs)
               (recur))
+
+            (= ch cancel-ch)
+            (do (flow/stop g)
+                (emit! events-ch run-id :run-cancelled)
+                (store/update-run! datasource run-id
+                                    {:state :cancelled
+                                     :finished-at (System/currentTimeMillis)})
+                (store/get-run datasource run-id))
 
             (= ch timeout)
             (do (flow/stop g)

@@ -22,14 +22,13 @@
 
 (defn- spawn-run! [{:keys [datasource events-ch pipeline idle-complete-ms registry]}
                    slug ^String abs-path]
-  (let [p   (->path abs-path)
-        s   (stat p)
-        rid (random-uuid)
-        prior (reg/install! registry slug {:run-id rid})]
-    (when prior
-      (store/update-run! datasource (:run-id prior)
-                         {:state :cancelled
-                          :finished-at (System/currentTimeMillis)}))
+  (let [p         (->path abs-path)
+        s         (stat p)
+        rid       (random-uuid)
+        cancel-ch (a/chan)
+        prior     (reg/install! registry slug {:run-id rid :cancel-ch cancel-ch})]
+    (when-let [prior-cancel (:cancel-ch prior)]
+      (a/close! prior-cancel))
     (store/insert-run! datasource
                        {:run-id rid :pipeline-id (:pipeline-id pipeline)
                         :input-path abs-path :input-slug slug
@@ -41,7 +40,8 @@
          {:datasource datasource :events-ch events-ch :run-id rid
           :pipeline pipeline
           :seed {:data {:path abs-path :slug slug}}
-          :idle-complete-ms idle-complete-ms})
+          :idle-complete-ms idle-complete-ms
+          :cancel-ch cancel-ch})
         (finally (reg/remove-if-matches! registry slug rid))))))
 
 (defn- schedule-spawn!

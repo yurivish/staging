@@ -87,3 +87,24 @@
       (is (= 1 (count (store/list-runs *ds* 10))))
       (is (= 1 (count (jdbc/execute! *ds* ["SELECT * FROM results"]))))
       (finally (component/stop dae) (component/stop tc)))))
+
+(deftest daemon-supersedes-in-flight-run-on-re-edit
+  ;; An in-flight run (long idle-complete-ms keeps it waiting in quiescence)
+  ;; must transition to :cancelled when a new edit supersedes it, not
+  ;; :completed. Verifies cancel-ch threading all the way to flow/stop.
+  (let [tc (component/start (trace/make {:datasource *ds* :batch-size 10 :flush-ms 20}))
+        dae (component/start
+              (daemon/make {:watch-dir (str *dir*) :datasource *ds*
+                            :events-ch (:events-ch tc) :pipeline (demo-pipeline *ds*)
+                            :stable-gap-ms 50 :debounce-ms 50
+                            :idle-complete-ms 2000}))]
+    (try
+      (write-aged! (.resolve *dir* "n.txt") "10\n")
+      (Thread/sleep 400)                         ; run 1 is now in idle-wait
+      (write-aged! (.resolve *dir* "n.txt") "20\n")
+      (Thread/sleep 3000)                        ; wait for run 2 to finish naturally
+      (let [runs (store/list-runs *ds* 10)
+            states (mapv :state runs)]
+        (is (= 2 (count runs)))
+        (is (= #{:completed :cancelled} (set states))))
+      (finally (component/stop dae) (component/stop tc)))))
