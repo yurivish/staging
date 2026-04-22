@@ -96,7 +96,8 @@
    :max-recent         16
    :min-per-tick       64
    :max-ticks-per-scan 20
-   :safety-gap-ms      3000})
+   :safety-gap-ms      3000
+   :clock              (fn [] (System/currentTimeMillis))})
 
 (def ^:private changes-buffer-default 16)
 
@@ -446,12 +447,10 @@
      (make {:interval-ms 50 :changes-buffer 32})
      (make {:on-change (fn [{:keys [path dir?]}] (prn path))})"
   [opts]
-  (let [opts (merge defaults
-                    {:clock (fn [] (System/currentTimeMillis))}
-                    (when (and (not (contains? opts :on-change))
-                               (not (contains? opts :changes-buffer)))
-                      {:changes-buffer changes-buffer-default})
-                    opts)]
+  (let [opts (cond-> (merge defaults opts)
+               (and (not (contains? opts :on-change))
+                    (not (contains? opts :changes-buffer)))
+               (assoc :changes-buffer changes-buffer-default))]
     (validate-opts! opts)
     (map->FileWatcher
       {:opts       opts

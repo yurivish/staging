@@ -15,11 +15,25 @@
 (defn clj-file? [^java.io.File f]
   (str/ends-with? (.getName f) ".clj"))
 
+(def ^:private ^"[Ljava.nio.file.LinkOption;" no-link-opts
+  (into-array LinkOption []))
+
+;; Same runtime feature-detect that filewatcher.clj uses (see
+;; filewatcher.clj:107-111) — and the same spirit as the Go toolkit's
+;; modkey_unix.go vs modkey_other.go build-tag split. Falls back to
+;; size+mtime on filesystems without POSIX inodes.
+(def ^:private has-posix?
+  (try
+    (Files/getAttribute (.toPath (io/file ".")) "unix:ino" no-link-opts)
+    true
+    (catch Throwable _ false)))
+
 (defn- path-attrs [path]
   (try
-    (let [opts (into-array LinkOption [])
-          a    (Files/readAttributes path BasicFileAttributes opts)]
-      {:inode (Files/getAttribute path "unix:ino" opts)
+    (let [a (Files/readAttributes path BasicFileAttributes no-link-opts)]
+      {:inode (when has-posix?
+                (try (Files/getAttribute path "unix:ino" no-link-opts)
+                     (catch Throwable _ nil)))
        :size  (.size a)
        :mtime (.toMillis (.lastModifiedTime a))})
     (catch Exception _ nil)))

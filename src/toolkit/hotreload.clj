@@ -51,8 +51,20 @@
    change) and you want the browser to reload immediately."
   []
   (doseq [sse @clients]
-    (try (d/execute-script sse "window.location.reload()")
-         (catch Throwable _))))
+    (try
+      (d/execute-script sse "window.location.reload()")
+      ;; IOException = the SSE channel died between registration and push
+      ;; (client navigated away, network blip, server shutdown racing a
+      ;; reload). Expected in a dev loop; the client reconnects and the
+      ;; hotreload handler fires window.location.reload() on reopen.
+      (catch java.io.IOException t
+        (binding [*out* *err*]
+          (println "[hotreload] reload-now!: dropped dead SSE client:"
+                   (.getMessage t))))
+      (catch Throwable t
+        (binding [*out* *err*]
+          (println "[hotreload] reload-now! threw (non-IO):")
+          (.printStackTrace t *err*))))))
 
 (defn handler
   "Long-lived SSE handler. Tracks open streams so `reload-now!` can push a

@@ -155,6 +155,10 @@
       (bit-and-not bit)
       (bit-or (bit-and (unchecked-dec bit) dm))))
 
+;; Decision tables for `litmax` and `bigmin` below are verified case-for-case
+;; against Tropf's Pascal source at
+;; refs/tropf_litmax_bigmin DBCode_mit_Erlaeuterung.txt.
+
 (defn litmax
   "Largest Morton code in the search rectangle [min, max] whose Z-value is
    less than `div`. `ndims` is the number of interleaved dimensions.

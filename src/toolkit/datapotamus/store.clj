@@ -45,15 +45,15 @@
 
 (defn insert-run! [ds r]
   (jdbc/execute! ds
-    (sql/format {:insert-into :runs
-                 :values [{:run_id      (str (:run-id r))
-                           :pipeline_id (name (:pipeline-id r))
-                           :input_path  (:input-path r)
-                           :input_slug  (:input-slug r)
-                           :input_mtime (:input-mtime r)
-                           :input_size  (:input-size r)
-                           :state       (name (:state r))
-                           :started_at  (:started-at r)}]})))
+                 (sql/format {:insert-into :runs
+                              :values [{:run_id      (str (:run-id r))
+                                        :pipeline_id (name (:pipeline-id r))
+                                        :input_path  (:input-path r)
+                                        :input_slug  (:input-slug r)
+                                        :input_mtime (:input-mtime r)
+                                        :input_size  (:input-size r)
+                                        :state       (name (:state r))
+                                        :started_at  (:started-at r)}]})))
 
 (defn update-run! [ds run-id patch]
   (let [m (cond-> {}
@@ -63,7 +63,7 @@
             (:error patch)         (assoc :error (:error patch)))]
     (when (seq m)
       (jdbc/execute! ds (sql/format {:update :runs :set m
-                                      :where [:= :run_id (str run-id)]})))))
+                                     :where [:= :run_id (str run-id)]})))))
 
 (defn- row->run [r]
   (when r
@@ -81,13 +81,13 @@
 
 (defn get-run [ds run-id]
   (row->run (first (jdbc/execute! ds
-                     (sql/format {:select [:*] :from :runs
-                                  :where [:= :run_id (str run-id)]})))))
+                                  (sql/format {:select [:*] :from :runs
+                                               :where [:= :run_id (str run-id)]})))))
 
 (defn list-runs [ds limit]
   (mapv row->run (jdbc/execute! ds (sql/format {:select [:*] :from :runs
-                                                 :order-by [[:started_at :desc]]
-                                                 :limit limit}))))
+                                                :order-by [[:started_at :desc]]
+                                                :limit limit}))))
 
 (defn- ev->row [e]
   {:event_id       (str (:event-id e))
@@ -121,15 +121,15 @@
 (defn insert-events! [ds events]
   (when (seq events)
     (jdbc/execute! ds (sql/format {:insert-into :trace_events
-                                    :values (mapv ev->row events)}))))
+                                   :values (mapv ev->row events)}))))
 
 (defn get-events
   "Events for a run, ordered by seq. Pass `after-seq` to tail (exclusive)."
   [ds run-id after-seq]
   (mapv row->ev
         (jdbc/execute! ds
-          (sql/format
-            (cond-> {:select [:*] :from :trace_events
-                     :where [:= :run_id (str run-id)]
-                     :order-by [[:seq :asc]]}
-              after-seq (update :where #(vector :and % [:> :seq after-seq])))))))
+                       (sql/format
+                        (cond-> {:select [:*] :from :trace_events
+                                 :where [:= :run_id (str run-id)]
+                                 :order-by [[:seq :asc]]}
+                          after-seq (update :where #(vector :and % [:> :seq after-seq])))))))

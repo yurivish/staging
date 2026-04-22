@@ -1,0 +1,887 @@
+(*
+LITMAX/BIGMIN computation - Pascal source code
+
+Author: Hermann Tropf
+
+Date: Feb 22, 2021.
+Realisation hints updated: Mar 30, 2021.
+
+
+
+This program refers to the article "Multidimensional Range Search in Dynamically Balanced Trees",
+by Hermann Tropf and Helmut Herzog, Angewandte Informatik (applied informatics) Febr. 1981 pp 71-77.
+
+Download: www.vision-tools.com/h-tropf/multidimensionalrangequery.pdf
+
+With this post, I hope to provide a more vivid explanation of the key functions LITMAX / BIGMIN
+described in the article. I try it by means of the old fashioned character graphics below.
+
+
+The above article describes the use of bitwise interleaved data for efficient multidimensional range
+searching in dynamic data. A key idea of the method is the usage of two symmetric functions
+called LITMAX and BIGMIN to which I refer in the following.
+
+40 Years after publication of the article, I researched for its impact and I found that the method
+has found its use in some commercial databases and in a bunch of different technical application
+areas - and who knows where else without being mentioned.
+
+
+However, I have the impression that some people had difficulties in implementing the LITMAX/BIGMIN
+functions described in the article. Assumedly some of them have resorted to other methods that are
+conceptually simpler at first sight. This is a pity, because in contrast to other methods like
+kd-trees or Range trees, the approach is independent of the data organisation chosen. You can use
+any 1-dimensional data organisation (binary search trees, skip lists, 1D-range trees, whatever).
+Even simple sorted arrays can be used, skipping large portions of the data by use of LITMAX and/or
+BIGMIN. Due to this independency it is easier to integrate the method into existing data bases or
+technical applications.
+
+Realising that the LITMAX/BIGMIN calculation seems to be a major hurdle when going into using the
+method, I decided to present the LITMAX/BIGMIN calculation directly as Pascal source code,
+together with a somewhat more elaborate explanation of how it works.
+
+At some time I worked with Hilbert Order instead of Z-order and realised that Z-order bit
+interleaving is not necessarily done explicitly (US Patent 7321890 , section "Technical Remarks",
+Patent dropped). Instead, data are kept as they are, they are just processed in bit interleaved
+manner. So there are no problems with word length restrictions, and the code can easily be
+adapted to any number of dimensions and to any key wordlength.
+
+And, for this presentation, keeping the data as they are and processing them instead in interleaved
+order, makes the explanation of how LITMAX/BIGMIN works somewhat easier.
+
+
+For a low number of dimensions and short data wordlength, it may still remain advantegeous
+to interleave the data, especially if Parallel-Bits-Deposit instructions or the like are available.
+
+
+To realise any structure for the z-ordered Data (search trees, skip lists, sorted arrays or
+whatever), you need a function comparing the Z-value of two records for the given number of
+dimensions. It is also given below (function "zvalue_compare").
+
+
+Some realisation hints (including usage of floating point data) are given at the end.
+
+
+
+Before going into the source code, at first a visualisation of LITMAX by means of an example in 2D:
+
+
+LITMAX, how it works
+--------------------
+
+        See Fig. 6 in the article.
+
+
+        The data field:
+        ---------------
+
+        Bitwise interleaving the 2D data (x,y) effects that the entire point field is alternatingly
+        devided up in x and y direction.
+
+        The first division is in x direchtion and splits it into a low x-section and a high x-section
+
+        These sections are divided in y direchtion; the sections are all split into a low y-section
+        and a high y-section
+
+        These sections are divided in x direchtion; the sections are all split into a low x-section
+        and a high x-section
+
+        etc etc
+
+
+                   ---> x
+
+          |                       |                     |                   |
+          |                       |                     |                   |
+          v                       |                     |                   |
+          y       -  -  -  -  -   |  -  -  - -  -  -    |  -  -  -  -  -    |  -  -  -  -  -
+                                  |                     |                   |
+                                  |                     |                   |
+                                  |                     |                   |
+                                                        |
+                   -  -  -  -  -  -  -  -  - -  -  -    |    -  -  -  -  -  -  -  -  -  -  -
+                                                        |
+                                  |                     |                   |
+                                  |                     |                   |
+                                  |                     |                   |
+                   -  -  -  -  -  |   -  -    -  -  -   |   -  -  -  -  -   |  -  -  -  -  -
+                                  |                     |                   |
+                                  |                     |                   |
+                                  |                     |                   |
+
+
+
+         Z-Values
+         --------
+
+         The Z-value of a data point is the value of its coordinates when x and y are bitwise
+         interleaved. As mentioned above, it is not necessary to interleave the date explicitly.
+         There is only needed a function to decide which of two Points has the greater Z-value.
+
+
+
+         LITMAX calculation
+         ------------------
+
+         F is the point found in the data
+
+         ****
+         *  *   is the search rectangle
+         ****
+
+         I=Min is the corner of the search rectangle with minimum data (upper left corner in
+               the illustration). Its z-value is the lowest z-value in the search rectangle
+         A=Max is the corner of the search rectangle with maximum data (lower right corner in
+               the illustration). Its z-value is the highest z-value in the search rectangle
+
+
+
+                   ---> x
+
+          |                       |                     ||                   |
+          |                       |         I***********||*******            |
+          v                       |         *           ||      *            |
+          y       -  -  -  -  -   |  -  -  - -  -  -    ||  -  -* -  -  -    |  -  -  -  -  -
+                                  |         *           ||      *            |
+                                  |         *           ||      *            |
+                                  |         *           ||      *            |
+                                            *           ||      *
+                   -  -  -  -  -  -  -  -  -*-  -  -    ||  - - *-  -  -  -  -  -  -  -  -  -
+                          F                 *           ||      *
+                                  |         *'''''''''''||******A            |
+                                  |                     ||                   |
+                                  |                     ||                   |
+                   -  -  -  -  -  |   -  -    -  -  -   ||   -  -  -  -  -   |  -  -  -  -  -
+                                  |                     ||                   |
+                                  |                     ||                   |
+                                  |                     ||                   |
+
+
+                      At first, division in x-direction.
+                      The splitting line (double, vertical) splits the field into a low section
+                      and an high section
+
+                      The search range is overlapping the splitting line:
+                        Min is in the low section  (MinBit = 0).
+                        Max is in the high section (MaxBit = 1).
+                      F is in the low section, that means Fbit =0.
+
+                      Situation FBit=0   MinBit =0  MaxBit =1
+
+                      All z-values in the high section are greater than the Z Values of F, Z(F).
+                      They are no candidates for LITMAX whose Z-value is smaller than Z(F) by
+                      defintion.
+
+                      So LITMAX must be in the low section. The search range is shrinked the way
+                      that it is intirely in the low section. This is done by Jumping Max in
+                      x-direction to the highest possible value in the lower section. This is
+                      done by loading 011111... into max, starting fom the actial bit position
+                      (first position here). See source code below: MAX := loadxxx011111( MAX)
+
+                      (Compare Fig. 11 in the article, which is for interlaced data).
+
+
+                      Result:
+
+
+                  ---> x
+                                                   splitting line
+                                                        v
+
+          |                       |                     ||                   |
+          |                       |         I***********||                   |
+          v                       |         *          *||                   |
+          y       -  -  -  -  -   |  -  -  - -  -  -   *||  -  -  -  -  -    |  -  -  -  -  -
+                                  |         *          *||                   |
+                                  |         *          *||                   |
+                                  |         *          *||                   |
+                                            *          *||
+                   -  -  -  -  -  -  -  -  -*-  -  -   *||  - -  -  -  -  -  -  -  -  -  -  -
+                          F                 *          *||
+                                  |         *''''''''''A||                   |
+                                  |                     ||                   |
+                                  |                     ||                   |
+                   -  -  -  -  -  |   -  -    -  -  -   ||   -  -  -  -  -   |  -  -  -  -  -
+                                  |                     ||                   |
+                                  |                     ||                   |
+                                  |                     ||                   |
+
+
+
+
+                      Now, the low x-section becomes the active section.
+                      Division in y-direction.
+                      The splitting line (double, horizontal) splits the field into a
+                      low section and a high section
+                      This section is now Here, At first, division in x-direction.
+
+
+                   ---> x
+
+          |                       |                     |                   |
+          |                       |         I***********|                   |
+          v                       |         *          *|                   |
+          y       -  -  -  -  -   |  -  -  - -  -  -   *|  -  -  -  -  -    |  -  -  -  -  -
+                                  |         *          *|                   |
+                                  |         *          *|                   |
+                                  |         *          *|                   |
+                                            *          C|
+ splitting line >  = = = = = = = = = = = = = = = = = = =| -  -  -  -  -  -  -  -  -  -  -
+                          F                 *          *|
+                                  |         *''''''''''A|                   |
+                                  |                     |                   |
+                                  |                     |                   |
+                   -  -  -  -  -  |   -  -    -  -  -   |   -  -  -  -  -   |  -  -  -  -  -
+                                  |                     |                   |
+                                  |                     |                   |
+                                  |                     |                   |
+
+
+                      Min is in the low  section (MinBit = 0).
+                      Max is in the high section (MaxBit = 1).
+                      F is in the upper section, that means Fbit =1.
+
+                      Situation: FBit=1   MinBit =0  MaxBit =1
+
+                      All z-values in the low section (here on top) are lower than the Z(F).
+                      They are candidates for LITMAX whose Z-value is smaller than Z(F) by
+                      defintion. From them, the greatest possible Z-value is in the corner
+                      denoted by C, where the "candidate point" is placed. This is done by
+                      C := loadxxx011111( MAX)
+
+                      F can also be in the high section.
+
+                      Search goes on in the high section, the range is now restricted to the
+                      high section.
+
+                      This is done by Jumping Min in y-direction to the lowest possible value
+                      in the upper section.
+
+                      This is done by loading 10000  into Min, starting fom the actial bit
+                      position (secodn bit position here).
+                      See source code below: MIN := loadxxx100000 ( MIN)
+
+                      The search for F in the high section can fail (this is the case if the
+                      staircase produced by F, see article, goes strictly along the splitting
+                      line); if it fails, then F is the candidate point C.
+
+
+                      result:
+
+                   ---> x
+
+          |                       |                     |                   |
+          |                       |                     |                   |
+          v                       |                     |                   |
+          y       -  -  -  -  -   |  -  -  - -  -  -    |  -  -  -  -  -    |  -  -  -  -  -
+                                  |                     |                   |
+                                  |                     |                   |
+                                  |                     |                   |
+                                                       C|
+                   -  -  -  -  -  -  -  -  -  -   -  -  | -  -  -  -  -  -  -  -  -  -  -
+                          F       ||        I***********|
+                                  ||        *''''''''''A|                   |
+                                  ||                    |                   |
+                                  ||                    |                   |
+                   -  -  -  -  -  ||  -  -    -  -  -   |   -  -  -  -  -   |  -  -  -  -  -
+                                  ||                    |                   |
+                                  ||                    |                   |
+                                  ||                    |                   |
+                   splitting line ^
+
+
+                    All Z-values in the search range are greater than Z(F). Search fails, the
+                    candidate point C is LITMAX.
+
+
+          The remaining situations are evident, the complete LITMAX decision table is here:
+
+
+          FBit=0   MinBit =0  MaxBit =0 :  everything in the same section: just continue
+
+          FBit=0   MinBit =0  MaxBit =1 :  see above
+
+          FBit=0   MinBit =1  MaxBit =0 :  impossible, because always F(Max) > F(Min)
+
+          FBit=0   MinBit =1  MaxBit =1 :  F is in the lower section, the remaining search range
+                                           is completely in the upper section. LITMAX cannot be
+                                           in the remaining search range. Therfore LITMAX=C.
+                                           (In the source code below, the LITMAX variable is
+                                           directly used for C, there no special variable for C).
+
+          FBit=1   MinBit =0  MaxBit =0 :  F is in the upper section, the remaining search range
+                                           completely in the lower section. LITMAX is the greates
+                                           possible Z-Value in the lower section, this is MAX.
+
+          FBit=1   MinBit =0  MaxBit =1 :  see above
+
+          FBit=1   MinBit =1  MaxBit =0 :  impossible, because always F(Max) > F(Min)
+
+          FBit=1   MinBit =1  MaxBit =1 :  everything in the same section: just continue
+
+
+The search for BIGMIN is analogue to that, with symmetries. You find the table in the article.
+
+
+Here is the Pascal source code:
+-------------------------------
+(I tested it, but of course there is no guarantee that it is error free)
+
+*)
+
+{
+
+//Basic definitions that can be modified to adopt to one's needs:
+//no. of dimensions (here: 3), dimension names, Key format (here: word):
+
+const ndims=3; //number of dimensions
+type tvaluefield=array [0..ndims-1] of integer;
+
+type trecord = record
+       case integer of
+       1: (x,y,z: word;);
+       2: (valuefield: array[1..ndims] of word;
+      //so you can address the data either with a.x or a.valuefield[1]
+           maxvalue: word); //Max of x,y,z... just to speed up z-value-Comparisons
+     end; //record
+
+type trecordarray = array of trecord;
+
+var startbit: integer;
+
+
+}
+
+procedure adjust_maxvalue(var R: trecord);
+//adjusts R.maxvalue to the max value in R
+var dim, max: integer;
+begin
+  max:= R.valuefield[1];
+  for dim:=2 to ndims do
+    if R.valuefield[dim] > max then max := R.valuefield[dim];
+  R.maxvalue:=max;
+end; //adjust_maxvalue
+
+
+
+function LOAD_xxx10000(loadword: word; bitindex: integer): word;
+//loads a bitpattern "10000.." into loadword, starting at bitindex
+var pattern_00010000: word;
+var pattern_00001111: word;
+var pattern_11110000: word;
+begin
+  pattern_00010000 := 1 shl (bitindex-1);
+  pattern_00001111 := pattern_00010000 -1;
+  pattern_11110000 := not pattern_00001111;
+
+  result:=loadword or  pattern_00010000;
+  result:=result and pattern_11110000;
+
+end; //LOAD_xxx10000
+
+
+function LOAD_xxx01111(loadword: word; bitindex: integer): word;
+//loads a bitpattern "011111.." into loadword, starting ad bitindex
+var pattern_00010000: word;
+var pattern_00001111: word;
+var pattern_11101111: word;
+
+begin
+
+  pattern_00010000 := 1 shl (bitindex-1);
+  pattern_11101111 := not pattern_00010000;
+  pattern_00001111 := pattern_00010000 -1;
+
+  result:=loadword and pattern_11101111;
+  result:=result or  pattern_00001111;
+
+end; //LOAD_xxx01111
+
+
+
+procedure getLITMAX(MIN_, MAX_, DIV_: trecord; startbit: integer; var LITMAX: trecord);
+//LITMAX is the maximum possible record in search Rectanle MIN_/Max_ whose Z-Value
+//is smaller than Z(DIV_)
+//how it works: see above
+//clearly some lines can be omitted ("case not possible.... error..."); I included it to keep
+//the code in accordance with the description above
+  var dimindex: integer; //0.. ndims-1
+  var bitindex: integer; //1..sizeof(word)
+  var bitmask: word;
+  var isminbit, ismaxbit, isdivbit: boolean;
+begin
+  //precondition: Z-value of DIV_ > Z-value of MIN_
+  //              Z-value of DIV_ < Z-value of MAX_
+  //to check it, use function zvalue_compare given below
+
+  LITMAX:=MAX_;
+
+  //for bitindex:=sizeof(word) * 8 (*one byte has 8 bits*) downto 1 do
+  for bitindex:=startbit downto 1 do
+  begin
+    bitmask:= 1 shl (bitindex-1); //a bit faster when beginning with 1 shl (bitindex-1) and then
+                                  //shr 1 each time. Easier to read this way.
+    for dimindex:=1 to ndims do
+    //Remark: interleaving order (3D) is xyzxyzxyz.... first dimension is x, second is y, etc.
+    //Therefore it does not work with "ndims downto 1".
+    //  As depicted above and in the article, this visually yields an N-curve, which is basically
+    //  the same. Just interchange x and y in the figures to get a Z.
+    begin
+      isdivbit:=(DIV_.valuefield[dimindex] and bitmask) = bitmask;
+      isminbit:=(MIN_.valuefield[dimindex] and bitmask) = bitmask;
+      ismaxbit:=(MAX_.valuefield[dimindex] and bitmask) = bitmask;
+
+      //decision table:
+      if (not isdivbit) and (not isminbit) and(not ismaxbit) // 0 0 0 -> no action, continue
+      then
+      else
+      if (not isdivbit) and (not isminbit) and(ismaxbit)     // 0 0 1 -> MAX:=LOAD xxx01111 into MAX
+        then
+        begin
+          MAX_.valuefield[dimindex] := LOAD_xxx01111(MAX_.valuefield[dimindex], bitindex);
+        end
+      else
+      if (not isdivbit) and (isminbit) and(not ismaxbit)     // 0 1 0  not possible
+      then
+        error('not possible')
+      else
+      if (not isdivbit) and (isminbit) and(ismaxbit)         // 0 1 1  finish
+      then
+      begin
+        exit;
+      end
+      else
+      if (isdivbit) and (not isminbit) and(not ismaxbit)     // 1 0 0  LITMAX:=MAX; finish
+      then
+      begin
+       LITMAX:=MAX_; exit;
+      end
+      else
+      if (isdivbit) and (not isminbit) and(ismaxbit)         // 1 0 1 LITMAX:=load xxx011111 into MAX
+                                                             //       MIN:=load xxx10000 into MIN
+      then
+      begin
+          LITMAX:=MAX_; LITMAX.valuefield[dimindex] := LOAD_xxx01111(MAX_.valuefield[dimindex],
+                                                                     bitindex);
+             //Remark: Don't forget "LITMAX:=MAX_"; it has become necessary, as interleaving is
+             //no more done explicitely. Here, the load function handles just one key, not the
+             //complete (bit interleaved ) record.
+          MIN_.valuefield   [dimindex] := LOAD_xxx10000(MIN_.valuefield[dimindex], bitindex);
+      end
+      else
+      if (isdivbit) and (isminbit) and(not ismaxbit)         // 1 1 0 not possible
+      then
+        error('not possible')
+      else
+      if (isdivbit) and (isminbit) and(ismaxbit)             // 1 1 1 no action, continue
+      then (*no action*);
+
+    end; //for dimindex
+
+  end; //for bitindex
+
+end; //getLITMAX
+
+
+
+procedure getBIGMIN(MIN_, MAX_, DIV_: trecord; startbit: integer; var BIGMIN: trecord);
+//BIGMIN is the minimum possible record in search rectanle MIN_/Max_ whose Z-Value is
+//bigger than Z(DIV_).
+//how it works: see above
+//clearly some lines can be omitted ("case not possible.... error..."); I included it to
+//keep the code in accordance
+//  with the description above
+  var dimindex: integer; //0.. ndims-1
+  var bitindex: integer; //1..sizeof(word)
+  var bitmask: word;
+  var isminbit, ismaxbit, isdivbit: boolean;
+begin
+
+  //precondition: Z-value of DIV_ > Z-value of MIN_
+  //              Z-value of DIV_ < Z-value of MAX_
+  //to check it, use function zvalue_compare given below
+
+
+  BIGMIN:=MIN_;
+
+  for bitindex:=startbit downto 1 do
+  //for bitindex:=sizeof(word) *8 (*one byte has 8 bits*) downto 1 do
+  begin
+    bitmask:= 1 shl (bitindex-1); //a bit faster when beginning with 1 shl (bitindex-1) and then
+                                  //shr 1 each time. Easier to read this way.
+
+    for dimindex:=1 to ndims do
+    //Remark: interleaving order (3D) is xyzxyzxyz.... first dimension is x, second is y, etc.
+    //  it does not work with "ndims downto 1"
+    //  As depicted above and in the article, this visually yields an N-curve, which is basically
+    //  the same. Just interchange x and y in the figures to get a Z.
+    begin
+      isdivbit:=(DIV_.valuefield[dimindex] and bitmask) = bitmask;
+      isminbit:=(MIN_.valuefield[dimindex] and bitmask) = bitmask;
+      ismaxbit:=(MAX_.valuefield[dimindex] and bitmask) = bitmask;
+
+      //decision table:
+      if (not isdivbit) and (not isminbit) and(not ismaxbit) // 0 0 0 -> no action, continue
+      then
+      else
+      if (not isdivbit) and (not isminbit) and(ismaxbit)     // 0 0 1 -> BIGMIN:=LOAD xxx10000 into MIN
+      then                                                   //          MAX   :=LOAD xxx01111 into MAX
+        begin
+          BIGMIN:=MIN_; BIGMIN.valuefield[dimindex] := LOAD_xxx10000(MIN_.valuefield[dimindex],
+                                                                     bitindex);
+             //Remark: Don't forget "BIGMIN:=MIN"; it has become necessary, as interleaving is
+             //no more done explicitely. Here, the load function handles just one key, not the
+             //complete (bit interleaved ) record.
+          MAX_.valuefield   [dimindex] := LOAD_xxx01111(MAX_.valuefield[dimindex], bitindex);
+        end
+      else
+      if (not isdivbit) and (isminbit) and(not ismaxbit)     // 0 1 0  not possible
+      then
+        error ('not possible')
+      else
+      if (not isdivbit) and (isminbit) and(ismaxbit)         // 0 1 1  bigmin:=min, finish
+      then
+      begin
+        BIGMIN:=MIN_; exit;
+      end
+      else
+      if (isdivbit) and (not isminbit) and(not ismaxbit)     // 1 0 0  finish
+      then
+        exit
+      else
+      if (isdivbit) and (not isminbit) and(ismaxbit)         // 1 0 1  load xxx10000 into MIN
+      then
+        begin
+          MIN_.valuefield[dimindex] := LOAD_xxx10000(MIN_.valuefield[dimindex], bitindex);
+        end
+      else
+      if (isdivbit) and (isminbit) and(not ismaxbit)         // 1 1 0  not possible
+      then
+        error('not possible')
+      else
+      if (isdivbit) and (isminbit) and(ismaxbit)             // 1 1 1 no action, continue
+      then (*no action*);
+
+    end; //for dimindex
+
+  end; //for bitindex
+
+end; //getBIGMIN
+
+
+
+//the function zvalue_compare described in the following becomes necessary because bit
+//interleaving is not done explicitly. The data are left as they are and they are processed
+//instead in interleaved manner.
+//(Comparing interleaved data a and b was easier: just write "if a > b" and the like).
+
+
+//type tcompare = (less, equal, greater); (defined elsewhere)
+
+
+
+function zvalue_compare(a,b: trecord): tcompare;
+//works with clobal ndims = number of dimensions
+var dim: integer;
+var a_xor_b: array [1..ndims] of word;
+var AND12, XOR12: word;
+(*
+
+Task:  go through the data columnwise, a and b in parallel, until you
+hit an "1" Bit, this is the decisive bit position and the relevant dimension.
+
+There:
+if aBit is "1" and bBit is "0", then Z(a)>Z(b)
+if aBit is "0" and bBit is "1", then Z(b)>Z(a)
+if aBit is "1" and bBit is "1", then Z(a)>Z(b).
+
+The latter rule applies because the interleaving scheme is xyzxyz...,
+that means x has proirity against y, y has proirity against z, etc.
+
+examples:
+
+       a             b
+x    00000         00100
+y    01000         00000
+z    00000         00000
+
+Z(a)>Z(b)  because the "1" is hit at a with "0" at b  (y is the relevant dimension)
+
+       a             b
+x    00000         01000
+y    01100         00000
+z    01000         00000
+
+Z(b)>Z(a)  because the "1" is hit at b with "0" at a (x is the relevant dimension)
+
+x    01000         01000
+y    01000         01000
+z    01000         00000
+
+Z(a)>Z(b)  because the "1" is hit at a with "1" at b  (x is the relevant dimension)
+
+So, a straightforward but slow realisation would be as follows (ndims=no. of dimensions):
+
+var bitpos, dim: integer;
+var bitmask: word;
+var a_is_1, b_is_1: boolean;
+begin
+
+  result:=equal; //init for the case that all values are Zero
+  for bitpos:=sizeof(word) *8 downto 1 do //one word has 2 bytes, one byte has 8 bits
+  begin
+    bitmask:= 1 shl (bitpos-1);
+    for dim:=1 to ndims do
+    begin
+
+      a_is_1 :=(a.valuefield[dim] and bitmask) <>0;
+      b_is_1 :=(b.valuefield[dim] and bitmask) <>0;
+
+      if a_is_1 then if not b_is_1 then
+      begin
+        result:=greater; //Z(a)>Z(b)
+        exit;
+      end;
+
+      if b_is_1 then if not a_is_1 then
+      begin
+        result:=less; //Z(a)<Z(b)
+        exit;
+      end;
+
+    end;
+  end;
+  //if it comes here, the result is "equal"
+end;
+
+This was just for explanation of the task.
+
+
+
+A faster, more sophisticated realisation is first explained by means of 2 dimensions, x and y.
+
+At first the x-values are XORed with the y-values:
+
+for dim:=1 to ndims do
+  a_xor_b[dim]:=a.valuefield[dim] xor b.valuefield[dim];
+
+
+if in a_xor_b[dim] at the decisive bit posiion both x and y bits are "1", then the relevant
+  dimension is x. This is because interleaving is xyxyxy..,, x has priority
+
+example:
+x:     a_xor_b[1]        00101010 < here is the relevant dimension
+y:     a_xor_b[2]        00111001
+                           ^ here is the decisiwe bit position
+
+if at the decisive bit posiion one bit is "1" and the other is "0", then then the relevant
+  dimension is the one with 1.
+example:
+x:     a_xor_b[1]        00001010
+y:     a_xor_b[2]        00111001  < here is the relevant dimension
+                           ^ here is the decisiwe bit position
+
+The final decision is done according to the original data a, b at the relevant dimension.
+
+auxiliary variables:
+
+AND12 = a_xor_b[1] AND a_xor_b[2]
+XOR12 = a_xor_b[1] VOR a_xor_b[2].
+
+case 1: at the decisive bit position AND12 is 1
+        at the decisive bit position XOR12 is 0
+
+        here, clearly, AND12 > XOR12
+
+        if so, both y and x bits are 1 and the relevant dimension is x.
+
+case 2: at the decisive bit position AND12 is 0
+        at the decisive bit position XOR12 is 1
+
+        here, clearly, XOR12 > AND12
+
+        if so, only one of the y and x bits has "1" and the relevant dimension
+        is the dimension which has "1".
+
+In order to handle n dimensions, the thing is done first for dimensions 1 and 2, the relevant
+dimension found thus far is kept. Then the same thing is done with the relevant dimension thus far
+and dimension 3, wherehy again the (possibly new) relevant dimension is kept. And so on.
+
+
+Here is the code:
+
+*)
+var relevant_dimension, run_dimension: integer;
+
+
+begin
+
+  //to accelerate, this should be done already when creating the records...
+  //(it is done here just to be sure)
+  adjust_maxvalue((*var*) a);
+  adjust_maxvalue((*var*) b);
+
+
+  //try shortcut:
+  if (a.maxvalue XOR b.maxvalue) > (a.maxvalue AND b.maxvalue)
+  then
+    begin
+      //inc (shortcutzaehler);
+
+      if a.maxvalue > b.maxvalue
+      //if maxvalue_A > maxvalue_B
+      then
+      begin
+        result:=greater;
+        exit;
+      end
+      else
+      if a.maxvalue < b.maxvalue
+      //if maxvalue_A < maxvalue_B //das else kann man sich sparen
+      then
+      begin
+        result:=less;
+        exit;
+      end
+    end;
+  //end try shortcut
+
+
+  result:=equal;
+
+  //prepare a_xor_b for all dimensions:
+  for dim:=1 to ndims do
+  a_xor_b[dim]:=a.valuefield[dim] xor b.valuefield[dim];
+
+
+  relevant_dimension:=1; //init for the first dimension loop
+  run_dimension:=2; //init
+
+
+  //dimensionloop:
+  while run_dimension <= ndims do
+  begin
+    AND12 := a_xor_b[relevant_dimension] AND a_xor_b[run_dimension];
+    XOR12 := a_xor_b[relevant_dimension] XOR a_xor_b[run_dimension];
+
+    if AND12 > XOR12 then
+     //dimension 1 (x) is relevant as it is the first dimension in the interlacing scheme
+    begin
+      if a.valuefield[relevant_dimension] > b.valuefield[relevant_dimension]
+      then result:=greater
+      else result:=less;
+      //relevant_dimension for next loop remains
+    end
+    else
+    if AND12 < XOR12 then
+    begin
+      if a_xor_b[relevant_dimension] > a_xor_b[run_dimension]
+      then
+      begin //dim 1 is relevant
+        if a.valuefield[relevant_dimension] > b.valuefield[relevant_dimension]
+        then result:=greater
+        else result:=less;
+        //relevant_dimension next loop remains
+      end
+      else
+      begin //dim 2 is relevant
+        if a.valuefield[run_dimension] > b.valuefield[run_dimension]
+        then result:=greater
+        else result:=less;
+        relevant_dimension:=run_dimension;
+        (*new; this is the init decisive dimension for the next dimension loop*)
+      end;
+    end;
+
+    //dimension_is_ready:
+    inc(run_dimension);
+
+  end; //dimensionloop
+
+  //remark: result remains "equal" only if never a[i]<>b[i], that means only if a=b
+
+end; //zvalue_compare
+
+
+(*
+
+Realisation hints:
+------------------
+
+Data types:
+
+The above program works with word type data (no negatives). To handle integer data
+(possibly negative), just invert the sign bit. This converts the data range to
+0000..0 (lowest negative) to 1111..1 (highest positive).
+
+The meaning behind the data is not relevant, only greater-less-equal matters! Anything
+sortable that can be mapped to a 0000..0 to 1111..1 range, can be range searched (maybe
+buckets of whatever that could again be searched anyhow).
+
+To achieve this mapping for floating point data is surprisingly simple: If the float
+is >=0, invert the sign bit, if the float is <0, invert all bits.
+
+The consideration behind it is as follows: The sign bit is the first significant bit.
+Unfortunately, it is 0 for positive data and 1 for negative data. So just invert it.
+Exponent and mantissa are both not 2's complement (as it is the case with integers)
+but in a range of 0000..0 (lowest value) to 1111..1 (highest value). Increasing the
+exponent shifts more to the left, which corresponds to an increasing absolute value
+of the float. The same is true for the mantissa: increasing the mantissa increases the
+absolute value of the float. So, what we do is sorting the float according to its
+absolute value. However, a negative with great absolute value is less than a negative
+with small absolute value. This can simply be handled by inverting both exponent and
+mantissa (in addition to the sign bit).
+
+Of course, such bit manipulations are to be reverted when reporting results.
+
+
+Data structures:
+
+The LITMAX/BIGMIN method can be helpful for any data structuring scheme. In the
+original article cited above, binary search trees are used (that can be dynamically
+balanced when insertions or deletions take place).
+
+For data given as an array of records, sorted by "zvalue_compare", this original
+method can be realized by binary search, without realizing a search tree explicitly.
+For an array of records, it is somewhat better, to split the data hierarchically
+into intervals and use for each interval processed both BIGMIN (of leftmost Record)
+and LITMAX (of rightmost Record), narrowing the interval of Z-Values remaining in
+question even further.
+
+The same can be done with other interval based data structures, e.g. skiplists
+(that also can be dynamically balanced when insertions or deletions take place).
+
+
+Performance considerations:
+
+Align the data the way that for each dimension the leading bit is at the same position.
+
+   Example:
+
+   maximum key value first  dimension is 00111010
+   maximum key value second dimension is 00000111
+
+   Here, shift the second dimension input data 3 bits to the left, shift the second
+   dimension output data 3 bits to the right.
+
+Adjust the startbit to the maximum possible key value; this makes the LILMAX/BIGMIN
+calculation a bit faster.
+
+When using a data structure where in some step the number of consecutive records in
+question is known (as it is the case for sorted arrays partitioned into intervals), make
+a trivial sequential search for these records if this number of records is small enough,
+(with limit at, say, 100..10000, depending on the computer and data situation).
+Use the LITMAX / BIGMIN stuff only for the big leaps. The limit can be determinded
+beforehand by experiments with typical test data and the computer at hand. It may be
+even learned from experience while processing.
+
+
+Double Records:
+
+The thing works also when double records are possible (concerning searchable keys).
+This is due to the fact that, when a record F encountered is within the search range,
+LITMAX/BIGMIN are not calculated (as described in the article algorithm, page 75):
+LITMAX/BIGMIN(F) results are records with z-value less/greater than the Z-codes of F,
+respectively. Therefore, don't use LITMAX/BIGMIN when F is in the search range and
+double records are possible. When using it in this case anyway, scan the neighbours
+of F in both directions as long they have the same keys as F.
+*)
