@@ -2,28 +2,38 @@
   "Datapotamus2 core: envelope helpers, the `instrument` transformation,
    and `run!` runner.
 
-   `instrument : FlowSpec → FlowSpec` walks every proc and wraps step-fns
-   with synchronous trace emission into a `toolkit.pubsub`. A nested
-   flow spec (a `:procs` value that is itself a map with `:procs`/`:conns`)
-   is recursed into — `instrument` handles arbitrary depth automatically.
+   Step-fns are **factories** that take a ctx and return the flow step-fn:
 
-   Step-fns never touch `::flow/report`. They return a plain flow output
-   map:
+     (defn my-step [ctx]
+       (fn ([] {:params {} :ins {:in \"\"} :outs {:out \"\"}})
+           ([_] {}) ([s _] s)
+           ([s _ m] ...)))
 
-     [new-state {out-port [children]
-                 ::dp2/derivations [intermediate-msgs]
-                 ::dp2/merges      [{:msg-id ... :parents [...]}]}]
+   `instrument` materializes each proc by calling `(p ctx)` before handing
+   the resulting step-fn to `clojure.core.async.flow`. The ctx carries only
+   what can't be obtained lexically:
 
-   The wrapper synthesizes :recv / :send-out / :merge / :success /
-   :failure events and publishes each one synchronously to the pubsub
-   before returning to flow. Synchronous publish gives lossless +
-   causal-ordered tracing with no buffering or quiesce windows.
+     :pubsub   — the shared event bus
+     :scope    — tagged path of containers, e.g. [[:flow fid] [:step sid]]
+     :step-id  — this proc's step-id
+     :emit     — raw publisher, (fn [scope ev])
+     :trace    — span helper, (fn [ctx span-name metadata body-fn])
 
-   Subjects are kind-first and flat-symmetric across nesting:
+   A nested flow spec (a `:procs` value that is itself a map with
+   `:procs`/`:conns`) is recursed into — `instrument` handles arbitrary
+   depth automatically.
 
-     <kind>.flow.<fid1>.step.<stepid>                                 top-level step
-     <kind>.flow.<fid1>.flow.<fid2>.step.<stepid>                     one nested
-     <kind>.flow.<fid1>.run                                           run-level"
+   Subjects are kind-first and built from the tagged scope:
+
+     <kind>.flow.<fid1>.step.<sid>                   top-level step
+     <kind>.flow.<fid1>.flow.<sub>.step.<sid>        nested flow
+     <kind>.flow.<fid1>.step.<sid>.span.<name>       span inside a step
+     <kind>.flow.<fid1>.run                          run-level
+
+   `wrap-proc` synthesizes :recv / :send-out / :merge / :success / :failure
+   events and publishes each one synchronously. `trace` synthesizes
+   :span-start / :span-success / :span-failure events around user code
+   inside a step; these are inert to the completion counter."
   (:refer-clojure :exclude [run!])
   (:require [clojure.core.async :as a]
             [clojure.core.async.flow :as flow]
@@ -139,8 +149,6 @@
   (let [ports     (port-output-keys output)
         port-ids  (into #{} (mapcat (fn [p] (map :msg-id (get output p)))) ports)
         derivs    (->> (get output ::derivations)
-                       ;; dedup: a msg that appears in a port output is not
-                       ;; also emitted as a nil-port derivation.
                        (remove #(port-ids (:msg-id %))))
         merges    (get output ::merges)
         ev-merges (mapv (fn [{:keys [msg-id parents]}]
@@ -157,40 +165,86 @@
 (defn- strip-dp2-keys [out]
   (reduce-kv (fn [m k v] (if (dp2-key? k) m (assoc m k v))) {} out))
 
-;; --- subject + emit ---------------------------------------------------------
+;; --- scope + subject --------------------------------------------------------
 
-(defn- subject-for [{:keys [flow-path]} step-id kind]
-  (->> (concat [(name kind)]
-               (mapcat (fn [fid] ["flow" fid]) flow-path)
-               (if step-id ["step" (name step-id)] ["run"]))
+(defn- scope->segments [scope]
+  (mapcat (fn [[k id]]
+            [(name k) (if (keyword? id) (name id) (str id))])
+          scope))
+
+(defn- subject-for [scope kind]
+  (->> (cons (name kind) (scope->segments scope))
        (str/join ".")))
 
-(defn- make-emit [{:keys [pubsub flow-path] :as ctx}]
-  (fn [ev]
-    (let [ev' (assoc ev :flow-path flow-path)]
-      (pubsub/pub pubsub (subject-for ctx (:step-id ev) (:kind ev)) ev'))))
+(defn- run-subject-for [scope kind]
+  (->> (cons (name kind) (concat (scope->segments scope) ["run"]))
+       (str/join ".")))
+
+(defn- flow-path-of
+  "Extract the list of flow-ids from a scope (preserves outer-to-inner order).
+   Provided on every event body for consumers that just want flow ancestry."
+  [scope]
+  (mapv (fn [[_ id]] (if (keyword? id) (name id) id))
+        (filter (fn [[k _]] (= k :flow)) scope)))
+
+;; --- emit -------------------------------------------------------------------
+
+(defn- make-emit [pubsub]
+  (fn [scope ev]
+    (pubsub/pub pubsub
+                (subject-for scope (:kind ev))
+                (assoc ev :scope scope :flow-path (flow-path-of scope)))))
+
+;; --- trace (spans) ----------------------------------------------------------
+
+(defn trace-span
+  "Run body-fn within a span scope. Emits :span-start, then either
+   :span-success or :span-failure, and rethrows on failure.
+
+   body-fn receives an inner ctx whose :scope is extended with
+   [:span span-name]; nested `trace-span` calls made from inside body-fn
+   therefore nest correctly.
+
+   Span events are observability only — they fall through the completion
+   counter's `case` and do not affect run completion."
+  [{:keys [emit scope step-id] :as ctx} span-name metadata body-fn]
+  (let [inner-scope (conj (vec scope) [:span span-name])
+        inner-ctx   (assoc ctx :scope inner-scope)]
+    (emit inner-scope
+          {:kind :span-start :step-id step-id :span-name span-name
+           :metadata metadata :at (now)})
+    (try
+      (let [result (body-fn inner-ctx)]
+        (emit inner-scope
+              {:kind :span-success :step-id step-id :span-name span-name
+               :result result :at (now)})
+        result)
+      (catch Throwable ex
+        (emit inner-scope
+              {:kind :span-failure :step-id step-id :span-name span-name
+               :error {:message (ex-message ex) :data (ex-data ex)}
+               :at (now)})
+        (throw ex)))))
 
 ;; --- wrap-proc --------------------------------------------------------------
 
-(defn- wrap-proc [step-id user-step-fn emit]
+(defn- wrap-proc [step-id step-scope emit user-step-fn]
   (fn
     ([] (user-step-fn))
     ([arg] (user-step-fn arg))
     ([s arg] (user-step-fn s arg))
     ([s in-id m]
-     ;; :recv is emitted unconditionally before user-fn runs so that a
-     ;; throw balances against :failure in the completion counter.
-     (emit (recv-event step-id m))
+     (emit step-scope (recv-event step-id m))
      (try
        (let [[s' raw]      (user-step-fn s in-id m)
              resolved      (resolve-output-nils (or raw {}) (:msg-id m))
              middle-events (build-middle-events step-id resolved)
              port-map      (strip-dp2-keys resolved)]
-         (doseq [ev middle-events] (emit ev))
-         (emit (success-event step-id m))
+         (doseq [ev middle-events] (emit step-scope ev))
+         (emit step-scope (success-event step-id m))
          [s' port-map])
        (catch Throwable ex
-         (emit (failure-event step-id m ex))
+         (emit step-scope (failure-event step-id m ex))
          [s {}])))))
 
 ;; --- counter logic ----------------------------------------------------------
@@ -202,7 +256,7 @@
     :failure  (update counters :completed inc)
     :send-out (if (:port ev)
                 (update counters :sent inc)
-                counters)                ; :port nil = internal derivation
+                counters)
     counters))
 
 (defn- done? [{:keys [sent recv completed]}]
@@ -215,30 +269,58 @@
 (defn- nested-spec? [v]
   (and (map? v) (contains? v :procs) (contains? v :conns)))
 
-(defn- expand-nested [step-id nested-spec outer-ctx]
-  (let [inner-ctx  (update outer-ctx :flow-path conj (name step-id))
-        inner-inst (instrument-with-ctx nested-spec inner-ctx)
-        outer-emit (make-emit outer-ctx)]
-    (wrap-proc step-id
-               (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                   ([_] {}) ([s _] s)
-                   ([s _ m]
-                    (let [outs (run-inner inner-inst inner-ctx (:data m))]
-                      [s {:out (mapv #(child-with-data m %) outs)}])))
-               outer-emit)))
+(defn- arities
+  "Set of arities a fn responds to (via any invoke-shaped Java method).
+   Pattern borrowed from Jepsen (EPL), which handles invoke/invokeStatic/
+   doInvoke uniformly across AOT and primitive-typed compilations."
+  [f]
+  (into #{}
+        (keep (fn [^java.lang.reflect.Method m]
+                (when (re-find #"invoke" (.getName m))
+                  (alength (.getParameterTypes m)))))
+        (-> f class .getDeclaredMethods)))
 
-(defn- instrument-with-ctx [spec ctx]
-  (let [emit   (make-emit ctx)
+(defn- factory?
+  "A factory responds to exactly one arity (ctx)."
+  [p]
+  (= #{1} (arities p)))
+
+(defn- instrument-proc [sid p outer-ctx emit]
+  (let [step-scope (conj (vec (:scope outer-ctx)) [:step sid])]
+    (cond
+      (nested-spec? p)
+      (let [inner-scope (conj (vec (:scope outer-ctx)) [:flow (name sid)])
+            inner-ctx   (assoc outer-ctx :scope inner-scope)
+            inner-inst  (instrument-with-ctx p inner-ctx)
+            step-fn     (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
+                            ([_] {}) ([s _] s)
+                            ([s _ m]
+                             (let [outs (run-inner inner-inst inner-ctx (:data m))]
+                               [s {:out (mapv #(child-with-data m %) outs)}])))]
+        (wrap-proc sid step-scope emit step-fn))
+
+      (factory? p)
+      (let [proc-ctx {:pubsub  (:pubsub outer-ctx)
+                      :scope   step-scope
+                      :step-id sid
+                      :emit    emit
+                      :trace   trace-span}
+            step-fn  (p proc-ctx)]
+        (wrap-proc sid step-scope emit step-fn))
+
+      :else
+      (wrap-proc sid step-scope emit p))))
+
+(defn- instrument-with-ctx [spec outer-ctx]
+  (let [emit   (make-emit (:pubsub outer-ctx))
         procs' (into {}
                  (for [[sid p] (:procs spec)]
-                   [sid (if (nested-spec? p)
-                          (expand-nested sid p ctx)
-                          (wrap-proc sid p emit))]))]
-    (assoc spec :procs procs' ::ctx ctx)))
+                   [sid (instrument-proc sid p outer-ctx emit)]))]
+    (assoc spec :procs procs' ::ctx outer-ctx)))
 
 (defn instrument
-  "Wrap every proc's step-fn for synchronous trace emission. Nested flow
-   specs (maps in :procs with :procs/:conns) are expanded recursively.
+  "Wrap every proc's factory and materialize its step-fn for synchronous
+   trace emission. Nested flow specs are expanded recursively.
 
    Options:
      :pubsub    existing pubsub instance (default: fresh via pubsub/make)
@@ -247,7 +329,7 @@
   ([spec opts]
    (let [fid (or (:flow-id opts) (str (random-uuid)))
          ctx {:pubsub (or (:pubsub opts) (pubsub/make))
-              :flow-path [fid]}]
+              :scope  [[:flow fid]]}]
      (instrument-with-ctx spec ctx))))
 
 ;; --- run! -------------------------------------------------------------------
@@ -257,28 +339,31 @@
    {:procs (into {} (map (fn [[sid pfn]] [sid {:proc (flow/process pfn)}])) (:procs spec))
     :conns (:conns spec)}))
 
+(defn- scope->glob [scope]
+  (str "*." (str/join "." (scope->segments scope)) ".>"))
+
 (defn- run-inner
   "Drive an already-instrumented nested spec to completion with a fresh
    seed, return a vector of data values that the inner's :output step
    received (via :recv events). The inner spec's :output should be a
    terminal sink that absorbs the final msgs."
   [inner-spec inner-ctx seed-data]
-  (let [{:keys [pubsub flow-path]} inner-ctx
-        entry    (:entry inner-spec)
-        output   (:output inner-spec)
-        counters (atom {:sent 1 :recv 0 :completed 0})
-        done-p   (promise)
-        outputs  (atom [])
-        scope    (str "*." (str/join "." (mapcat (fn [fid] ["flow" fid]) flow-path)) ".>")
-        main-sub (pubsub/sub pubsub scope
-                             (fn [_ ev _]
-                               (when (and (= :recv (:kind ev))
-                                          (= output (:step-id ev))
-                                          (= flow-path (:flow-path ev)))
-                                 (swap! outputs conj (:data ev)))
-                               (let [c' (swap! counters update-counters ev)]
-                                 (when (done? c')
-                                   (deliver done-p :completed)))))
+  (let [{:keys [pubsub scope]} inner-ctx
+        entry      (:entry inner-spec)
+        output     (:output inner-spec)
+        counters   (atom {:sent 1 :recv 0 :completed 0})
+        done-p     (promise)
+        outputs    (atom [])
+        inner-path (flow-path-of scope)
+        main-sub   (pubsub/sub pubsub (scope->glob scope)
+                               (fn [_ ev _]
+                                 (when (and (= :recv (:kind ev))
+                                            (= output (:step-id ev))
+                                            (= inner-path (:flow-path ev)))
+                                   (swap! outputs conj (:data ev)))
+                                 (let [c' (swap! counters update-counters ev)]
+                                   (when (done? c')
+                                     (deliver done-p :completed)))))
         g (build-graph inner-spec)
         {:keys [error-chan]} (flow/start g)
         seed (new-msg seed-data)]
@@ -316,27 +401,26 @@
                    for the duration of the run"
   [spec {:keys [entry port data subscribers]
          :or {port :in subscribers {}}}]
-  (let [{:keys [pubsub flow-path]} (::ctx spec)
-        entry (or entry (:entry spec))
-        fid   (first flow-path)
-        events   (atom [])
-        counters (atom {:sent 1 :recv 0 :completed 0})
-        done-p   (promise)
-        scope    (str "*.flow." fid ".>")
-        main-sub (pubsub/sub pubsub scope
-                             (fn [_ ev _]
-                               (swap! events conj ev)
-                               (let [c' (swap! counters update-counters ev)]
-                                 (when (done? c')
-                                   (deliver done-p :completed)))))
+  (let [{:keys [pubsub scope]} (::ctx spec)
+        entry       (or entry (:entry spec))
+        fid         (first (flow-path-of scope))
+        events      (atom [])
+        counters    (atom {:sent 1 :recv 0 :completed 0})
+        done-p      (promise)
+        main-sub    (pubsub/sub pubsub (scope->glob scope)
+                                (fn [_ ev _]
+                                  (swap! events conj ev)
+                                  (let [c' (swap! counters update-counters ev)]
+                                    (when (done? c')
+                                      (deliver done-p :completed)))))
         user-unsubs (mapv (fn [[pat h]] (pubsub/sub pubsub pat h)) subscribers)
         g (build-graph spec)
         {:keys [error-chan]} (flow/start g)
         seed (new-msg data)]
-    (pubsub/pub pubsub (str "run-started.flow." fid ".run")
-                {:kind :run-started :flow-path [fid] :at (now)})
-    (pubsub/pub pubsub (str "seed.flow." fid ".run")
-                {:kind :seed :flow-path [fid]
+    (pubsub/pub pubsub (run-subject-for scope :run-started)
+                {:kind :run-started :flow-path [fid] :scope scope :at (now)})
+    (pubsub/pub pubsub (run-subject-for scope :seed)
+                {:kind :seed :flow-path [fid] :scope scope
                  :msg-id (:msg-id seed) :data-id (:data-id seed)
                  :entry entry :port port :at (now)})
     (flow/resume g)
