@@ -1,4 +1,4 @@
-(ns toolkit.datapotamus2.token
+(ns toolkit.datapotamus.token
   "XOR tokens for fan-out/fan-in coordination.
 
    A token is a 64-bit long. A token map is {token-id → long}. Merging

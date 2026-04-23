@@ -1,6 +1,6 @@
-(ns toolkit.datapotamus2.token-test
+(ns toolkit.datapotamus.token-test
   (:require [clojure.test :refer [deftest is]]
-            [toolkit.datapotamus2.token :as tok]))
+            [toolkit.datapotamus.token :as tok]))
 
 (deftest split-value-xors-back
   (doseq [n [1 2 3 5 17]]
