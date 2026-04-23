@@ -142,7 +142,7 @@
                    ;; in addition to adding the new zero-sum group, so this
                    ;; named-port fan-out composes correctly inside a nested
                    ;; topology — mirrors what the built-in `dp/fan-out` does.
-                   (let [gid           (str "split-" (:msg-id m))
+                   (let [gid           [:split (:msg-id m)]
                          [va vb]       (tok/split-value 0 2)
                          [pa pb]       (tok/split-tokens (:tokens m) 2)
                          mk            (fn [parent-tokens slice]
@@ -715,7 +715,7 @@
 
 (defn- dyn-fan-out
   "Emit one child per input item (data is a vector). Fresh zero-sum token
-   group keyed by \"dyn-<parent-msg-id>\"; a downstream `(dp/fan-in :dyn)`
+   group keyed by `[:dyn <parent-msg-id>]`; a downstream `(dp/fan-in :dyn)`
    will merge them. Splits the parent's existing tokens across the N
    children so nested fan-out/fan-in topologies compose correctly
    (mirroring what the built-in `dp/fan-out` does)."
@@ -724,7 +724,7 @@
     (fn [_ctx s m]
       (let [items         (:data m)
             n             (count items)
-            gid           (str "dyn-" (:msg-id m))
+            gid           [:dyn (:msg-id m)]
             new-slices    (tok/split-value 0 n)
             parent-splits (tok/split-tokens (:tokens m) n)
             kids          (mapv (fn [i item v]
