@@ -1,7 +1,7 @@
 (ns toolkit.datapotamus
   "Datapotamus: a thin layer over clojure.core.async.flow that adds a
-   scope-prefixed pubsub for trace emission and a span primitive for
-   observing sequential work inside a step.
+   scope-prefixed pubsub for trace emission and a ledger-based message
+   algebra for composable token accounting.
 
    The unit of composition is a **step**: a map of the shape
 
@@ -11,8 +11,7 @@
       :out sid-or-[sid port]}      ; boundary for outer composition
 
    A step with one proc is still a step; `serial`, `merge-steps`, and
-   `as-step` all produce steps. When a step is run at the top level, it
-   plays the role of a workflow — but there's only one data type.
+   `as-step` all produce steps.
 
    Factories are 1-arg fns that take a ctx and return a 4-arity
    core.async.flow process-fn. ctx carries:
@@ -21,31 +20,72 @@
      :step-id  — this step's id, as it appears in trace events
      :cancel   — promise, delivered on stop!; poll with `realized?`
 
-   Users call `with-span` (a fn taking ctx) to annotate work inside a
-   step with named spans.
+   At message time the ctx is further extended with
 
-   Subjects compose uniformly across flow / step / span:
+     :in-port  — the port this invocation arrived on
+     :msg      — the current input message envelope
+     :ledger   — per-invocation derivation atom; consumed by the
+                 message-construction helpers (`child`, `children`,
+                 `pass`, `signal`, `merge`)
 
-     recv.flow.<fid>.step.<sid>
-     recv.flow.<fid>.step.<sid>.span.<name>
-     recv.flow.<fid>.flow.<sub>.step.<sid>
+   Handlers return `[s' [[port msg-or-data] ...]]` — a new state plus
+   a seq of port/value pairs. Handler signature is `(fn [ctx s d])`
+   where `d` is the input data (shorthand for `(:data (:msg ctx))`).
+   A `value` in the outputs that is a message built via one of the
+   helpers is routed as-is; a bare value is sugar for
+   `(child ctx value)` and is coerced by the wrapper before synthesis.
 
-   Subflows — a `:procs` entry that is itself a step map — are flattened
-   at instrument time. References to a subflow's id in outer conns
-   resolve to its `:in` (for to-endpoints) or `:out` (for from-endpoints).
-   Subflow inner steps get namespaced graph ids (e.g. `:sub.inc`) and a
-   `[:flow <sub>]` scope segment, so their trace events nest correctly.
+   ## Token conservation
+
+   Tokens live in an abelian group under XOR. Three invariants compose:
+
+     (1) 1-to-1 preserves tokens.
+         (child p d).tokens = p.tokens
+
+     (2) N-way split preserves XOR sum.
+         XOR over (children p [d_1..d_N]).tokens = p.tokens
+
+     (3) Merge combines tokens.
+         (merge [p_1..p_N] d).tokens = XOR over p_i.tokens
+
+   Fan-out introduces a fresh zero-sum group: N children tagged with
+   values XOR-summing to 0. Fan-in closes the group when it sees
+   arrivals whose XOR-sum returns to 0 — emitting a merge msg and
+   stripping the closed group's key. Because (1)(2)(3) compose, any
+   chain of steps preserves every upstream group's XOR sum; downstream
+   fan-ins fire exactly when their groups actually close.
+
+   Users who stay within the helpers (`child`/`children`/`pass`/
+   `signal`/`merge`) get these invariants by construction. Hand-built
+   messages that stamp `::extra-tokens` metadata (e.g. inside custom
+   combinators) are the one place where the invariant becomes a manual
+   obligation — the combinator is responsible for XOR-summing its
+   stamped values to 0 across siblings.
+
+   ## Trace events
+
+   The event stream is orthogonal on two axes:
+
+     :kind       — lifecycle role (:recv :success :failure :send-out
+                   :split :merge :seed :run-started)
+     :msg-kind   — message type (:data :signal :done) when applicable
+
+   This means `:kind :recv :msg-kind :signal` replaces what was a
+   separate `:recv-signal` event, and so on. Subjects are built from
+   `:kind` only — consumers who care about `:msg-kind` filter in the
+   handler.
 
    File layout (narrative order, top to bottom):
 
-     Part 1 — Messages      envelope, spawn, emit, fcatch
-     Part 2 — Steps         step/proc + single-step blueprints
-     Part 3 — Composition   serial, merge-steps, connect, input-at, output-at
-     Part 4 — Combinators   fan-out, fan-in, router, retry
-     Part 5 — Tracing       events, counters, scope+pubsub, with-span
-     Part 6 — wrap-proc     the step-execution wrapper that drives handlers
-     Part 7 — Flow lifecycle  instrument, start!, inject!, stop!, run!"
-  (:refer-clojure :exclude [derive run!])
+     Part 1 — Messages      envelope, ledger, helpers, fcatch
+     Part 2 — Tracing       events, counters, scope+pubsub
+     Part 3 — Synthesis     token synthesis, event emission for ledger
+     Part 4 — Steps         step/proc + single-step blueprints
+     Part 5 — Composition   serial, merge-steps, connect, input-at, output-at
+     Part 6 — Combinators   fan-out, fan-in, router, retry
+     Part 7 — wrap-proc     the step-execution wrapper
+     Part 8 — Flow lifecycle  instrument, start!, inject!, stop!, run!, run-seq"
+  (:refer-clojure :exclude [merge run!])
   (:require [clojure.core.async :as a]
             [clojure.core.async.flow :as flow]
             [clojure.set :as set]
@@ -58,12 +98,20 @@
 ;; ============================================================================
 ;; Part 1 — Messages
 ;;
-;; What flows through a graph. Three message kinds — `data`, `signal`,
-;; `done` — are a structural sum identified by key absence: data has
-;; :data; signal has :tokens but no :data; done has neither. Every
-;; child carries parent tokens; when N children come from one parent
-;; their tokens are split (never copied) so XOR mass is conserved —
-;; this is the foundation that makes fan-in a well-defined morphism.
+;; Three structural message kinds distinguished by key absence:
+;;   data:   has :data,  has :tokens
+;;   signal: no  :data,  has :tokens
+;;   done:   no  :data,  no  :tokens
+;;
+;; Done messages are port-closure markers generated by the wrapper when
+;; all declared input ports have closed. They bypass the user handler
+;; and the ledger entirely.
+;;
+;; Data and signal messages go through the ledger — every construction
+;; inside a handler is recorded there, and the wrapper walks the
+;; derivation DAG at the end to assign tokens. `::pending` is the
+;; placeholder tokens field on provisional messages returned from the
+;; helpers; real tokens are stamped on by the wrapper before emission.
 ;; ============================================================================
 
 (defn new-msg
@@ -72,463 +120,192 @@
   {:msg-id (random-uuid) :data-id (random-uuid) :data data
    :tokens {} :parent-msg-ids []})
 
-(defn child-with-data
-  "Child msg with new ids, given data, parent tokens inherited.
-   1-arity: parent left nil — the wrapper resolves it to the current
-   input msg's id at step-call boundary."
-  ([data] (child-with-data nil data))
-  ([parent data]
-   {:msg-id (random-uuid) :data-id (random-uuid) :data data
-    :tokens (:tokens parent {})
-    :parent-msg-ids (when parent [(:msg-id parent)])}))
-
-(defn child-with-parents
-  "Child msg with explicit multi-parent lineage (for merge outputs)."
-  [parent-msg-ids data]
-  {:msg-id (random-uuid) :data-id (random-uuid) :data data
-   :tokens {} :parent-msg-ids (vec parent-msg-ids)})
-
-(defn child-same-data
-  "Child msg with new ids, same data as parent, tokens inherited."
-  ([] (child-same-data nil))
-  ([parent]
-   {:msg-id (random-uuid) :data-id (random-uuid) :data (:data parent)
-    :tokens (:tokens parent {})
-    :parent-msg-ids (when parent [(:msg-id parent)])}))
-
 (defn signal?
-  "True iff `m` is a signal message — a coordination primitive that
-   carries tokens and lineage but no payload. Identified by absence of
-   the `:data` key (not by a sentinel value), so `nil` stays a
-   legitimate data value."
+  "True iff `m` is a signal message — carries tokens and lineage but no
+   payload. Identified by absence of the `:data` key (not a sentinel
+   value), so `nil` is a legitimate data value."
   [m]
   (not (contains? m :data)))
 
-(defn child-signal
-  "Build a signal child of `parent`: carries parent tokens and lineage,
-   no `:data` key. Signal messages flow through `wrap-proc` transparently
-   — user handlers on downstream steps are not invoked — which makes them
-   useful for per-group coordination (e.g. realizing the token-monoid's
-   identity for an empty fan-out)."
-  ([] (child-signal nil))
-  ([parent]
-   {:msg-id (random-uuid) :data-id (random-uuid)
-    :tokens (:tokens parent {})
-    :parent-msg-ids (when parent [(:msg-id parent)])}))
-
 (defn done?
   "True iff `m` is a done message — a port-closure marker. No `:data`,
-   no `:tokens`. Arrival means: no more messages will come on this
-   input port. `wrap-proc` tracks done per-input-port and cascades a
-   fresh done on every declared output port once all inputs have closed."
+   no `:tokens`."
   [m]
   (and (not (contains? m :data))
        (not (contains? m :tokens))))
 
 (defn new-done
-  "Fresh port-closure marker: no data, no tokens, no lineage. Inject
-   via `(inject! handle {})` (the empty-opts call) when a source has
-   exhausted or a terminator combinator has decided to stop."
+  "Fresh port-closure marker."
   []
   {:msg-id (random-uuid) :at (System/currentTimeMillis)})
 
-(defn- spawn
-  "Produce N children of `parent`, splitting parent tokens N ways so
-   the children's pointwise XOR equals parent's. Each entry in `specs`
-   shapes one child: `{:data d}` builds a data child, `{:signal? true}`
-   a signal child. An optional `:extra-tokens` on a spec is merged onto
-   its split slice — fan-out uses this to inject the new group's
-   zero-sum slice on top of the inherited mass.
+;; --- ledger ------------------------------------------------------------------
+;;
+;; One ledger atom per handler invocation, stored under ctx's `:ledger`
+;; key. Nodes are keyed by msg-id; :order preserves registration order
+;; (which is topological because helpers register after their parents).
+;;
+;; Node shape:
+;;   {:op :split :parent <id> :data <d> :data-id <uuid>}           data child
+;;   {:op :split :parent <id> :data-id <uuid>}                     signal child (no :data key)
+;;   {:op :split :parent <id> :data <d> :data-id <uuid>            `pass` result
+;;    :preserve-data-id? true}
+;;   {:op :merge :parents [<id>...] :data <d> :data-id <uuid>
+;;    :external-tokens <map>}                                       multi-parent
 
-   The sibling-token-split invariant lives here and only here: any
-   primitive that produces N children from one parent routes through
-   this fn, so token conservation across siblings is a property of the
-   construction, not of each callsite's discipline."
-  [parent specs]
-  (let [splits (tok/split-tokens (:tokens parent) (count specs))]
-    (mapv (fn [i {:keys [signal? extra-tokens] :as spec}]
-            (let [base  (if signal?
-                          (child-signal parent)
-                          (child-with-data parent (:data spec)))
-                  slice (nth splits i)]
-              (assoc base :tokens
-                     (if extra-tokens (merge slice extra-tokens) slice))))
-          (range (count specs)) specs)))
+(defn- new-ledger [input-msg]
+  (atom {:root (:msg-id input-msg)
+         :root-tokens (:tokens input-msg {})
+         :order []
+         :nodes {}}))
 
-(defn emit
-  "Build a handler-output port-map from port/data pairs. Each `data`
-   becomes one child msg carrying `m`'s lineage. Repeating a port key
-   emits multiple children on that port, in the order they appear in
-   the port-map vector at emit time.
+(defn- register-split! [ledger parent-id msg preserve-data-id?]
+  (let [node (cond-> {:op :split :parent parent-id :data-id (:data-id msg)}
+               (contains? msg :data) (assoc :data (:data msg))
+               preserve-data-id?     (assoc :preserve-data-id? true))]
+    (swap! ledger #(-> %
+                       (update :order conj (:msg-id msg))
+                       (assoc-in [:nodes (:msg-id msg)] node)))))
 
-     (emit m :out result)            ;; one port, one msg
-     (emit m :a x :b y)              ;; multi-port, one msg each
-     (emit m :out x :out y :out z)   ;; one port, three msgs
+(defn- register-merge! [ledger parent-ids external-tokens msg]
+  (let [node {:op :merge :parents (vec parent-ids)
+              :external-tokens external-tokens
+              :data (:data msg) :data-id (:data-id msg)}]
+    (swap! ledger #(-> %
+                       (update :order conj (:msg-id msg))
+                       (assoc-in [:nodes (:msg-id msg)] node)))))
 
-   When more than one child is emitted, `m`'s tokens are split across
-   them (via `tok/split-tokens`) so that their pointwise XOR
-   reconstructs the original token map. This preserves any upstream
-   zero-sum group: N siblings collectively contribute the same token
-   mass their parent did, so a downstream `fan-in` correlates
-   correctly. For token-free flows the split is a no-op (`{}` splits
-   to `n` copies of `{}`).
+;; --- public helpers ---------------------------------------------------------
 
-   Ordering: siblings are independent messages once emitted. Their
-   arrival order at a downstream step is NOT guaranteed to match the
-   order they appeared in the emit call. The argument order is a local
-   property of the port-map vector, not a promise about the flow."
-  [m & port-data-pairs]
-  (let [pairs (vec (partition 2 port-data-pairs))]
-    (if (empty? pairs)
-      {}
-      (let [kids (spawn m (mapv (fn [[_ data]] {:data data}) pairs))]
-        (reduce (fn [acc [[port _] kid]]
-                  (update acc port (fnil conj []) kid))
-                {}
-                (map vector pairs kids))))))
+(defn child
+  "Single-parent derive. 2-arity uses `(:msg ctx)` as parent; 3-arity
+   takes an explicit parent. Returns a provisional message carrying
+   `::pending` tokens; the wrapper stamps final tokens after the
+   handler returns."
+  ([ctx data] (child ctx (:msg ctx) data))
+  ([ctx parent data]
+   (let [msg {:msg-id (random-uuid)
+              :data-id (random-uuid)
+              :data data
+              :tokens ::pending
+              :parent-msg-ids [(:msg-id parent)]}]
+     (register-split! (:ledger ctx) (:msg-id parent) msg false)
+     msg)))
+
+(defn children
+  "N-way derive of `(:msg ctx)` (or the explicit `parent`)."
+  ([ctx datas] (children ctx (:msg ctx) datas))
+  ([ctx parent datas]
+   (mapv #(child ctx parent %) datas)))
+
+(defn pass
+  "Same data as `(:msg ctx)`, preserves its `:data-id`. Use when a
+   step routes or coordinates without transforming the payload."
+  [ctx]
+  (let [parent (:msg ctx)
+        msg {:msg-id (random-uuid)
+             :data-id (:data-id parent)
+             :data (:data parent)
+             :tokens ::pending
+             :parent-msg-ids [(:msg-id parent)]}]
+    (register-split! (:ledger ctx) (:msg-id parent) msg true)
+    msg))
+
+(defn signal
+  "Signal child of `(:msg ctx)` — carries tokens and lineage but no
+   payload. Downstream steps' user handlers are not invoked on signal
+   messages; they are used for per-group coordination."
+  [ctx]
+  (let [parent (:msg ctx)
+        msg {:msg-id (random-uuid)
+             :data-id (random-uuid)
+             :tokens ::pending
+             :parent-msg-ids [(:msg-id parent)]}]
+    (register-split! (:ledger ctx) (:msg-id parent) msg false)
+    msg))
+
+(defn merge
+  "Multi-parent derive. XOR-combines parent tokens; publishes a `:merge`
+   trace event. External parents' tokens are captured at call time;
+   internal (ledger-built) parents contribute via the DAG walk."
+  [ctx parents data]
+  (let [ledger     (:ledger ctx)
+        root-id    (:root @ledger)
+        parent-ids (mapv :msg-id parents)
+        external-tokens
+        (reduce (fn [acc p]
+                  (cond
+                    (= (:msg-id p) root-id) acc
+                    (= ::pending (:tokens p)) acc
+                    :else (tok/merge-tokens acc (:tokens p {}))))
+                {} parents)
+        msg {:msg-id (random-uuid)
+             :data-id (random-uuid)
+             :data data
+             :tokens ::pending
+             :parent-msg-ids parent-ids}]
+    (register-merge! ledger parent-ids external-tokens msg)
+    msg))
+
+(defn- ledger-msg?
+  "True iff `x` is a provisional message returned by one of the helpers."
+  [x]
+  (and (map? x) (= ::pending (:tokens x))))
+
+;; --- fcatch -----------------------------------------------------------------
 
 (defn fcatch
-  "Wrap f so it returns exceptions rather than throwing them. Useful for
-   lifting exceptions into the data domain, where they become routable
-   like any other value — compose with `router` (or a custom handler) to
-   split success and error streams downstream.
-
-     (dp/step :work (dp/fcatch risky-fn))
-     (dp/router :split [:ok :err]
-       (fn [v] [{:data v :port (if (instance? Throwable v) :err :ok)}]))
-
-   Catches `Throwable` (not just `Exception`), matching `wrap-proc`."
+  "Wrap `f` so it returns exceptions rather than throwing them."
   [f]
   (fn [& args]
     (try (apply f args)
          (catch Throwable t t))))
 
 ;; ============================================================================
-;; Part 2 — Steps
+;; Part 2 — Tracing (events, counters, scoped pubsub)
 ;;
-;; A step is a blueprint: a map with :procs, :conns, :in, :out. The
-;; constructors in this section each build a step with exactly one
-;; proc; Part 3 combines steps into larger ones.
-;; ============================================================================
-
-(def ^:private auto-id-counters (atom {}))
-
-(defn- gen-id [kind]
-  (let [n (-> (swap! auto-id-counters update kind (fnil inc 0)) (get kind))]
-    (keyword (str (name kind) "-" n))))
-
-(defn- handler-factory
-  "Lift a 3-arg message handler `(fn [ctx s m] -> [s' port-map])` into a
-   full factory `(fn [ctx] step-fn)` that satisfies core.async.flow's
-   4-arity proc-fn shape. Ports default to `{:in \"\"}` / `{:out \"\"}`.
-
-   Each message invocation passes `ctx` with `:in-port` and `:msg`
-   assoc'd — `:in-port` lets multi-input handlers dispatch on source
-   port; `:msg` lets `derive` default its parent to the current input."
-  ([handler] (handler-factory nil handler))
-  ([ports handler]
-   (let [ins  (:ins  ports {:in  ""})
-         outs (:outs ports {:out ""})]
-     (fn [ctx]
-       (fn ([]            {:params {} :ins ins :outs outs})
-         ([_]           {})
-         ([s _]         s)
-         ([s in-port m] (handler (assoc ctx :in-port in-port :msg m) s m)))))))
-
-(defn- pure-fn-handler
-  "Handler that lifts a pure (data -> data) fn: reads :data, emits the
-   result on :out with `child-with-data`."
-  [f]
-  (fn [_ctx s m]
-    [s {:out [(child-with-data m (f (:data m)))]}]))
-
-(defn proc
-  "Low-level: wrap a raw core.async.flow factory `(fn [ctx] step-fn)`
-   into a 1-proc step. Most users want `step` instead — use `proc` only
-   when you need access to `ctx` at factory time (rare)."
-  [id factory]
-  {:procs {id factory} :conns [] :in id :out id})
-
-(defn step
-  "Build a 1-proc step.
-
-   2-arity — pure-fn form:
-     (step id f)        ; f is (data -> data), ports default to :in / :out
-
-   3-arity — handler form:
-     (step id ports handler)
-       ports   = {:ins {port-kw \"\"} :outs {port-kw \"\"}}
-       handler = (fn [ctx s m] -> [s' port-map])
-       port-map shape: {port-kw [msg ...]}; use `emit` to build it.
-
-   For raw factory access (stateful ctx capture at factory time), use
-   `proc`."
-  ([id f]
-   (proc id (handler-factory (pure-fn-handler f))))
-  ([id ports handler]
-   (proc id (handler-factory ports handler))))
-
-(defn sink
-  "Terminal step — consumes input, emits nothing. Default id: :sink."
-  ([] (sink :sink))
-  ([id]
-   (proc id (handler-factory {:outs {}} (fn [_ctx s _m] [s {}])))))
-
-(defn passthrough
-  "Identity step: receives on :in, forwards data unchanged on :out with
-   fresh ids and inherited lineage. Useful as a placeholder in `serial`."
-  ([] (passthrough (gen-id :passthrough)))
-  ([id]
-   (proc id
-         (fn [_ctx]
-           (fn ([]      {:params {} :ins {:in ""} :outs {:out ""}})
-             ([_]     {})
-             ([s _]   s)
-             ([s _ m] [s {:out [(child-same-data m)]}]))))))
-
-(defn as-step
-  "Black-box `inner-step` as a single proc under `id` in the containing
-   step. Inner proc ids get namespaced by `id` at instrument time, and
-   inner trace events nest under a [:flow id] scope segment."
-  [id inner-step]
-  {:procs {id inner-step} :conns [] :in id :out id})
-
-;; ============================================================================
-;; Part 3 — Composition
-;;
-;; Union procs, glue :out → :in, rebind the boundary. Produces new
-;; steps out of old; closes under `serial`/`merge-steps` so arbitrary
-;; pipelines stay first-class blueprints.
-;; ============================================================================
-
-(defn- assert-no-collision! [a b context]
-  (let [coll (set/intersection (set (keys (:procs a))) (set (keys (:procs b))))]
-    (when (seq coll)
-      (throw (ex-info (str context ": colliding proc ids")
-                      {:colliding coll})))))
-
-(defn- ref->endpoint [ref default-port]
-  (if (vector? ref) ref [ref default-port]))
-
-(defn- conn-glue [from-step to-step]
-  [(ref->endpoint (:out from-step) :out)
-   (ref->endpoint (:in to-step) :in)])
-
-(defn serial
-  "Compose steps sequentially. Glues each step's :out to the next step's
-   :in. The composite's :in is the first step's :in; :out is the last
-   step's :out."
-  [& steps]
-  (when (empty? steps)
-    (throw (ex-info "serial needs at least one step" {})))
-  (reduce (fn [acc f]
-            (assert-no-collision! acc f "serial")
-            {:procs  (merge (:procs acc) (:procs f))
-             :conns  (conj (into (vec (:conns acc)) (:conns f))
-                           (conn-glue acc f))
-             :in  (:in acc)
-             :out (:out f)})
-          (first steps)
-          (rest steps)))
-
-(defn merge-steps
-  "Union procs and conns of several steps without auto-wiring. :in /
-   :out of the result come from the first step. Use with `connect` for
-   explicit multi-port wiring."
-  [& steps]
-  (when (empty? steps)
-    (throw (ex-info "merge-steps needs at least one step" {})))
-  (reduce (fn [acc f]
-            (assert-no-collision! acc f "merge-steps")
-            (-> acc
-                (update :procs merge (:procs f))
-                (update :conns (fnil into []) (:conns f))))
-          (first steps)
-          (rest steps)))
-
-(defn connect
-  "Add an explicit conn. `from` and `to` are refs: a keyword (uses the
-   default port) or a [sid port] vector."
-  [step from to]
-  (update step :conns (fnil conj [])
-          [(ref->endpoint from :out) (ref->endpoint to :in)]))
-
-(defn input-at
-  "Set the step's :in boundary. `ref` is either a step-id keyword
-   (default :in port) or `[step-id port]` for an explicit port."
-  [step ref]
-  (assoc step :in ref))
-
-(defn output-at
-  "Set the step's :out boundary. `ref` is either a step-id keyword
-   (default :out port) or `[step-id port]` for an explicit port."
-  [step ref]
-  (assoc step :out ref))
-
-;; ============================================================================
-;; Part 4 — Combinators
-;;
-;; Named algebraic patterns over `step`/`proc` + `emit`/`spawn`.
-;; `fan-out` and `fan-in` are duals on the token-group structure —
-;; every N-way split gets a fresh zero-sum group; fan-in closes it
-;; when the XOR returns to zero. `router` is emit with a runtime-
-;; computed port list; `retry` is a local loop inside one handler.
-;; ============================================================================
-
-(declare derive)  ; fan-in uses derive; derive is defined in Part 5 (depends on pubsub helpers)
-
-(defn fan-out
-  "Emit N copies of the input on :out with a fresh zero-sum token group
-   keyed `[group-id input-msg-id]`. Pair with `(fan-in group-id)`
-   downstream to detect completion of all N branches.
-
-   2-arg form uses the group-id as the step-id (common case).
-   3-arg form lets you set the step-id distinctly, e.g. when fan-out
-   and fan-in share a group-id inside the same composition.
-
-   Composition: fan-out splits the incoming message's EXISTING tokens
-   across the N children (via `tok/split-tokens`) and adds its own
-   fresh zero-sum slice for the new group. This preserves upstream
-   zero-sum groups through nesting, so `(fan-out :outer ...) → inner
-   processing that itself fans out and in → (fan-in :outer)` composes
-   correctly — each outer-group slice traverses the inner topology as
-   the algebra dictates. Well-nested fan-out/fan-in pairs are the
-   recommended shape; interleaving pairs still yields algebraically
-   correct tokens but produces merged data vectors whose nesting
-   reflects fire-order at each fan-in rather than user intent, which
-   is usually unwanted.
-
-   Ordering: children flow independently through the graph after
-   emission; any downstream step (including the paired `fan-in`) sees
-   them in arrival order, NOT in emission / child-index order. Tokens
-   conserve cardinality, not ordinality. If your pipeline depends on
-   position, encode it in the data payload yourself."
-  ([group-id n] (fan-out group-id group-id n))
-  ([id group-id n]
-   (proc id
-         (handler-factory
-          (fn [_ctx s m]
-            (let [gid    [group-id (:msg-id m)]
-                  specs  (mapv (fn [v] {:data (:data m) :extra-tokens {gid v}})
-                               (tok/split-value 0 n))]
-              [s {:out (spawn m specs)}]))))))
-
-(defn fan-in
-  "Accumulate inputs grouped by token-ids produced by `(fan-out
-   group-id …)`. When a group's XOR reaches zero, emit a merge msg on
-   :out whose:
-     - parents are the accumulated input msg-ids
-     - data is a vector of accumulated datas (in arrival order)
-     - tokens are the XOR-merge of all inputs' tokens, with the
-       completing group removed.
-
-   1-arg form uses the group-id as the step-id (common case).
-   2-arg form lets you set the step-id distinctly — useful when fan-in
-   and fan-out share a group-id inside the same composition.
-
-   Ordering: the `:data` vector is in ARRIVAL order, NOT input/
-   collection order. Tokens conserve cardinality (multiset semantics),
-   not ordinality, so the merged vector reflects the order children
-   happened to reach this step through the graph — which depends on
-   scheduler, branch latency, and intermediate step behavior. If
-   position matters, encode it into each child's data payload before
-   fan-out and reconstruct after fan-in."
-  ([group-id] (fan-in group-id group-id))
-  ([id group-id]
-   (proc id
-         (handler-factory
-          (fn [ctx s m]
-            (let [gids (filterv (fn [k] (and (vector? k) (= group-id (first k))))
-                                (keys (:tokens m)))]
-              (reduce
-               (fn [[s' output] gid]
-                 (let [v     (long (get (:tokens m) gid))
-                       grp   (get-in s' [:groups gid] {:value 0 :msgs []})
-                       grp'  (-> grp
-                                 (update :value (fn [x] (bit-xor (long x) v)))
-                                 (update :msgs conj m))]
-                   (if (zero? (long (:value grp')))
-                     ;; Group closed — produce a merge msg whose parents
-                     ;; are the actual siblings directly. Multi-parent
-                     ;; `derive` XOR-merges their tokens and publishes a
-                     ;; :merge trace event. The closing group's gid value
-                     ;; is 0 in the merged tokens (by construction); drop
-                     ;; it for cleanliness.
-                     (let [merged (-> (derive ctx (:msgs grp') (mapv :data (:msgs grp')))
-                                      (update :tokens dissoc gid))]
-                       [(update s' :groups dissoc gid)
-                        (update output :out (fnil conj []) merged)])
-                     [(assoc-in s' [:groups gid] grp') output])))
-               [s {}]
-               gids)))))))
-
-(defn router
-  "Route input to multiple ports based on `(route-fn data) →
-   [{:data d :port p} ...]`. Splits existing tokens across outputs; does
-   not introduce a new zero-group (routing is dispatch, not coordination)."
-  [id ports route-fn]
-  (let [port-set (set ports)]
-    (proc id
-          (handler-factory
-           {:outs (zipmap ports (repeat ""))}
-           (fn [_ctx s m]
-             (let [routes (vec (route-fn (:data m)))]
-               (doseq [{:keys [port]} routes]
-                 (when-not (port-set port)
-                   (throw (IllegalArgumentException.
-                           (str "router: unknown port " port)))))
-               (let [kids (spawn m (mapv #(select-keys % [:data]) routes))]
-                 [s (reduce (fn [acc [route kid]]
-                              (update acc (:port route) (fnil conj []) kid))
-                            {} (map vector routes kids))])))))))
-
-(defn retry
-  "Wrap a (data -> data) fn. On exception, retry up to `max-attempts`
-   times. Retries are invisible in the trace (internal to the step);
-   on exhausted attempts the final exception propagates, surfacing as
-   a :failure event."
-  [id f max-attempts]
-  (proc id
-        (handler-factory
-         (fn [_ctx s m]
-           (loop [attempt 1]
-             (let [result (try {:ok (f (:data m))}
-                               (catch Throwable t {:err t}))]
-               (if (contains? result :ok)
-                 [s {:out [(child-with-data m (:ok result))]}]
-                 (if (< attempt max-attempts)
-                   (recur (inc attempt))
-                   (throw (:err result))))))))))
-
-;; ============================================================================
-;; Part 5 — Tracing (events, counters, scoped pubsub, spans)
-;;
-;; Every step run produces a stream of events — recv/success/failure
-;; for data; recv-signal/success-signal for signals; done-in/done-out/
-;; done-complete for port closures; span-start/success/failure for
-;; in-step spans. Each event is published on a subject derived from
-;; the step's scope, so subscribers can filter by flow / step / span.
-;; `with-span` (user-facing) extends the current scope for the
-;; duration of a body-fn.
+;; :kind is the lifecycle role; :msg-kind is the message type where
+;; applicable. This gives a 4×3 grid for message lifecycle events
+;; (:recv/:success/:send-out/:failure × :data/:signal/:done, minus
+;; :failure on non-data) plus :split / :merge for ledger derivations
+;; and :seed / :run-started for run-level events.
 ;; ============================================================================
 
 (defn- now [] (System/currentTimeMillis))
 
 ;; --- event constructors (internal) ------------------------------------------
 
-(defn- recv-event [step-id m]
-  {:kind :recv :step-id step-id :msg-id (:msg-id m) :data-id (:data-id m)
-   :data (:data m) :at (now)})
+(defn- recv-event
+  "Build a :recv event for any msg-kind. For :done, pass `in-port`."
+  ([step-id msg-kind m] (recv-event step-id msg-kind m nil))
+  ([step-id msg-kind m in-port]
+   (cond-> {:kind :recv :msg-kind msg-kind :step-id step-id
+            :msg-id (:msg-id m) :at (now)}
+     (= :data msg-kind)   (assoc :data-id (:data-id m) :data (:data m))
+     (= :signal msg-kind) (assoc :data-id (:data-id m) :tokens (:tokens m))
+     (= :done msg-kind)   (assoc :in-port in-port))))
 
-(defn- success-event [step-id m]
-  {:kind :success :step-id step-id :msg-id (:msg-id m) :at (now)})
+(defn- success-event [step-id msg-kind m]
+  {:kind :success :msg-kind msg-kind :step-id step-id
+   :msg-id (:msg-id m) :at (now)})
 
 (defn- failure-event [step-id m ^Throwable ex]
-  {:kind :failure :step-id step-id :msg-id (:msg-id m)
+  {:kind :failure :msg-kind :data :step-id step-id :msg-id (:msg-id m)
    :error {:message (ex-message ex) :data (ex-data ex)} :at (now)})
 
-(defn- send-out-event [step-id port child]
-  {:kind :send-out :step-id step-id :port port
+(defn- send-out-event [step-id msg-kind port child]
+  (cond-> {:kind :send-out :msg-kind msg-kind :port port :step-id step-id
+           :msg-id (:msg-id child) :at (now)}
+    (not= :done msg-kind)
+    (assoc :data-id (:data-id child)
+           :parent-msg-ids (vec (:parent-msg-ids child))
+           :tokens (:tokens child))
+
+    (= :data msg-kind)
+    (assoc :data (:data child))))
+
+(defn- split-event [step-id child]
+  {:kind :split :step-id step-id
    :msg-id (:msg-id child) :data-id (:data-id child)
    :parent-msg-ids (vec (:parent-msg-ids child))
    :tokens (:tokens child) :data (:data child) :at (now)})
@@ -537,62 +314,18 @@
   {:kind :merge :step-id step-id :msg-id msg-id
    :parent-msg-ids (vec parents) :at (now)})
 
-(defn- recv-signal-event [step-id m]
-  {:kind :recv-signal :step-id step-id :msg-id (:msg-id m) :data-id (:data-id m)
-   :tokens (:tokens m) :at (now)})
-
-(defn- success-signal-event [step-id m]
-  {:kind :success-signal :step-id step-id :msg-id (:msg-id m) :at (now)})
-
-(defn- send-out-signal-event [step-id port child]
-  {:kind :send-out-signal :step-id step-id :port port
-   :msg-id (:msg-id child) :data-id (:data-id child)
-   :parent-msg-ids (vec (:parent-msg-ids child))
-   :tokens (:tokens child) :at (now)})
-
-(defn- done-in-event [step-id in-port m]
-  {:kind :done-in :step-id step-id :in-port in-port
-   :msg-id (:msg-id m) :at (now)})
-
-(defn- done-out-event [step-id port child]
-  {:kind :done-out :step-id step-id :port port
-   :msg-id (:msg-id child) :at (now)})
-
-(defn- done-complete-event [step-id m]
-  {:kind :done-complete :step-id step-id :msg-id (:msg-id m) :at (now)})
-
-(defn- derive-event [step-id child]
-  {:kind :derive :step-id step-id
-   :msg-id (:msg-id child) :data-id (:data-id child)
-   :parent-msg-ids (vec (:parent-msg-ids child))
-   :tokens (:tokens child) :data (:data child) :at (now)})
-
 ;; --- counter logic ----------------------------------------------------------
 
 (defn- update-counters [counters ev]
   (case (:kind ev)
-    :recv             (update counters :recv inc)
-    :recv-signal      (update counters :recv inc)
-    :done-in          (update counters :recv inc)
-    :success          (update counters :completed inc)
-    :success-signal   (update counters :completed inc)
-    :done-complete    (update counters :completed inc)
-    :failure          (update counters :completed inc)
-    :send-out         (if (:port ev)
-                        (update counters :sent inc)
-                        counters)
-    :send-out-signal  (if (:port ev)
-                        (update counters :sent inc)
-                        counters)
-    :done-out         (if (:port ev)
-                        (update counters :sent inc)
-                        counters)
+    :recv     (update counters :recv inc)
+    :success  (update counters :completed inc)
+    :failure  (update counters :completed inc)
+    :send-out (if (:port ev) (update counters :sent inc) counters)
     counters))
 
 (defn- balanced?
-  "True iff the step/flow counters indicate all work so far has resolved:
-   at least one message was injected, and every sent message has been
-   received and completed."
+  "True iff counters indicate all work so far has resolved."
   [{:keys [sent recv completed]}]
   (and (pos? sent) (= sent recv) (= recv completed)))
 
@@ -634,184 +367,367 @@
 (defn- sp-extend [^ScopedPubsub sp segment]
   (->ScopedPubsub (.raw sp) (conj (.prefix sp) segment)))
 
-;; --- spans ------------------------------------------------------------------
-
-(defn with-span
-  "Run body-fn inside a span scope. Emits :span-start, then runs body-fn,
-   then emits :span-success (carrying body-fn's return value) or
-   :span-failure (rethrowing the exception). Returns body-fn's result.
-
-   `body-fn` is `(fn [inner-ctx] -> result)`. The inner ctx has its
-   pubsub scope extended by [:span span-name]; nested `with-span` calls
-   made with inner-ctx therefore nest correctly.
-
-   Span events are observability only — they do not affect run
-   completion counters."
-  [{:keys [pubsub step-id] :as ctx} span-name metadata body-fn]
-  (let [inner-sp  (sp-extend pubsub [:span span-name])
-        inner-ctx (assoc ctx :pubsub inner-sp)]
-    (sp-pub inner-sp {:kind :span-start :step-id step-id :span-name span-name
-                      :metadata metadata :at (now)})
-    (try
-      (let [result (body-fn inner-ctx)]
-        (sp-pub inner-sp {:kind :span-success :step-id step-id :span-name span-name
-                          :result result :at (now)})
-        result)
-      (catch Throwable ex
-        (sp-pub inner-sp {:kind :span-failure :step-id step-id :span-name span-name
-                          :error {:message (ex-message ex) :data (ex-data ex)}
-                          :at (now)})
-        (throw ex)))))
-
-(defn derive
-  "Create a child msg and publish its creation as a trace event on
-   ctx's scoped pubsub. Returns the child — a full msg with fresh
-   `:msg-id`/`:data-id`, tokens inherited from parent(s), and
-   `:parent-msg-ids` naming the parent(s) — that you can bind, pass
-   around, and use as the parent of further `derive` calls.
-
-   Arities:
-     (derive ctx data)               — single parent = ctx's `:msg`
-     (derive ctx parent data)        — single parent, explicit
-     (derive ctx [p1 p2 …] data)     — multi-parent (merge)
-
-   Single-parent derive fires a `:derive` trace event. Multi-parent
-   derive fires a `:merge` event (the shape fan-in uses): the child's
-   `:parent-msg-ids` names every parent directly. Multi-parent tokens
-   are XOR-merged across parents.
-
-   `derive` is trace-only: the child does not travel the graph. Pass
-   your final msg to `emit` (or place it directly in a port's output
-   vector) to route it out. Example:
-
-     (let [b (derive ctx {:stage :b})
-           c (derive ctx b {:stage :c})]
-       [s (emit c :out {:stage :d})])"
-  ([ctx data]        (derive ctx (:msg ctx) data))
-  ([ctx parent-or-parents data]
-   (if (vector? parent-or-parents)
-     (let [parents parent-or-parents
-           tokens  (reduce tok/merge-tokens {} (map :tokens parents))
-           child   {:msg-id         (random-uuid)
-                    :data-id        (random-uuid)
-                    :data           data
-                    :tokens         tokens
-                    :parent-msg-ids (mapv :msg-id parents)}]
-       (sp-pub (:pubsub ctx)
-               (merge-event (:step-id ctx) (:msg-id child) (:parent-msg-ids child)))
-       child)
-     (let [child (child-with-data parent-or-parents data)]
-       (sp-pub (:pubsub ctx) (derive-event (:step-id ctx) child))
-       child))))
-
 ;; ============================================================================
-;; Part 6 — wrap-proc
+;; Part 3 — Synthesis
 ;;
-;; The step-execution wrapper. Each user step-fn is wrapped once at
-;; instrument time; the wrapper drives data/signal/done dispatch,
-;; publishes events, resolves handler output-maps (filling in nil
-;; parents, auto-splitting sibling tokens that were inherited
-;; unchanged), and enforces that emitted ports are among declared
-;; outs.
+;; After a handler returns:
+;;   1. Coerce bare data outputs to registered children (in the ledger).
+;;   2. Build the DAG: {parent-id [child-id ...]}.
+;;   3. Seed token map: root gets root-tokens; every :merge node gets
+;;      its captured external-tokens.
+;;   4. Distribute: walk (cons root order) in topological order; for
+;;      each parent with K resolvable children, split its tokens
+;;      K-ways; :split kids assign, :merge kids XOR-merge.
+;;   5. Materialize each ledger node as a final message.
+;;   6. Publish :split / :merge events in registration order.
 ;; ============================================================================
 
-;; --- handler-output resolution ---------------------------------------------
-;;
-;; Handlers return `[s' {port [msgs…]}]` — pure routing. Trace events
-;; for intermediate msgs come from side-effecting verbs (`derive`,
-;; `with-span`) called during the handler; they never appear in the
-;; return value. These helpers resolve nil parent-ids against the
-;; current input, auto-split sibling tokens where inherited uniformly,
-;; and produce the :send-out events per port-msg.
+(defn- children-by-parent
+  "Reverse-adjacency: {parent-id [child-id ...]} in registration order.
+   Skips parents not resolvable in the ledger (external merge parents)."
+  [nodes order resolvable?]
+  (reduce
+   (fn [acc id]
+     (let [node (get nodes id)]
+       (case (:op node)
+         :split (cond-> acc
+                  (resolvable? (:parent node))
+                  (update (:parent node) (fnil conj []) id))
+         :merge (reduce (fn [a p]
+                          (cond-> a (resolvable? p) (update p (fnil conj []) id)))
+                        acc (:parents node)))))
+   {} order))
 
-(defn- resolve-msg-nils [m input-id]
-  (cond-> m
-    (or (nil? (:parent-msg-ids m))
-        (some nil? (:parent-msg-ids m)))
-    (update :parent-msg-ids
-            (fn [ps]
-              (if (or (nil? ps) (empty? ps))
-                [input-id]
-                (mapv #(or % input-id) ps))))))
+(defn- seed-tokens
+  "Initial tokens map: root plus external-tokens for every :merge node."
+  [root root-tokens nodes order]
+  (reduce (fn [acc id]
+            (let [node (get nodes id)]
+              (cond-> acc
+                (= :merge (:op node))
+                (assoc id (or (:external-tokens node) {})))))
+          {root root-tokens}
+          order))
 
-(defn- resolve-output-nils
-  "Walk the port-map and resolve any nil `:parent-msg-ids` in emitted
-   msgs against the current input msg's id."
-  [out input-id]
-  (reduce-kv (fn [m port msgs]
-               (assoc m port (mapv #(resolve-msg-nils % input-id) msgs)))
-             {} out))
+(defn- distribute-tokens
+  "Walk parents in topological order; split each parent's tokens K-ways
+   across its resolvable children and contribute to each child's entry."
+  [tokens nodes children-idx walk-order]
+  (reduce
+   (fn [tokens parent-id]
+     (let [kids (get children-idx parent-id)]
+       (if (empty? kids)
+         tokens
+         (let [splits (tok/split-tokens (get tokens parent-id {}) (count kids))]
+           (reduce (fn [t [kid-id slice]]
+                     (case (:op (get nodes kid-id))
+                       :split (assoc t kid-id slice)
+                       :merge (update t kid-id #(tok/merge-tokens (or % {}) slice))))
+                   tokens
+                   (map vector kids splits))))))
+   tokens
+   walk-order))
 
-(defn- build-middle-events [step-id output]
-  (into []
-        (mapcat (fn [[port msgs]]
-                  (map #(send-out-event step-id port %) msgs)))
-        output))
+(defn- synthesize-tokens
+  "Return {msg-id tokens} for every node in the ledger snapshot."
+  [{:keys [root root-tokens order nodes]}]
+  (let [resolvable?  #(or (= % root) (contains? nodes %))
+        children-idx (children-by-parent nodes order resolvable?)
+        initial      (seed-tokens root root-tokens nodes order)]
+    (distribute-tokens initial nodes children-idx (cons root order))))
 
-(defn- split-sibling-group
-  "Given N≥2 siblings whose parent-tokens are `parent-tokens`,
-   rewrite per-msg tokens so that for every key where all N siblings
-   currently hold the PARENT's value (i.e. inherited unchanged), the
-   value is split N ways (XOR-preserving) and reassigned per-sibling.
-   Keys not in `parent-tokens` (e.g. fan-out's fresh group slice) or
-   keys where siblings have already diverged are left alone — the
-   user is presumed to have handled those deliberately."
-  [siblings parent-tokens]
-  (let [n          (count siblings)
-        shared     (filterv (fn [k]
-                              (let [pv (get parent-tokens k)
-                                    vs (map #(get (:tokens %) k ::absent) siblings)]
-                                (and (not-any? #(= % ::absent) vs)
-                                     (every? #(= % pv) vs))))
-                            (keys parent-tokens))
-        key-splits (into {}
-                         (map (fn [k]
-                                [k (tok/split-value (get parent-tokens k) n)]))
-                         shared)]
-    (mapv (fn [i sibling]
-            (update sibling :tokens
-                    (fn [t]
-                      (reduce (fn [acc k]
-                                (assoc acc k (nth (get key-splits k) i)))
-                              t shared))))
-          (range n) siblings)))
+(defn- materialize-msg
+  "Build the final message for a ledger node, applying ::extra-tokens /
+   ::drop-tokens metadata stamped by combinators (fan-out / fan-in)."
+  [id node tokens extra-tokens drop-tokens]
+  (let [tokens'  (tok/merge-tokens tokens (or extra-tokens {}))
+        tokens'' (if (seq drop-tokens)
+                   (apply dissoc tokens' drop-tokens)
+                   tokens')
+        base     {:msg-id id
+                  :data-id (:data-id node)
+                  :tokens tokens''
+                  :parent-msg-ids (case (:op node)
+                                    :split [(:parent node)]
+                                    :merge (:parents node))}]
+    (cond-> base
+      (contains? node :data) (assoc :data (:data node)))))
 
-(defn- auto-split-sibling-tokens
-  "Walk the port-map, find port-msgs whose parent is the input msg
-   `m`, group them as siblings, and for each group of N≥2 split any
-   uniformly-inherited tokens N ways. Sibling groups parented by
-   intermediate (non-input) msgs are left alone — those paths go
-   through `emit`/`spawn`, which handle their own splitting. Token
-   conservation across graph-visible siblings of the input becomes a
-   property of the wrapper, not of each call site."
-  [port-map m]
-  (let [input-id    (:msg-id m)
-        port-msgs   (mapcat val port-map)
-        siblings    (filterv #(= [input-id] (:parent-msg-ids %)) port-msgs)
-        rewrites    (if (< (count siblings) 2)
-                      {}
-                      (into {} (map (fn [s] [(:msg-id s) s])
-                                    (split-sibling-group siblings (:tokens m)))))]
-    (if (empty? rewrites)
-      port-map
-      (reduce-kv (fn [mm port v]
-                   (assoc mm port (mapv #(get rewrites (:msg-id %) %) v)))
-                 {} port-map))))
+(defn- coerce-bare-outputs!
+  "Replace bare-data values in `raw-outputs` with registered provisional
+   messages; leave ledger-built messages as-is."
+  [ctx raw-outputs]
+  (mapv (fn [[port v]]
+          (if (ledger-msg? v)
+            [port v]
+            [port (child ctx v)]))
+        raw-outputs))
 
-;; --- wrap-proc --------------------------------------------------------------
+(defn- process-ledger!
+  "Drive the post-handler pipeline. Returns `{port [final-msg ...]}`
+   and publishes :split / :merge events in registration order."
+  [ctx raw-outputs]
+  (let [outputs'   (coerce-bare-outputs! ctx (or raw-outputs []))
+        meta-by-id (reduce (fn [acc [_ prov]]
+                             (let [mm (meta prov)]
+                               (if (or (::extra-tokens mm) (::drop-tokens mm))
+                                 (assoc acc (:msg-id prov) mm)
+                                 acc)))
+                           {} outputs')
+        snap       @(:ledger ctx)
+        tokens-by  (synthesize-tokens snap)
+        nodes      (:nodes snap)
+        final-by-id (reduce-kv
+                     (fn [acc id node]
+                       (let [mm (get meta-by-id id)]
+                         (assoc acc id
+                                (materialize-msg id node
+                                                 (get tokens-by id {})
+                                                 (::extra-tokens mm)
+                                                 (::drop-tokens mm)))))
+                     {} nodes)
+        step-id    (:step-id ctx)
+        step-sp    (:pubsub ctx)]
+    (doseq [id (:order snap)
+            :let [node (get nodes id)
+                  msg  (get final-by-id id)]]
+      (case (:op node)
+        :split (sp-pub step-sp (split-event step-id msg))
+        :merge (sp-pub step-sp (merge-event step-id id (:parent-msg-ids msg)))))
+    (reduce (fn [acc [port prov]]
+              (let [final (get final-by-id (:msg-id prov))]
+                (update acc port (fnil conj []) final)))
+            {} outputs')))
+
+;; ============================================================================
+;; Part 4 — Steps
+;; ============================================================================
+
+(def ^:private auto-id-counters (atom {}))
+
+(defn- gen-id [kind]
+  (let [n (-> (swap! auto-id-counters update kind (fnil inc 0)) (get kind))]
+    (keyword (str (name kind) "-" n))))
+
+(defn- handler-factory
+  "Lift a 3-arg message handler `(fn [ctx s d] -> [s' outputs])` into a
+   full factory `(fn [ctx] step-fn)` that satisfies core.async.flow's
+   4-arity proc-fn shape.
+
+   `d` is the input data (shorthand for `(:data (:msg ctx))`). The
+   full envelope is on `(:msg ctx)` if needed (tokens, lineage, etc.).
+
+   `outputs` is a seq of `[port msg-or-data]` pairs. A ledger is
+   created per 4-arity invocation and attached to ctx; bare data in
+   outputs is coerced via `child` during synthesis."
+  ([handler] (handler-factory nil handler))
+  ([ports handler]
+   (let [ins  (:ins  ports {:in  ""})
+         outs (:outs ports {:out ""})]
+     (fn [factory-ctx]
+       (fn ([]             {:params {} :ins ins :outs outs})
+         ([_]            {})
+         ([s _]          s)
+         ([s in-port m]
+          (let [ledger   (new-ledger m)
+                ctx      (assoc factory-ctx :in-port in-port :msg m :ledger ledger)
+                [s' raw] (handler ctx s (:data m))]
+            [s' (process-ledger! ctx raw)])))))))
+
+(defn- pure-fn-handler
+  "Lift a pure (data -> data) fn: emits (f d) as bare data on :out."
+  [f]
+  (fn [_ctx s d]
+    [s [[:out (f d)]]]))
+
+(defn proc
+  "Low-level: wrap a raw core.async.flow factory `(fn [ctx] step-fn)`
+   into a 1-proc step. Most users want `step` instead."
+  [id factory]
+  {:procs {id factory} :conns [] :in id :out id})
+
+(defn step
+  "Build a 1-proc step.
+
+   2-arity — pure-fn form:
+     (step id f)        ; f is (data -> data), ports default to :in / :out
+
+   3-arity — handler form:
+     (step id ports handler)
+       ports   = {:ins {port-kw \"\"} :outs {port-kw \"\"}}
+       handler = (fn [ctx s d] -> [s' [[port msg-or-data] ...]])
+
+   `d` is the incoming data (the `:data` field of the input message).
+   Full envelope is on `(:msg ctx)`."
+  ([id f]
+   (proc id (handler-factory (pure-fn-handler f))))
+  ([id ports handler]
+   (proc id (handler-factory ports handler))))
+
+(defn sink
+  "Terminal step — consumes input, emits nothing."
+  ([] (sink :sink))
+  ([id]
+   (proc id (handler-factory {:outs {}} (fn [_ctx s _d] [s []])))))
+
+(defn passthrough
+  "Identity step: forwards data unchanged with preserved data-id."
+  ([] (passthrough (gen-id :passthrough)))
+  ([id]
+   (proc id (handler-factory (fn [ctx s _d] [s [[:out (pass ctx)]]])))))
+
+(defn as-step
+  "Black-box `inner-step` as a single proc under `id`."
+  [id inner-step]
+  {:procs {id inner-step} :conns [] :in id :out id})
+
+;; ============================================================================
+;; Part 5 — Composition
+;; ============================================================================
+
+(defn- assert-no-collision! [a b context]
+  (let [coll (set/intersection (set (keys (:procs a))) (set (keys (:procs b))))]
+    (when (seq coll)
+      (throw (ex-info (str context ": colliding proc ids") {:colliding coll})))))
+
+(defn- ref->endpoint [ref default-port]
+  (if (vector? ref) ref [ref default-port]))
+
+(defn- conn-glue [from-step to-step]
+  [(ref->endpoint (:out from-step) :out)
+   (ref->endpoint (:in to-step) :in)])
+
+(defn serial
+  "Compose steps sequentially."
+  [& steps]
+  (when (empty? steps)
+    (throw (ex-info "serial needs at least one step" {})))
+  (reduce (fn [acc f]
+            (assert-no-collision! acc f "serial")
+            {:procs  (clojure.core/merge (:procs acc) (:procs f))
+             :conns  (conj (into (vec (:conns acc)) (:conns f))
+                           (conn-glue acc f))
+             :in  (:in acc)
+             :out (:out f)})
+          (first steps)
+          (rest steps)))
+
+(defn merge-steps
+  "Union procs and conns without auto-wiring."
+  [& steps]
+  (when (empty? steps)
+    (throw (ex-info "merge-steps needs at least one step" {})))
+  (reduce (fn [acc f]
+            (assert-no-collision! acc f "merge-steps")
+            (-> acc
+                (update :procs clojure.core/merge (:procs f))
+                (update :conns (fnil into []) (:conns f))))
+          (first steps)
+          (rest steps)))
+
+(defn connect
+  "Add an explicit conn."
+  [step from to]
+  (update step :conns (fnil conj [])
+          [(ref->endpoint from :out) (ref->endpoint to :in)]))
+
+(defn input-at
+  "Set the step's :in boundary."
+  [step ref]
+  (assoc step :in ref))
+
+(defn output-at
+  "Set the step's :out boundary."
+  [step ref]
+  (assoc step :out ref))
+
+;; ============================================================================
+;; Part 6 — Combinators
+;; ============================================================================
+
+(defn fan-out
+  "Emit N copies of the input on :out with a fresh zero-sum token group."
+  ([group-id n] (fan-out group-id group-id n))
+  ([id group-id n]
+   (proc id
+         (handler-factory
+          (fn [ctx s d]
+            (let [gid    [group-id (:msg-id (:msg ctx))]
+                  values (tok/split-value 0 n)
+                  kids   (children ctx (repeat n d))
+                  kids'  (mapv (fn [k v]
+                                 (vary-meta k assoc ::extra-tokens {gid v}))
+                               kids values)]
+              [s (mapv (fn [k] [:out k]) kids')]))))))
+
+(defn fan-in
+  "Accumulate inputs grouped by token-ids produced by `fan-out`."
+  ([group-id] (fan-in group-id group-id))
+  ([id group-id]
+   (proc id
+         (handler-factory
+          (fn [ctx s _d]
+            (let [m    (:msg ctx)
+                  gids (filterv (fn [k] (and (vector? k) (= group-id (first k))))
+                                (keys (:tokens m)))]
+              (reduce
+               (fn [[s' output] gid]
+                 (let [v    (long (get (:tokens m) gid))
+                       grp  (get-in s' [:groups gid] {:value 0 :msgs []})
+                       grp' (-> grp
+                                (update :value (fn [x] (bit-xor (long x) v)))
+                                (update :msgs conj m))]
+                   (if (zero? (long (:value grp')))
+                     (let [merged (-> (merge ctx (:msgs grp') (mapv :data (:msgs grp')))
+                                      (vary-meta assoc ::drop-tokens #{gid}))]
+                       [(update s' :groups dissoc gid)
+                        (conj output [:out merged])])
+                     [(assoc-in s' [:groups gid] grp') output])))
+               [s []]
+               gids)))))))
+
+(defn router
+  "Route input to multiple ports based on `(route-fn data)`."
+  [id ports route-fn]
+  (let [port-set (set ports)]
+    (proc id
+          (handler-factory
+           {:outs (zipmap ports (repeat ""))}
+           (fn [ctx s d]
+             (let [routes (vec (route-fn d))]
+               (doseq [{:keys [port]} routes]
+                 (when-not (port-set port)
+                   (throw (IllegalArgumentException.
+                           (str "router: unknown port " port)))))
+               (let [kids (children ctx (mapv :data routes))]
+                 [s (mapv (fn [route kid] [(:port route) kid])
+                          routes kids)])))))))
+
+(defn retry
+  "Wrap a (data -> data) fn. Retries on exception up to `max-attempts`."
+  [id f max-attempts]
+  (proc id
+        (handler-factory
+         (fn [_ctx s d]
+           (loop [attempt 1]
+             (let [result (try {:ok (f d)}
+                               (catch Throwable t {:err t}))]
+               (if (contains? result :ok)
+                 [s [[:out (:ok result)]]]
+                 (if (< attempt max-attempts)
+                   (recur (inc attempt))
+                   (throw (:err result))))))))))
+
+;; ============================================================================
+;; Part 7 — wrap-proc
+;; ============================================================================
 
 (defn- wrap-proc [trace-sid step-sp user-step-fn]
-  ;; Peek at the step's declared ports once (the 0-arity call is pure per
-  ;; the core.async.flow proc-fn contract). `outs` determines where
-  ;; signals and done cascades forward to; `ins` defines the done quorum.
   (let [ports         (user-step-fn)
         ins           (:ins ports)
         outs          (:outs ports)
         all-in-ports  (set (keys ins))
         declared-outs (set (keys outs))
-        ;; Per-step accumulator of which input ports have closed. When
-        ;; this set equals all-in-ports, cascade done on every declared
-        ;; output. Multi-input steps hold until all inputs are closed.
         done-ins      (atom #{})]
     (fn
       ([] (user-step-fn))
@@ -820,77 +736,67 @@
       ([s in-id m]
        (cond
          (done? m)
-         ;; Done short-circuit: framework-managed control signal; user
-         ;; handler is not called. Track per-input-port receipt; cascade
-         ;; done on all declared output ports once every input has closed.
          (let [closed-ins (swap! done-ins conj in-id)]
-           (sp-pub step-sp (done-in-event trace-sid in-id m))
+           (sp-pub step-sp (recv-event trace-sid :done m in-id))
            (if (= closed-ins all-in-ports)
              (let [forwards (into {} (map (fn [p] [p [(new-done)]])) (keys outs))]
                (doseq [[p [d]] forwards]
-                 (sp-pub step-sp (done-out-event trace-sid p d)))
-               (sp-pub step-sp (done-complete-event trace-sid m))
+                 (sp-pub step-sp (send-out-event trace-sid :done p d)))
+               (sp-pub step-sp (success-event trace-sid :done m))
                [s forwards])
              (do
-               (sp-pub step-sp (done-complete-event trace-sid m))
+               (sp-pub step-sp (success-event trace-sid :done m))
                [s {}])))
 
          (signal? m)
-         ;; Signal short-circuit: skip the user handler, forward on EVERY
-         ;; declared output port with parent tokens split across them via
-         ;; `spawn`. This preserves any upstream fan-out group's XOR
-         ;; invariant through multi-out intermediaries. Terminal steps
-         ;; (no :outs) absorb the signal.
-         (let [_         (sp-pub step-sp (recv-signal-event trace-sid m))
-               out-ports (vec (keys outs))]
-           (if (seq out-ports)
-             (let [kids     (spawn m (vec (repeat (count out-ports) {:signal? true})))
+         (let [_         (sp-pub step-sp (recv-event trace-sid :signal m))
+               out-ports (vec (keys outs))
+               n         (count out-ports)]
+           (if (pos? n)
+             (let [splits   (tok/split-tokens (:tokens m {}) n)
+                   kids     (mapv (fn [slice]
+                                    {:msg-id (random-uuid)
+                                     :data-id (random-uuid)
+                                     :tokens slice
+                                     :parent-msg-ids [(:msg-id m)]})
+                                  splits)
                    forwards (zipmap out-ports (map vector kids))]
                (doseq [[p [sig]] forwards]
-                 (sp-pub step-sp (send-out-signal-event trace-sid p sig)))
-               (sp-pub step-sp (success-signal-event trace-sid m))
+                 (sp-pub step-sp (send-out-event trace-sid :signal p sig)))
+               (sp-pub step-sp (success-event trace-sid :signal m))
                [s forwards])
              (do
-               (sp-pub step-sp (success-signal-event trace-sid m))
+               (sp-pub step-sp (success-event trace-sid :signal m))
                [s {}])))
 
          :else
          (do
-           (sp-pub step-sp (recv-event trace-sid m))
+           (sp-pub step-sp (recv-event trace-sid :data m))
            (try
-             (let [[s' raw]       (user-step-fn s in-id m)
-                   user-ports     (set (keys (or raw {})))
-                   unknown-ports  (set/difference user-ports declared-outs)
-                   _              (when (seq unknown-ports)
-                                    (throw (ex-info
-                                            (str "step " trace-sid
-                                                 " emitted on undeclared port(s): "
-                                                 unknown-ports
-                                                 " (declared: " declared-outs ")")
-                                            {:step           trace-sid
-                                             :unknown-ports  unknown-ports
-                                             :declared-ports declared-outs})))
-                   port-map       (-> (or raw {})
-                                      (resolve-output-nils (:msg-id m))
-                                      (auto-split-sibling-tokens m))
-                   middle-events  (build-middle-events trace-sid port-map)]
-               (doseq [ev middle-events] (sp-pub step-sp ev))
-               (sp-pub step-sp (success-event trace-sid m))
+             (let [[s' port-map] (user-step-fn s in-id m)
+                   user-ports    (set (keys port-map))
+                   unknown-ports (set/difference user-ports declared-outs)
+                   _             (when (seq unknown-ports)
+                                   (throw (ex-info
+                                           (str "step " trace-sid
+                                                " emitted on undeclared port(s): "
+                                                unknown-ports
+                                                " (declared: " declared-outs ")")
+                                           {:step           trace-sid
+                                            :unknown-ports  unknown-ports
+                                            :declared-ports declared-outs})))]
+               (doseq [[port msgs] port-map
+                       msg msgs]
+                 (sp-pub step-sp (send-out-event trace-sid :data port msg)))
+               (sp-pub step-sp (success-event trace-sid :data m))
                [s' port-map])
              (catch Throwable ex
                (sp-pub step-sp (failure-event trace-sid m ex))
                [s {}]))))))))
 
 ;; ============================================================================
-;; Part 7 — Flow lifecycle
-;;
-;; `instrument-flow` flattens subflows and wraps each leaf factory
-;; with `wrap-proc`, producing a plain core.async.flow graph spec.
-;; `start!` materializes it; `inject!` seeds messages; `stop!` tears
-;; it down. `run!` is a one-shot convenience.
+;; Part 8 — Flow lifecycle
 ;; ============================================================================
-
-;; --- instrument (flattening) ------------------------------------------------
 
 (defn- subflow? [v]
   (and (map? v) (contains? v :procs) (contains? v :conns)))
@@ -901,10 +807,7 @@
 (defn- prefix-endpoint [prefix [sid port]]
   [(prefix-sid prefix sid) port])
 
-(defn- prefix-ref
-  "Prefix a step-boundary ref (either a step-id keyword or a [sid port]
-   vector) with `prefix`."
-  [prefix ref]
+(defn- prefix-ref [prefix ref]
   (if (vector? ref)
     [(prefix-sid prefix (first ref)) (second ref)]
     (prefix-sid prefix ref)))
@@ -917,9 +820,6 @@
 (declare instrument-flow)
 
 (defn- inline-subflow
-  "Recursively instrument a subflow with extended scope, rename its graph
-   ids to avoid collision in the outer graph, and return the inlined
-   pieces plus entry/output aliases."
   [sid subflow outer-sp cancel-p]
   (let [inner-sp      (sp-extend outer-sp [:flow (name sid)])
         inner-inst    (instrument-flow subflow inner-sp cancel-p)
@@ -932,27 +832,15 @@
                             (:conns inner-inst))
         in-ref        (prefix-ref sid (:in inner-inst))
         out-ref       (prefix-ref sid (or (:out inner-inst) (:in inner-inst)))]
-    {:procs renamed-procs
-     :conns renamed-conns
-     :in in-ref
-     :out out-ref}))
+    {:procs renamed-procs :conns renamed-conns :in in-ref :out out-ref}))
 
-(defn- resolve-endpoint
-  "Resolve a conn endpoint against `aliases`. If `sid` is a subflow alias,
-   use the alias's `:in`/`:out` target: if that target is `[sid port]`,
-   substitute it wholesale (the subflow's declared boundary port wins);
-   if it's a bare sid, keep the outer conn's port."
-  [aliases which [sid port]]
+(defn- resolve-endpoint [aliases which [sid port]]
   (if-let [a (get aliases sid)]
     (let [target (get a which)]
       (if (vector? target) target [target port]))
     [sid port]))
 
-(defn- resolve-flow-ref
-  "Resolve the step's own :in/:out field against `aliases`. If it
-   references a subflow, replace with that subflow's resolved boundary
-   ref; otherwise return as-is."
-  [ref aliases which]
+(defn- resolve-flow-ref [ref aliases which]
   (let [sid (if (vector? ref) (first ref) ref)]
     (if-let [a (get aliases sid)]
       (get a which)
@@ -965,7 +853,7 @@
                     (let [{:keys [procs conns in out]}
                           (inline-subflow sid p outer-sp cancel-p)]
                       (-> acc
-                          (update :procs merge procs)
+                          (update :procs clojure.core/merge procs)
                           (update :inner-conns into conns)
                           (assoc-in [:aliases sid] {:in in :out out})))
                     (let [step-sp (sp-extend outer-sp [:step sid])
@@ -985,58 +873,41 @@
       (:in step)  (assoc :in  in-resolved)
       (:out step) (assoc :out out-resolved))))
 
-;; --- start! / inject! / quiescent? / stop! ---------------------------------
-
 (defn- build-graph [step]
   (flow/create-flow
    {:procs (into {} (map (fn [[sid pfn]] [sid {:proc (flow/process pfn)}])) (:procs step))
     :conns (:conns step)}))
 
 (defn start!
-  "Instantiate a step and start it running. Returns a handle for
-   `inject!` / `quiescent?` / `counters` / `stop!`.
-
-   No messages are seeded. Call `inject!` to add inputs. Unlike `run!`,
-   this does not block.
-
-   Opts:
-     :pubsub       existing pubsub instance (default: fresh)
-     :flow-id      this step's run id (default: fresh uuid)
-     :subscribers  {pattern handler-fn} — extra subscriptions that live
-                   for the handle's lifetime"
+  "Instantiate a step and start it running. Returns a handle."
   ([step] (start! step {}))
   ([step opts]
-   (let [fid         (or (:flow-id opts) (str (random-uuid)))
-         raw-ps      (or (:pubsub opts) (pubsub/make))
-         subscribers (:subscribers opts {})
-         outer-sp    (scoped-pubsub raw-ps [[:flow fid]])
-         cancel-p    (promise)
+   (let [fid          (or (:flow-id opts) (str (random-uuid)))
+         raw-ps       (or (:pubsub opts) (pubsub/make))
+         subscribers  (:subscribers opts {})
+         outer-sp     (scoped-pubsub raw-ps [[:flow fid]])
+         cancel-p     (promise)
          instrumented (instrument-flow step outer-sp cancel-p)
-         ;; Port index: {sid {:ins #{port-kw} :outs #{port-kw}}}. Built from
-         ;; each wrapped proc-fn's 0-arity (pure per the c.a.flow contract)
-         ;; and used by `inject!` to validate :in / :port args — turns typos
-         ;; into ex-info with a helpful message instead of failures from
-         ;; flow/inject's internals.
-         port-index  (into {}
-                           (map (fn [[sid pfn]]
-                                  (let [p (pfn)]
-                                    [sid {:ins  (set (keys (:ins  p)))
-                                          :outs (set (keys (:outs p)))}])))
-                           (:procs instrumented))
-         scope       [[:flow fid]]
-         events      (atom [])
-         counters    (atom {:sent 0 :recv 0 :completed 0})
-         quiescent-p (atom (promise))
-         main-sub    (pubsub/sub raw-ps (scope->glob scope)
-                                 (fn [_ ev _]
-                                   (swap! events conj ev)
-                                   (let [c' (swap! counters update-counters ev)]
-                                     (when (balanced? c')
-                                       (deliver @quiescent-p :quiescent)))))
-         user-unsubs (mapv (fn [[pat h]] (pubsub/sub raw-ps pat h)) subscribers)
-         g           (build-graph instrumented)
+         port-index   (into {}
+                            (map (fn [[sid pfn]]
+                                   (let [p (pfn)]
+                                     [sid {:ins  (set (keys (:ins  p)))
+                                           :outs (set (keys (:outs p)))}])))
+                            (:procs instrumented))
+         scope        [[:flow fid]]
+         events       (atom [])
+         counters     (atom {:sent 0 :recv 0 :completed 0})
+         quiescent-p  (atom (promise))
+         main-sub     (pubsub/sub raw-ps (scope->glob scope)
+                                  (fn [_ ev _]
+                                    (swap! events conj ev)
+                                    (let [c' (swap! counters update-counters ev)]
+                                      (when (balanced? c')
+                                        (deliver @quiescent-p :quiescent)))))
+         user-unsubs  (mapv (fn [[pat h]] (pubsub/sub raw-ps pat h)) subscribers)
+         g            (build-graph instrumented)
          {:keys [error-chan]} (flow/start g)
-         err-p       (promise)]
+         err-p        (promise)]
      (pubsub/pub raw-ps (run-subject-for scope :run-started)
                  {:kind :run-started :flow-path [fid] :scope scope :at (now)})
      (flow/resume g)
@@ -1056,63 +927,42 @@
       ::port-index  port-index})))
 
 (defn inject!
-  "Seed a message into the running step. Returns the handle.
-
-   The kind of message injected mirrors the envelope's own shape:
-   presence or absence of `:data` and `:tokens` in opts directly
-   determines which kind of message is built.
-
-     (inject! h {:data 5})                  ; data msg  (with :tokens {})
-     (inject! h {:data 5 :tokens {g v}})    ; data msg  with pre-set tokens
-     (inject! h {:tokens {g v}})            ; signal    (no data, has tokens)
-     (inject! h {})                         ; done      (no data, no tokens)
-
-   Note the empty-opts case: `(inject! h {})` injects a done, by design.
-   Make sure you want that — typos here silently shift semantics.
-
-   Other opts:
-     :in     step-id (required unless the step declares :in)
-     :port   port keyword (default :in)"
+  "Seed a message into the running step. Returns the handle."
   [handle {:keys [in port] :as opts}]
   (let [{::keys [step graph pubsub scope fid counters quiescent-p port-index]} handle
-        ref              (or in (:in step))
+        ref                 (or in (:in step))
         [flow-in flow-port] (if (vector? ref) ref [ref :in])
-        port             (or port flow-port)
-        step-ports       (get port-index flow-in)
-        _                (when-not step-ports
-                           (throw (ex-info
-                                   (str "inject!: unknown step " flow-in
-                                        " (known: " (sort (keys port-index)) ")")
-                                   {:step  flow-in
-                                    :known (set (keys port-index))})))
-        _                (when-not (contains? (:ins step-ports) port)
-                           (throw (ex-info
-                                   (str "inject!: step " flow-in
-                                        " does not declare input port " port
-                                        " (declared: " (:ins step-ports) ")")
-                                   {:step     flow-in
-                                    :port     port
-                                    :declared (:ins step-ports)})))
-        has-data?        (contains? opts :data)
-        has-tokens?      (contains? opts :tokens)
-        seed             (cond
-                           has-data?
-                           (cond-> (new-msg (:data opts))
-                             has-tokens? (assoc :tokens (:tokens opts)))
+        port                (or port flow-port)
+        step-ports          (get port-index flow-in)
+        _                   (when-not step-ports
+                              (throw (ex-info
+                                      (str "inject!: unknown step " flow-in
+                                           " (known: " (sort (keys port-index)) ")")
+                                      {:step flow-in :known (set (keys port-index))})))
+        _                   (when-not (contains? (:ins step-ports) port)
+                              (throw (ex-info
+                                      (str "inject!: step " flow-in
+                                           " does not declare input port " port
+                                           " (declared: " (:ins step-ports) ")")
+                                      {:step flow-in :port port :declared (:ins step-ports)})))
+        has-data?           (contains? opts :data)
+        has-tokens?         (contains? opts :tokens)
+        seed                (cond
+                              has-data?
+                              (cond-> (new-msg (:data opts))
+                                has-tokens? (assoc :tokens (:tokens opts)))
 
-                           has-tokens?
-                           {:msg-id (random-uuid) :data-id (random-uuid)
-                            :tokens (:tokens opts) :parent-msg-ids []}
+                              has-tokens?
+                              {:msg-id (random-uuid) :data-id (random-uuid)
+                               :tokens (:tokens opts) :parent-msg-ids []}
 
-                           :else
-                           (new-done))
-        kind             (cond has-data?   :seed
-                               has-tokens? :seed-signal
-                               :else       :seed-done)]
+                              :else
+                              (new-done))
+        msg-kind            (cond has-data? :data has-tokens? :signal :else :done)]
     (swap! quiescent-p (fn [p] (if (realized? p) (promise) p)))
     (swap! counters update :sent inc)
-    (pubsub/pub pubsub (run-subject-for scope kind)
-                (cond-> {:kind kind
+    (pubsub/pub pubsub (run-subject-for scope :seed)
+                (cond-> {:kind :seed :msg-kind msg-kind
                          :flow-path [fid] :scope scope
                          :msg-id (:msg-id seed)
                          :in flow-in :port port :at (now)}
@@ -1132,14 +982,12 @@
   @(::events handle))
 
 (defn quiescent?
-  "True iff the handle's counters currently balance and at least one
-   message has been injected."
+  "True iff counters balance and at least one message has been injected."
   [handle]
   (balanced? (counters handle)))
 
 (defn await-quiescent!
-  "Block until the handle reaches quiescence or the underlying graph
-   errors. Returns :quiescent, [:failed ex], or :timeout (with timeout-ms)."
+  "Block until quiescence or error."
   ([handle] (await-quiescent! handle nil))
   ([handle timeout-ms]
    (let [{::keys [quiescent-p err-p]} handle
@@ -1158,8 +1006,7 @@
            (if (= ::pending v) (recur) v)))))))
 
 (defn stop!
-  "Tear down the graph, deliver the cancel promise, and return a final
-   result map {:state :events :counters :error}."
+  "Tear down the graph."
   [handle]
   (let [{::keys [graph main-sub user-unsubs cancel err-p events counters]} handle]
     (when-not (realized? cancel) (deliver cancel :stopped))
@@ -1173,15 +1020,7 @@
        :error    err})))
 
 (defn run!
-  "Convenience: start, inject one message, wait for quiescence, stop.
-
-   Opts:
-     :in           entry step-id (required if not in step's :in)
-     :port         entry port (default :in)
-     :data         seed data
-     :pubsub       existing pubsub instance (default: fresh)
-     :flow-id      this step's run id (default: fresh uuid)
-     :subscribers  {pattern handler-fn} — extra pubsub subscriptions"
+  "Convenience: start, inject one message, wait for quiescence, stop."
   [step opts]
   (let [handle (start! step (select-keys opts [:pubsub :flow-id :subscribers]))]
     (inject! handle (select-keys opts [:in :port :data]))
@@ -1189,3 +1028,73 @@
       (-> (stop! handle)
           (assoc :state (if (= :quiescent signal) :completed :failed))
           (cond-> (vector? signal) (assoc :error (second signal)))))))
+
+(defn- collector-step
+  "Terminal step that appends `{:msg-id ... :data ...}` to `a` for every
+   data message it receives. Internal to `run-seq`."
+  [id a]
+  (proc id
+        (handler-factory
+         {:outs {}}
+         (fn [ctx s d]
+           (swap! a conj {:msg-id (:msg-id (:msg ctx)) :data d})
+           [s []]))))
+
+(defn- parent-index
+  "Build `{msg-id #{parent-msg-id ...}}` from an event log, using only
+   events that carry both fields."
+  [events]
+  (reduce (fn [acc ev]
+            (let [mid     (:msg-id ev)
+                  parents (:parent-msg-ids ev)]
+              (if (and mid parents (#{:split :merge :send-out} (:kind ev)))
+                (update acc mid (fnil into #{}) parents)
+                acc)))
+          {} events))
+
+(defn- ancestors-in
+  "BFS backward from `msg-id` via `pidx`; return the subset of `targets`
+   reached through the ancestry."
+  [pidx targets msg-id]
+  (loop [frontier #{msg-id} visited #{} found #{}]
+    (if (empty? frontier)
+      found
+      (let [hits      (set/intersection frontier targets)
+            visited'  (set/union visited frontier)
+            parents   (reduce set/union #{} (map pidx frontier))
+            frontier' (set/difference parents visited')]
+        (recur frontier' visited' (set/union found hits))))))
+
+(defn run-seq
+  "Run `step` against each input in `coll`. Returns a map like `run!`
+   plus `:outputs` — a vector aligned with `coll`; each element is the
+   vector of data values whose message ancestry traces back to that
+   input. An output that traces to multiple inputs (cross-input merge)
+   appears under every matching index.
+
+   An internal collector is appended at the step's `:out` boundary, so
+   the caller's step should NOT already include its own sink."
+  ([step coll] (run-seq step coll {}))
+  ([step coll opts]
+   (if (empty? coll)
+     {:state :completed :outputs [] :events [] :counters {:sent 0 :recv 0 :completed 0}}
+     (let [collected (atom [])
+           wf        (serial step (collector-step ::collector collected))
+           handle    (start! wf (select-keys opts [:pubsub :flow-id :subscribers]))]
+       (doseq [d coll] (inject! handle {:data d}))
+       (let [signal    (await-quiescent! handle)
+             result    (-> (stop! handle)
+                           (assoc :state (if (= :quiescent signal) :completed :failed))
+                           (cond-> (vector? signal) (assoc :error (second signal))))
+             events    (:events result)
+             seed-ids  (mapv :msg-id (filter #(= :seed (:kind %)) events))
+             seed-set  (set seed-ids)
+             seed->idx (zipmap seed-ids (range))
+             pidx      (parent-index events)
+             outputs   (reduce (fn [acc {:keys [msg-id data]}]
+                                 (reduce (fn [a s] (update a (seed->idx s) conj data))
+                                         acc
+                                         (ancestors-in pidx seed-set msg-id)))
+                               (vec (repeat (count coll) []))
+                               @collected)]
+         (assoc result :outputs outputs))))))
