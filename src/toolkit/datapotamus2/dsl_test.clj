@@ -40,6 +40,30 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"colliding"
                           (dsl/serial a b)))))
 
+(deftest serial-respects-vector-boundaries
+  ;; A child flow whose boundary was set with input-at/output-at [sid port]
+  ;; should compose under serial via its declared ports, not :in/:out defaults.
+  (let [custom (-> (dsl/from-handler :b
+                     {:ins  {:custom-in  ""}
+                      :outs {:custom-out ""}}
+                     (fn [_ctx s m]
+                       [s {:custom-out [(dp2/child-with-data m (* (:data m) 10))]}]))
+                   (dsl/input-at  [:b :custom-in])
+                   (dsl/output-at [:b :custom-out]))
+        composed (dsl/serial
+                  (dsl/step :a (c/wrap inc))
+                  custom
+                  (dsl/step :sink (c/absorb-sink)))
+        result   (dp2/run! composed {:data 3})]
+    (testing "run completes; b received through :custom-in and emitted on :custom-out"
+      (is (= :completed (:state result)))
+      (is (= 40 (:data (first (filterv #(= :sink (:step-id %))
+                                       (events-of result :recv)))))))  ; 3 → 4 → 40
+    (testing "conns wire through the declared ports"
+      (is (= #{[[:a :out]          [:b :custom-in]]
+               [[:b :custom-out]   [:sink :in]]}
+             (set (:conns composed)))))))
+
 ;; --- as-step: black-box composition ---------------------------------------
 
 (deftest deep-nested-as-step

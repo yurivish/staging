@@ -223,6 +223,25 @@
                           :at (now)})
         (throw ex)))))
 
+;; --- handler factory -------------------------------------------------------
+
+(defn handler-factory
+  "Lift a 3-arg message handler `(fn [ctx s m] -> [s' port-map])` into a
+   full dp2 factory `(fn [ctx] step-fn)` that satisfies core.async.flow's
+   4-arity proc-fn shape. Ports default to `{:in \"\"}` / `{:out \"\"}`.
+
+     (handler-factory h)
+     (handler-factory {:ins {...} :outs {...}} h)"
+  ([handler] (handler-factory nil handler))
+  ([ports handler]
+   (let [ins  (:ins  ports {:in  ""})
+         outs (:outs ports {:out ""})]
+     (fn [ctx]
+       (fn ([]      {:params {} :ins ins :outs outs})
+           ([_]     {})
+           ([s _]   s)
+           ([s _ m] (handler ctx s m)))))))
+
 ;; --- wrap-proc --------------------------------------------------------------
 
 (defn- wrap-proc [trace-sid step-sp user-step-fn]

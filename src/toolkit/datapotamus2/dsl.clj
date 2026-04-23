@@ -46,25 +46,17 @@
 
    `handler` is `(fn [ctx s m] -> [s' port-map])` — the same contract as
    the 4-arity step-fn's message handler, without the three vestigial
-   arities.
+   arities. `ctx` carries `:pubsub`, `:step-id`, `:cancel`.
 
    2-arg form is 1-in 1-out (ports `:in` / `:out`). 3-arg form takes a
    `ports` map `{:ins {...} :outs {...}}` for multi-port steps.
 
      (from-handler :work
-       (fn [{:keys [trace] :as ctx} s m]
-         (let [v (trace ctx :op {} (fn [_] (inc (:data m))))]
+       (fn [ctx s m]
+         (let [v (dp2/with-span ctx :op {} (fn [_] (inc (:data m))))]
            [s (emit m :out v)])))"
-  ([id handler]        (from-handler id {} handler))
-  ([id ports handler]
-   (let [ins  (:ins  ports {:in  "Datapotamus flow step input port"})
-         outs (:outs ports {:out "Datapotamus flow step output port"})]
-     (step id
-           (fn [ctx]
-             (fn ([]      {:params {} :ins ins :outs outs})
-                 ([_]     {})
-                 ([s _]   s)
-                 ([s _ m] (handler ctx s m))))))))
+  ([id handler]        (step id (dp2/handler-factory handler)))
+  ([id ports handler]  (step id (dp2/handler-factory ports handler))))
 
 (defn id-flow
   "Identity / pass-through flow: receives on :in, emits the same data on
@@ -93,8 +85,12 @@
       (throw (ex-info (str context ": colliding proc ids")
                       {:colliding coll})))))
 
+(defn- ref->endpoint [ref default-port]
+  (if (vector? ref) ref [ref default-port]))
+
 (defn- conn-glue [from-flow to-flow]
-  [[(:out from-flow) :out] [(:in to-flow) :in]])
+  [(ref->endpoint (:out from-flow) :out)
+   (ref->endpoint (:in to-flow) :in)])
 
 (defn serial
   "Compose flows sequentially. Glues each flow's :out to the next
@@ -130,18 +126,12 @@
 
 ;; --- explicit wiring --------------------------------------------------------
 
-(defn- resolve-ref [ref default-port]
-  (cond
-    (keyword? ref) [ref default-port]
-    (vector? ref)  ref
-    :else (throw (ex-info "connect: invalid ref" {:ref ref}))))
-
 (defn connect
   "Add an explicit conn to the flow. `from` and `to` are refs: a keyword
    (uses the default port) or a [sid port] vector."
   [flow from to]
   (update flow :conns (fnil conj [])
-          [(resolve-ref from :out) (resolve-ref to :in)]))
+          [(ref->endpoint from :out) (ref->endpoint to :in)]))
 
 (defn input-at
   "Set the flow's :in boundary. `ref` is either a step-id (default `:in`
