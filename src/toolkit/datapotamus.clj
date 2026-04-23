@@ -45,7 +45,7 @@
      Part 5 — Tracing       events, counters, scope+pubsub, with-span
      Part 6 — wrap-proc     the step-execution wrapper that drives handlers
      Part 7 — Flow lifecycle  instrument, start!, inject!, stop!, run!"
-  (:refer-clojure :exclude [run!])
+  (:refer-clojure :exclude [derive run!])
   (:require [clojure.core.async :as a]
             [clojure.core.async.flow :as flow]
             [clojure.set :as set]
@@ -222,9 +222,9 @@
    full factory `(fn [ctx] step-fn)` that satisfies core.async.flow's
    4-arity proc-fn shape. Ports default to `{:in \"\"}` / `{:out \"\"}`.
 
-   Each message invocation passes `ctx` with `:in-port` assoc'd to the
-   port keyword the message arrived on — useful for multi-input
-   handlers that need to dispatch on the source port."
+   Each message invocation passes `ctx` with `:in-port` and `:msg`
+   assoc'd — `:in-port` lets multi-input handlers dispatch on source
+   port; `:msg` lets `derive` default its parent to the current input."
   ([handler] (handler-factory nil handler))
   ([ports handler]
    (let [ins  (:ins  ports {:in  ""})
@@ -233,7 +233,7 @@
        (fn ([]            {:params {} :ins ins :outs outs})
          ([_]           {})
          ([s _]         s)
-         ([s in-port m] (handler (assoc ctx :in-port in-port) s m)))))))
+         ([s in-port m] (handler (assoc ctx :in-port in-port :msg m) s m)))))))
 
 (defn- pure-fn-handler
   "Handler that lifts a pure (data -> data) fn: reads :data, emits the
@@ -563,6 +563,12 @@
 (defn- done-complete-event [step-id m]
   {:kind :done-complete :step-id step-id :msg-id (:msg-id m) :at (now)})
 
+(defn- derive-event [step-id child]
+  {:kind :derive :step-id step-id
+   :msg-id (:msg-id child) :data-id (:data-id child)
+   :parent-msg-ids (vec (:parent-msg-ids child))
+   :tokens (:tokens child) :data (:data child) :at (now)})
+
 ;; --- counter logic ----------------------------------------------------------
 
 (defn- update-counters [counters ev]
@@ -658,6 +664,30 @@
                           :error {:message (ex-message ex) :data (ex-data ex)}
                           :at (now)})
         (throw ex)))))
+
+(defn derive
+  "Create a child msg and publish it as a `:derive` trace event on
+   ctx's scoped pubsub. Returns the child — a full msg with
+   `:msg-id`, `:data-id`, tokens inherited from parent, and
+   `:parent-msg-ids [parent-msg-id]` — that you can bind, pass
+   around, and use as the parent of further `derive` calls.
+
+   2-arity `(derive ctx data)` uses ctx's current input msg (`:msg`,
+   set by the step wrapper) as parent. 3-arity `(derive ctx parent
+   data)` takes an explicit parent.
+
+   `derive` is trace-only: the child does not travel the graph.
+   Pass your final msg to `emit` (or place it directly in a port's
+   output vector) to route it out. Example:
+
+     (let [b (derive ctx {:stage :b})
+           c (derive ctx b {:stage :c})]
+       [s (emit c :out {:stage :d})])"
+  ([ctx data]        (derive ctx (:msg ctx) data))
+  ([ctx parent data]
+   (let [child (child-with-data parent data)]
+     (sp-pub (:pubsub ctx) (derive-event (:step-id ctx) child))
+     child)))
 
 ;; ============================================================================
 ;; Part 6 — wrap-proc

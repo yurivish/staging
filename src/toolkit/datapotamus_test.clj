@@ -597,3 +597,38 @@
         "merge names all six leaves as parents (2 fan-out branches × 3 explode children)")
     (is (= 1 (count sink-recvs))
         "exactly one merged msg reaches the sink")))
+
+;; --- derive: handler-internal intermediates as trace events -----------------
+
+(deftest derive-chain-records-intermediates-as-trace-events
+  ;; Handler internally derives A → B → C, then emits D (child of C) on :out.
+  ;; `dp/derive` creates a child msg and publishes a :derive event via ctx's
+  ;; pubsub as a side effect — so B and C show up in the trace without the
+  ;; handler ever touching the output map's trace annotations.
+  (let [wf     (dp/serial
+                (dp/step :chain {:ins {:in ""} :outs {:out ""}}
+                  (fn [ctx s _m]
+                    (let [b (dp/derive ctx {:stage :b})
+                          c (dp/derive ctx b {:stage :c})]
+                      [s (dp/emit c :out {:stage :d})])))
+                (dp/sink))
+        result (dp/run! wf {:data {:stage :a}})]
+    (testing "run completes; sink receives exactly one msg whose stage is :d"
+      (is (= :completed (:state result)))
+      (let [recvs (filterv #(= :sink (:step-id %)) (events-of result :recv))]
+        (is (= 1 (count recvs)))
+        (is (= :d (:stage (:data (first recvs)))))))
+    (testing "exactly two :derive events in order B, C"
+      (let [derives (events-of result :derive)]
+        (is (= 2 (count derives)))
+        (is (= [:b :c] (mapv (comp :stage :data) derives)))))
+    (testing "DAG connects: C's parent is B, D's parent is C"
+      (let [derives  (events-of result :derive)
+            b-id     (:msg-id (first derives))
+            c-id     (:msg-id (second derives))
+            c-ev     (second derives)
+            d-send   (first (filterv #(and (= :chain (:step-id %)) (= :out (:port %)))
+                                     (events-of result :send-out)))]
+        (is (= [b-id] (:parent-msg-ids c-ev)))
+        (is (= [c-id] (:parent-msg-ids d-send)))))))
+
