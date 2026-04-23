@@ -655,3 +655,22 @@
     (is (= :completed (:state result)))
     (is (= [[10 11 12] [20 21 22]]
            (mapv #(vec (sort %)) (:outputs result))))))
+
+(deftest await-quiescent-returns-failed-on-flow-error
+  (let [bad (dp/proc :bad
+                     (fn [_factory-ctx]
+                       (fn
+                         ([] {:params {} :ins {:in ""} :outs {:out ""}})
+                         ([_s] {})
+                         ([_s _transition]
+                          (throw (ex-info "boom" {:cause :intentional})))
+                         ([s _in-id _m] [s {}]))))
+        h   (dp/start! (dp/serial bad (dp/sink)))]
+    (try
+      (let [signal (dp/await-quiescent! h 5000)]
+        (testing "done-promise carries [:failed err] from the error-chan drain"
+          (is (vector? signal))
+          (is (= :failed (first signal)))
+          (is (= "boom" (-> signal second :message)))
+          (is (= {:cause :intentional} (-> signal second :data)))))
+      (finally (dp/stop! h)))))

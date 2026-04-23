@@ -159,6 +159,24 @@
          :order []
          :nodes {}}))
 
+(defn- derive-msg
+  "Build a derived message envelope: fresh msg-id and data-id, given
+   tokens and parent-msg-ids. Tokens are `::pending` for handler-land
+   helpers (synthesis stamps the real value) or a real token-map for
+   eager construction in wrap-proc."
+  [parent-ids tokens]
+  {:msg-id (random-uuid)
+   :data-id (random-uuid)
+   :tokens tokens
+   :parent-msg-ids (vec parent-ids)})
+
+(defn- split-across-children
+  "Split `parent-tokens` K-ways and produce K derived envelopes whose
+   `:parent-msg-ids` is `[parent-msg-id]`."
+  [parent-msg-id parent-tokens k]
+  (mapv #(derive-msg [parent-msg-id] %)
+        (tok/split-tokens (or parent-tokens {}) k)))
+
 (defn- register-split! [ledger parent-id msg preserve-data-id?]
   (let [node (cond-> {:op :split :parent parent-id :data-id (:data-id msg)}
                (contains? msg :data) (assoc :data (:data msg))
@@ -184,11 +202,8 @@
    handler returns."
   ([ctx data] (child ctx (:msg ctx) data))
   ([ctx parent data]
-   (let [msg {:msg-id (random-uuid)
-              :data-id (random-uuid)
-              :data data
-              :tokens ::pending
-              :parent-msg-ids [(:msg-id parent)]}]
+   (let [msg (-> (derive-msg [(:msg-id parent)] ::pending)
+                 (assoc :data data))]
      (register-split! (:ledger ctx) (:msg-id parent) msg false)
      msg)))
 
@@ -203,11 +218,9 @@
    step routes or coordinates without transforming the payload."
   [ctx]
   (let [parent (:msg ctx)
-        msg {:msg-id (random-uuid)
-             :data-id (:data-id parent)
-             :data (:data parent)
-             :tokens ::pending
-             :parent-msg-ids [(:msg-id parent)]}]
+        msg    (-> (derive-msg [(:msg-id parent)] ::pending)
+                   (assoc :data-id (:data-id parent)
+                          :data    (:data parent)))]
     (register-split! (:ledger ctx) (:msg-id parent) msg true)
     msg))
 
@@ -217,10 +230,7 @@
    messages; they are used for per-group coordination."
   [ctx]
   (let [parent (:msg ctx)
-        msg {:msg-id (random-uuid)
-             :data-id (random-uuid)
-             :tokens ::pending
-             :parent-msg-ids [(:msg-id parent)]}]
+        msg    (derive-msg [(:msg-id parent)] ::pending)]
     (register-split! (:ledger ctx) (:msg-id parent) msg false)
     msg))
 
@@ -239,11 +249,8 @@
                     (= ::pending (:tokens p)) acc
                     :else (tok/merge-tokens acc (:tokens p {}))))
                 {} parents)
-        msg {:msg-id (random-uuid)
-             :data-id (random-uuid)
-             :data data
-             :tokens ::pending
-             :parent-msg-ids parent-ids}]
+        msg (-> (derive-msg parent-ids ::pending)
+                (assoc :data data))]
     (register-merge! ledger parent-ids external-tokens msg)
     msg))
 
@@ -753,13 +760,7 @@
                out-ports (vec (keys outs))
                n         (count out-ports)]
            (if (pos? n)
-             (let [splits   (tok/split-tokens (:tokens m {}) n)
-                   kids     (mapv (fn [slice]
-                                    {:msg-id (random-uuid)
-                                     :data-id (random-uuid)
-                                     :tokens slice
-                                     :parent-msg-ids [(:msg-id m)]})
-                                  splits)
+             (let [kids     (split-across-children (:msg-id m) (:tokens m) n)
                    forwards (zipmap out-ports (map vector kids))]
                (doseq [[p [sig]] forwards]
                  (sp-pub step-sp (send-out-event trace-sid :signal p sig)))
@@ -919,30 +920,32 @@
          scope        [[:flow fid]]
          events       (atom [])
          counters     (atom {:sent 0 :recv 0 :completed 0})
-         quiescent-p  (atom (promise))
+         done-p       (atom (promise))
          main-sub     (pubsub/sub raw-ps (scope->glob scope)
                                   (fn [_ ev _]
                                     (swap! events conj ev)
                                     (let [c' (swap! counters update-counters ev)]
                                       (when (balanced? c')
-                                        (deliver @quiescent-p :quiescent)))))
+                                        (deliver @done-p :quiescent)))))
          user-unsubs  (mapv (fn [[pat h]] (pubsub/sub raw-ps pat h)) subscribers)
          g            (build-graph instrumented)
          {:keys [error-chan]} (flow/start g)
          err-done     (a/io-thread
                         (loop []
                           (when-let [m (a/<!! error-chan)]
-                            (let [ex (:clojure.core.async.flow/ex m)]
+                            (let [ex  (:clojure.core.async.flow/ex m)
+                                  err {:message (ex-message ex) :data (ex-data ex)}]
                               (pubsub/pub raw-ps
                                           (run-subject-for scope :flow-error)
                                           {:kind      :flow-error
                                            :pid       (:clojure.core.async.flow/pid m)
                                            :cid       (:clojure.core.async.flow/cid m)
                                            :msg-id    (get-in m [:clojure.core.async.flow/msg :msg-id])
-                                           :error     {:message (ex-message ex) :data (ex-data ex)}
+                                           :error     err
                                            :scope     scope
                                            :flow-path [fid]
-                                           :at        (now)}))
+                                           :at        (now)})
+                              (deliver @done-p [:failed err]))
                             (recur))))]
      (pubsub/pub raw-ps (run-subject-for scope :run-started)
                  {:kind :run-started :flow-path [fid] :scope scope :at (now)})
@@ -955,7 +958,7 @@
       ::cancel      cancel-p
       ::events      events
       ::counters    counters
-      ::quiescent-p quiescent-p
+      ::done-p      done-p
       ::main-sub    main-sub
       ::user-unsubs user-unsubs
       ::err-done    err-done
@@ -964,7 +967,7 @@
 (defn inject!
   "Seed a message into the running step. Returns the handle."
   [handle {:keys [in port] :as opts}]
-  (let [{::keys [step graph pubsub scope fid counters quiescent-p port-index]} handle
+  (let [{::keys [step graph pubsub scope fid counters done-p port-index]} handle
         ref                 (or in (:in step))
         [flow-in flow-port] (if (vector? ref) ref [ref :in])
         port                (or port flow-port)
@@ -994,7 +997,7 @@
                               :else
                               (new-done))
         msg-kind            (cond has-data? :data has-tokens? :signal :else :done)]
-    (swap! quiescent-p (fn [p] (if (realized? p) (promise) p)))
+    (swap! done-p (fn [p] (if (realized? p) (promise) p)))
     (swap! counters update :sent inc)
     (pubsub/pub pubsub (run-subject-for scope :seed)
                 (cond-> {:kind :seed :msg-kind msg-kind
@@ -1022,23 +1025,13 @@
   (balanced? (counters handle)))
 
 (defn await-quiescent!
-  "Block until quiescence or error."
+  "Block until quiescence or error. Returns :quiescent, [:failed err], or :timeout."
   ([handle] (await-quiescent! handle nil))
   ([handle timeout-ms]
-   (let [{::keys [quiescent-p events]} handle
-         deadline (when timeout-ms (+ (System/currentTimeMillis) timeout-ms))
-         find-err #(some (fn [ev] (when (= :flow-error (:kind ev)) ev)) @events)]
-     (loop []
-       (if-let [err (find-err)]
-         [:failed (:error err)]
-         (cond
-           (and deadline (>= (System/currentTimeMillis) deadline))
-           :timeout
-
-           :else
-           (let [current @quiescent-p
-                 v       (deref current 10 ::pending)]
-             (if (= ::pending v) (recur) v))))))))
+   (let [p @(::done-p handle)]
+     (if timeout-ms
+       (deref p timeout-ms :timeout)
+       @p))))
 
 (defn stop!
   "Tear down the graph."
@@ -1075,30 +1068,21 @@
            (swap! a conj {:msg-id (:msg-id (:msg ctx)) :data d})
            [s []]))))
 
-(defn- parent-index
-  "Build `{msg-id #{parent-msg-id ...}}` from an event log, using only
-   events that carry both fields."
-  [events]
+(defn- seed-attribution
+  "Single forward pass over time-ordered `events`: returns
+   `{msg-id #{seed-idx ...}}` mapping every message to the set of
+   seed indices whose ancestry reaches it. Relies on events arriving
+   in causal order (a derived message's event follows its parents')."
+  [events seed->idx]
   (reduce (fn [acc ev]
-            (let [mid     (:msg-id ev)
-                  parents (:parent-msg-ids ev)]
-              (if (and mid parents (#{:split :merge :send-out} (:kind ev)))
-                (update acc mid (fnil into #{}) parents)
-                acc)))
+            (case (:kind ev)
+              :seed
+              (update acc (:msg-id ev) (fnil conj #{}) (seed->idx (:msg-id ev)))
+              (:split :merge :send-out)
+              (let [parent-seeds (reduce set/union #{} (map acc (:parent-msg-ids ev)))]
+                (update acc (:msg-id ev) (fnil set/union #{}) parent-seeds))
+              acc))
           {} events))
-
-(defn- ancestors-in
-  "BFS backward from `msg-id` via `pidx`; return the subset of `targets`
-   reached through the ancestry."
-  [pidx targets msg-id]
-  (loop [frontier #{msg-id} visited #{} found #{}]
-    (if (empty? frontier)
-      found
-      (let [hits      (set/intersection frontier targets)
-            visited'  (set/union visited frontier)
-            parents   (reduce set/union #{} (map pidx frontier))
-            frontier' (set/difference parents visited')]
-        (recur frontier' visited' (set/union found hits))))))
 
 (defn run-seq
   "Run `step` against each input in `coll`. Returns a map like `run!`
@@ -1123,13 +1107,12 @@
                            (cond-> (vector? signal) (assoc :error (second signal))))
              events    (:events result)
              seed-ids  (mapv :msg-id (filter #(= :seed (:kind %)) events))
-             seed-set  (set seed-ids)
              seed->idx (zipmap seed-ids (range))
-             pidx      (parent-index events)
+             seed-map  (seed-attribution events seed->idx)
              outputs   (reduce (fn [acc {:keys [msg-id data]}]
-                                 (reduce (fn [a s] (update a (seed->idx s) conj data))
+                                 (reduce (fn [a s] (update a s conj data))
                                          acc
-                                         (ancestors-in pidx seed-set msg-id)))
+                                         (seed-map msg-id)))
                                (vec (repeat (count coll) []))
                                @collected)]
          (assoc result :outputs outputs))))))
