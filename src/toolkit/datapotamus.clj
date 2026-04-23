@@ -375,6 +375,8 @@
 ;; computed port list; `retry` is a local loop inside one handler.
 ;; ============================================================================
 
+(declare derive)  ; fan-in uses derive; derive is defined in Part 5 (depends on pubsub helpers)
+
 (defn fan-out
   "Emit N copies of the input on :out with a fresh zero-sum token group
    keyed `[group-id input-msg-id]`. Pair with `(fan-in group-id)`
@@ -435,7 +437,7 @@
   ([id group-id]
    (proc id
          (handler-factory
-          (fn [_ctx s m]
+          (fn [ctx s m]
             (let [gids (filterv (fn [k] (and (vector? k) (= group-id (first k))))
                                 (keys (:tokens m)))]
               (reduce
@@ -446,20 +448,16 @@
                                  (update :value (fn [x] (bit-xor (long x) v)))
                                  (update :msgs conj m))]
                    (if (zero? (long (:value grp')))
-                     (let [merge-id (random-uuid)
-                           parents  (mapv :msg-id (:msgs grp'))
-                           mtokens  (-> (reduce tok/merge-tokens {} (map :tokens (:msgs grp')))
-                                        (dissoc gid))
-                           out-msg  {:msg-id        (random-uuid)
-                                     :data-id       (random-uuid)
-                                     :data          (mapv :data (:msgs grp'))
-                                     :tokens        mtokens
-                                     :parent-msg-ids [merge-id]}]
+                     ;; Group closed — produce a merge msg whose parents
+                     ;; are the actual siblings directly. Multi-parent
+                     ;; `derive` XOR-merges their tokens and publishes a
+                     ;; :merge trace event. The closing group's gid value
+                     ;; is 0 in the merged tokens (by construction); drop
+                     ;; it for cleanliness.
+                     (let [merged (-> (derive ctx (:msgs grp') (mapv :data (:msgs grp')))
+                                      (update :tokens dissoc gid))]
                        [(update s' :groups dissoc gid)
-                        (-> output
-                            (update :out (fnil conj []) out-msg)
-                            (update ::merges (fnil conj [])
-                                    {:msg-id merge-id :parents parents}))])
+                        (update output :out (fnil conj []) merged)])
                      [(assoc-in s' [:groups gid] grp') output])))
                [s {}]
                gids)))))))
@@ -666,28 +664,45 @@
         (throw ex)))))
 
 (defn derive
-  "Create a child msg and publish it as a `:derive` trace event on
-   ctx's scoped pubsub. Returns the child — a full msg with
-   `:msg-id`, `:data-id`, tokens inherited from parent, and
-   `:parent-msg-ids [parent-msg-id]` — that you can bind, pass
+  "Create a child msg and publish its creation as a trace event on
+   ctx's scoped pubsub. Returns the child — a full msg with fresh
+   `:msg-id`/`:data-id`, tokens inherited from parent(s), and
+   `:parent-msg-ids` naming the parent(s) — that you can bind, pass
    around, and use as the parent of further `derive` calls.
 
-   2-arity `(derive ctx data)` uses ctx's current input msg (`:msg`,
-   set by the step wrapper) as parent. 3-arity `(derive ctx parent
-   data)` takes an explicit parent.
+   Arities:
+     (derive ctx data)               — single parent = ctx's `:msg`
+     (derive ctx parent data)        — single parent, explicit
+     (derive ctx [p1 p2 …] data)     — multi-parent (merge)
 
-   `derive` is trace-only: the child does not travel the graph.
-   Pass your final msg to `emit` (or place it directly in a port's
-   output vector) to route it out. Example:
+   Single-parent derive fires a `:derive` trace event. Multi-parent
+   derive fires a `:merge` event (the shape fan-in uses): the child's
+   `:parent-msg-ids` names every parent directly. Multi-parent tokens
+   are XOR-merged across parents.
+
+   `derive` is trace-only: the child does not travel the graph. Pass
+   your final msg to `emit` (or place it directly in a port's output
+   vector) to route it out. Example:
 
      (let [b (derive ctx {:stage :b})
            c (derive ctx b {:stage :c})]
        [s (emit c :out {:stage :d})])"
   ([ctx data]        (derive ctx (:msg ctx) data))
-  ([ctx parent data]
-   (let [child (child-with-data parent data)]
-     (sp-pub (:pubsub ctx) (derive-event (:step-id ctx) child))
-     child)))
+  ([ctx parent-or-parents data]
+   (if (vector? parent-or-parents)
+     (let [parents parent-or-parents
+           tokens  (reduce tok/merge-tokens {} (map :tokens parents))
+           child   {:msg-id         (random-uuid)
+                    :data-id        (random-uuid)
+                    :data           data
+                    :tokens         tokens
+                    :parent-msg-ids (mapv :msg-id parents)}]
+       (sp-pub (:pubsub ctx)
+               (merge-event (:step-id ctx) (:msg-id child) (:parent-msg-ids child)))
+       child)
+     (let [child (child-with-data parent-or-parents data)]
+       (sp-pub (:pubsub ctx) (derive-event (:step-id ctx) child))
+       child))))
 
 ;; ============================================================================
 ;; Part 6 — wrap-proc
@@ -695,19 +710,19 @@
 ;; The step-execution wrapper. Each user step-fn is wrapped once at
 ;; instrument time; the wrapper drives data/signal/done dispatch,
 ;; publishes events, resolves handler output-maps (filling in nil
-;; parents, separating port data from ::merges/::derivations trace
-;; annotations), and enforces that emitted ports are among declared
+;; parents, auto-splitting sibling tokens that were inherited
+;; unchanged), and enforces that emitted ports are among declared
 ;; outs.
 ;; ============================================================================
 
 ;; --- handler-output resolution ---------------------------------------------
 ;;
-;; Handlers return `[s' port-map]`. The port-map can contain:
-;;   - declared-port keys       — real outgoing messages
-;;   - ::merges / ::derivations — trace-only annotations for fan-in
-;;     merges and side-channel derivations (no port routing)
-;; These helpers resolve nil parent-ids against the current input msg,
-;; split the two layers apart, and produce the intermediate events.
+;; Handlers return `[s' {port [msgs…]}]` — pure routing. Trace events
+;; for intermediate msgs come from side-effecting verbs (`derive`,
+;; `with-span`) called during the handler; they never appear in the
+;; return value. These helpers resolve nil parent-ids against the
+;; current input, auto-split sibling tokens where inherited uniformly,
+;; and produce the :send-out events per port-msg.
 
 (defn- resolve-msg-nils [m input-id]
   (cond-> m
@@ -719,51 +734,69 @@
                 [input-id]
                 (mapv #(or % input-id) ps))))))
 
-(defn- port-output-keys [out]
-  (filter (fn [k] (and (keyword? k) (not (namespace k)))) (keys out)))
-
-(defn- internal-key? [k]
-  (and (keyword? k) (= "toolkit.datapotamus" (namespace k))))
-
-(defn- resolve-output-nils [out input-id]
-  (let [resolved-ports
-        (reduce (fn [m k]
-                  (assoc m k (mapv #(resolve-msg-nils % input-id) (get m k))))
-                out (port-output-keys out))
-        resolved-derivs
-        (update resolved-ports ::derivations
-                (fn [ds] (when ds (mapv #(resolve-msg-nils % input-id) ds))))
-        resolved-merges
-        (update resolved-derivs ::merges
-                (fn [ms]
-                  (when ms
-                    (mapv (fn [{:keys [msg-id parents]}]
-                            {:msg-id msg-id
-                             :parents (if (empty? parents)
-                                        [input-id]
-                                        (mapv #(or % input-id) parents))})
-                          ms))))]
-    resolved-merges))
+(defn- resolve-output-nils
+  "Walk the port-map and resolve any nil `:parent-msg-ids` in emitted
+   msgs against the current input msg's id."
+  [out input-id]
+  (reduce-kv (fn [m port msgs]
+               (assoc m port (mapv #(resolve-msg-nils % input-id) msgs)))
+             {} out))
 
 (defn- build-middle-events [step-id output]
-  (let [ports     (port-output-keys output)
-        port-ids  (into #{} (mapcat (fn [p] (map :msg-id (get output p)))) ports)
-        derivs    (->> (get output ::derivations)
-                       (remove #(port-ids (:msg-id %))))
-        merges    (get output ::merges)
-        ev-merges (mapv (fn [{:keys [msg-id parents]}]
-                          (merge-event step-id msg-id parents))
-                        merges)
-        ev-derivs (mapv (fn [c] (send-out-event step-id nil c)) derivs)
-        ev-sends  (into []
-                        (mapcat
-                         (fn [p]
-                           (map (fn [c] (send-out-event step-id p c)) (get output p))))
-                        ports)]
-    (into [] cat [ev-merges ev-derivs ev-sends])))
+  (into []
+        (mapcat (fn [[port msgs]]
+                  (map #(send-out-event step-id port %) msgs)))
+        output))
 
-(defn- strip-internal-keys [out]
-  (reduce-kv (fn [m k v] (if (internal-key? k) m (assoc m k v))) {} out))
+(defn- split-sibling-group
+  "Given N≥2 siblings whose parent-tokens are `parent-tokens`,
+   rewrite per-msg tokens so that for every key where all N siblings
+   currently hold the PARENT's value (i.e. inherited unchanged), the
+   value is split N ways (XOR-preserving) and reassigned per-sibling.
+   Keys not in `parent-tokens` (e.g. fan-out's fresh group slice) or
+   keys where siblings have already diverged are left alone — the
+   user is presumed to have handled those deliberately."
+  [siblings parent-tokens]
+  (let [n          (count siblings)
+        shared     (filterv (fn [k]
+                              (let [pv (get parent-tokens k)
+                                    vs (map #(get (:tokens %) k ::absent) siblings)]
+                                (and (not-any? #(= % ::absent) vs)
+                                     (every? #(= % pv) vs))))
+                            (keys parent-tokens))
+        key-splits (into {}
+                         (map (fn [k]
+                                [k (tok/split-value (get parent-tokens k) n)]))
+                         shared)]
+    (mapv (fn [i sibling]
+            (update sibling :tokens
+                    (fn [t]
+                      (reduce (fn [acc k]
+                                (assoc acc k (nth (get key-splits k) i)))
+                              t shared))))
+          (range n) siblings)))
+
+(defn- auto-split-sibling-tokens
+  "Walk the port-map, find port-msgs whose parent is the input msg
+   `m`, group them as siblings, and for each group of N≥2 split any
+   uniformly-inherited tokens N ways. Sibling groups parented by
+   intermediate (non-input) msgs are left alone — those paths go
+   through `emit`/`spawn`, which handle their own splitting. Token
+   conservation across graph-visible siblings of the input becomes a
+   property of the wrapper, not of each call site."
+  [port-map m]
+  (let [input-id    (:msg-id m)
+        port-msgs   (mapcat val port-map)
+        siblings    (filterv #(= [input-id] (:parent-msg-ids %)) port-msgs)
+        rewrites    (if (< (count siblings) 2)
+                      {}
+                      (into {} (map (fn [s] [(:msg-id s) s])
+                                    (split-sibling-group siblings (:tokens m)))))]
+    (if (empty? rewrites)
+      port-map
+      (reduce-kv (fn [mm port v]
+                   (assoc mm port (mapv #(get rewrites (:msg-id %) %) v)))
+                 {} port-map))))
 
 ;; --- wrap-proc --------------------------------------------------------------
 
@@ -826,11 +859,7 @@
            (sp-pub step-sp (recv-event trace-sid m))
            (try
              (let [[s' raw]       (user-step-fn s in-id m)
-                   user-ports     (into #{}
-                                        (filter (fn [k]
-                                                  (and (keyword? k)
-                                                       (not (namespace k)))))
-                                        (keys (or raw {})))
+                   user-ports     (set (keys (or raw {})))
                    unknown-ports  (set/difference user-ports declared-outs)
                    _              (when (seq unknown-ports)
                                     (throw (ex-info
@@ -841,9 +870,10 @@
                                             {:step           trace-sid
                                              :unknown-ports  unknown-ports
                                              :declared-ports declared-outs})))
-                   resolved       (resolve-output-nils (or raw {}) (:msg-id m))
-                   middle-events  (build-middle-events trace-sid resolved)
-                   port-map      (strip-internal-keys resolved)]
+                   port-map       (-> (or raw {})
+                                      (resolve-output-nils (:msg-id m))
+                                      (auto-split-sibling-tokens m))
+                   middle-events  (build-middle-events trace-sid port-map)]
                (doseq [ev middle-events] (sp-pub step-sp ev))
                (sp-pub step-sp (success-event trace-sid m))
                [s' port-map])

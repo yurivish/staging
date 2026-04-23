@@ -632,3 +632,40 @@
         (is (= [b-id] (:parent-msg-ids c-ev)))
         (is (= [c-id] (:parent-msg-ids d-send)))))))
 
+(deftest derive-multi-parent-fires-merge-event
+  ;; Handler derives B and C separately from the input, then merges them
+  ;; by calling `derive` with a vector of parents. The merged msg has
+  ;; :parent-msg-ids = [b-id c-id] directly (no synthetic intermediate),
+  ;; and a :merge trace event names both parents.
+  (let [wf     (dp/serial
+                (dp/step :merge-in-place {:outs {:out ""}}
+                  (fn [ctx s _m]
+                    (let [b        (dp/derive ctx {:stage :b})
+                          c        (dp/derive ctx {:stage :c})
+                          combined (dp/derive ctx [b c] {:combined true})]
+                      [s {:out [combined]}])))
+                (dp/sink))
+        result (dp/run! wf {:data {:stage :a}})]
+    (testing "sink receives exactly one combined msg"
+      (let [recvs (filterv #(= :sink (:step-id %)) (events-of result :recv))]
+        (is (= :completed (:state result)))
+        (is (= 1 (count recvs)))
+        (is (= {:combined true} (:data (first recvs))))))
+    (testing "two :derive events (B and C) and one :merge event"
+      (is (= 2 (count (events-of result :derive))))
+      (is (= 1 (count (events-of result :merge)))))
+    (testing ":merge event's parents are [B-id C-id]"
+      (let [derives (events-of result :derive)
+            merge-ev (first (events-of result :merge))
+            b-id (:msg-id (first derives))
+            c-id (:msg-id (second derives))]
+        (is (= [b-id c-id] (:parent-msg-ids merge-ev)))))
+    (testing "combined's :parent-msg-ids name B and C directly (no intermediate)"
+      (let [derives (events-of result :derive)
+            b-id (:msg-id (first derives))
+            c-id (:msg-id (second derives))
+            send-out (first (filterv #(and (= :merge-in-place (:step-id %))
+                                           (= :out (:port %)))
+                                     (events-of result :send-out)))]
+        (is (= [b-id c-id] (:parent-msg-ids send-out)))))))
+

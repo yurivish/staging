@@ -18,7 +18,9 @@
 
 (defn- events->dag
   "Fold events into a stuartsierra dependency graph + a {msg-id → kind}
-   map. Each msg depends on its parents (per :parent-msg-ids)."
+   map. Each msg depends on its parents (per :parent-msg-ids). A
+   multi-parent msg fires both a :merge and a :send-out for the same
+   msg-id; we keep the :merge kind because that's the structural role."
   [events]
   (reduce (fn [{:keys [g kinds]} e]
             (case (:kind e)
@@ -27,7 +29,9 @@
               (:send-out :merge)
               {:g (reduce (fn [g p] (dep/depend g (:msg-id e) p))
                           g (:parent-msg-ids e))
-               :kinds (assoc kinds (:msg-id e) (:kind e))}
+               :kinds (if (= :merge (get kinds (:msg-id e)))
+                        kinds
+                        (assoc kinds (:msg-id e) (:kind e)))}
               {:g g :kinds kinds}))
           {:g (dep/graph) :kinds {}}
           events))
@@ -123,11 +127,13 @@
     (testing "fan-in sent exactly one downstream msg on :out"
       (is (= 1 (count (filterv #(and (= :fi (:step-id %)) (:port %))
                                (events-of result :send-out))))))
-    (testing "the sink-bound msg's parent is the merge-node id"
-      (let [merge-id   (:msg-id (first (events-of result :merge)))
-            fi-send    (first (filterv #(and (= :fi (:step-id %)) (:port %))
-                                       (events-of result :send-out)))]
-        (is (= [merge-id] (:parent-msg-ids fi-send)))))))
+    (testing "the sink-bound msg IS the merge node (same msg-id, parents named directly)"
+      (let [merge-ev (first (events-of result :merge))
+            fi-send  (first (filterv #(and (= :fi (:step-id %)) (:port %))
+                                     (events-of result :send-out)))]
+        (is (= (:msg-id merge-ev) (:msg-id fi-send)))
+        (is (= 3 (count (:parent-msg-ids fi-send))))
+        (is (= (:parent-msg-ids merge-ev) (:parent-msg-ids fi-send)))))))
 
 (deftest named-port-fan-out-fan-in
   ;; The Go version's `FanOut(ports=[a,b]) → per-port procs → FanIn`
