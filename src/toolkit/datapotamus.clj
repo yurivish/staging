@@ -477,6 +477,9 @@
    full factory `(fn [ctx] step-fn)` that satisfies core.async.flow's
    4-arity proc-fn shape.
 
+   `ports` is `{:ins {port-kw \"\"} :outs {port-kw \"\"}}`; pass `nil` for
+   the default `{:in \"\"} / {:out \"\"}`.
+
    `d` is the input data (shorthand for `(:data (:msg ctx))`). The
    full envelope is on `(:msg ctx)` if needed (tokens, lineage, etc.).
 
@@ -485,24 +488,17 @@
    to their direct parents; synthesis walks that ref graph on handler
    return to distribute tokens. Bare data in outputs is coerced via
    `child` during that pass."
-  ([handler] (handler-factory nil handler))
-  ([ports handler]
-   (let [ins  (:ins  ports {:in  ""})
-         outs (:outs ports {:out ""})]
-     (fn [factory-ctx]
-       (fn ([]             {:params {} :ins ins :outs outs})
-         ([_]            {})
-         ([s _]          s)
-         ([s in-port m]
-          (let [ctx      (assoc factory-ctx :in-port in-port :msg m)
-                [s' raw] (handler ctx s (:data m))]
-            [s' (process-outputs ctx m raw)])))))))
-
-(defn- pure-fn-handler
-  "Lift a pure (data -> data) fn: emits (f d) as bare data on :out."
-  [f]
-  (fn [_ctx s d]
-    [s [[:out (f d)]]]))
+  [ports handler]
+  (let [ins  (:ins  ports {:in  ""})
+        outs (:outs ports {:out ""})]
+    (fn [factory-ctx]
+      (fn ([]             {:params {} :ins ins :outs outs})
+        ([_]            {})
+        ([s _]          s)
+        ([s in-port m]
+         (let [ctx      (assoc factory-ctx :in-port in-port :msg m)
+               [s' raw] (handler ctx s (:data m))]
+           [s' (process-outputs ctx m raw)]))))))
 
 (defn proc
   "Low-level: wrap a raw core.async.flow factory `(fn [ctx] step-fn)`
@@ -524,7 +520,7 @@
    `d` is the incoming data (the `:data` field of the input message).
    Full envelope is on `(:msg ctx)`."
   ([id f]
-   (proc id (handler-factory (pure-fn-handler f))))
+   (proc id (handler-factory nil (fn [_ s d] [s [[:out (f d)]]]))))
   ([id ports handler]
    (proc id (handler-factory ports handler))))
 
@@ -538,7 +534,7 @@
   "Identity step: forwards data unchanged with preserved data-id."
   ([] (passthrough (gen-id :passthrough)))
   ([id]
-   (proc id (handler-factory (fn [ctx s _d] [s [[:out (pass ctx)]]])))))
+   (proc id (handler-factory nil (fn [ctx s _d] [s [[:out (pass ctx)]]])))))
 
 (defn as-step
   "Black-box `inner-step` as a single proc under `id`."
@@ -615,6 +611,7 @@
   ([id group-id n]
    (proc id
          (handler-factory
+          nil
           (fn [ctx s d]
             (let [gid    [group-id (:msg-id (:msg ctx))]
                   values (tok/split-value 0 n)
@@ -630,6 +627,7 @@
   ([id group-id]
    (proc id
          (handler-factory
+          nil
           (fn [ctx s _d]
             (let [m    (:msg ctx)
                   gids (filterv (fn [k] (and (vector? k) (= group-id (first k))))
@@ -672,6 +670,7 @@
   [id f max-attempts]
   (proc id
         (handler-factory
+         nil
          (fn [_ctx s d]
            (loop [attempt 1]
              (let [result (try {:ok (f d)}
