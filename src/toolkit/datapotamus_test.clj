@@ -596,6 +596,26 @@
     (testing "each input contributes three copies of its doubled value"
       (is (= [[10 10 10] [14 14 14]] (mapv #(vec (sort %)) (:outputs result)))))))
 
+(deftest start-rejects-unwired-output-port
+  (testing "a router whose :drop port is never connected is rejected at start!"
+    (let [wf (dp/router :route [:out :drop]
+                        (fn [x] [{:data x :port (if (odd? x) :out :drop)}]))]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"unwired output port"
+           (dp/run-seq wf [1])))))
+  (testing "the same step becomes valid once every out is wired"
+    (let [wf (-> (dp/merge-steps
+                  (dp/router :route [:out :drop]
+                             (fn [x] [{:data x :port (if (odd? x) :out :drop)}]))
+                  (dp/sink :drop-sink))
+                 (dp/connect [:route :drop] [:drop-sink :in])
+                 (dp/input-at  :route)
+                 (dp/output-at [:route :out]))
+          result (dp/run-seq wf [1 2 3 4])]
+      (is (= :completed (:state result)))
+      (is (= [[1] [] [3] []] (:outputs result))))))
+
 (deftest run-seq-no-output-gives-empty-slot
   (let [filter-odd (dp/step :filter-odd nil
                             (fn [_ctx s d]

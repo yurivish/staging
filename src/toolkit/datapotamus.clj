@@ -878,6 +878,27 @@
    {:procs (into {} (map (fn [[sid pfn]] [sid {:proc (flow/process pfn)}])) (:procs step))
     :conns (:conns step)}))
 
+(defn- validate-wired-outs!
+  "Throw iff any proc declares an output port that is neither consumed by
+   a conn nor exposed via the flow's :out boundary. An unwired port is
+   a latent hang — `flow/inject` on it would block forever."
+  [instrumented port-index]
+  (let [out-ref      (:out instrumented)
+        out-endpoint (when out-ref
+                       (if (vector? out-ref) out-ref [out-ref :out]))
+        used         (cond-> (set (map first (:conns instrumented)))
+                       out-endpoint (conj out-endpoint))
+        unwired      (vec (for [[sid {:keys [outs]}] port-index
+                                port outs
+                                :when (not (used [sid port]))]
+                            [sid port]))]
+    (when (seq unwired)
+      (throw (ex-info
+              (str "step has unwired output port(s): " (pr-str unwired)
+                   "; every declared :out must be consumed by a conn or "
+                   "match the step's :out boundary")
+              {:unwired unwired})))))
+
 (defn start!
   "Instantiate a step and start it running. Returns a handle."
   ([step] (start! step {}))
@@ -894,6 +915,7 @@
                                      [sid {:ins  (set (keys (:ins  p)))
                                            :outs (set (keys (:outs p)))}])))
                             (:procs instrumented))
+         _            (validate-wired-outs! instrumented port-index)
          scope        [[:flow fid]]
          events       (atom [])
          counters     (atom {:sent 0 :recv 0 :completed 0})
@@ -907,11 +929,24 @@
          user-unsubs  (mapv (fn [[pat h]] (pubsub/sub raw-ps pat h)) subscribers)
          g            (build-graph instrumented)
          {:keys [error-chan]} (flow/start g)
-         err-p        (promise)]
+         err-done     (a/io-thread
+                        (loop []
+                          (when-let [m (a/<!! error-chan)]
+                            (let [ex (:clojure.core.async.flow/ex m)]
+                              (pubsub/pub raw-ps
+                                          (run-subject-for scope :flow-error)
+                                          {:kind      :flow-error
+                                           :pid       (:clojure.core.async.flow/pid m)
+                                           :cid       (:clojure.core.async.flow/cid m)
+                                           :msg-id    (get-in m [:clojure.core.async.flow/msg :msg-id])
+                                           :error     {:message (ex-message ex) :data (ex-data ex)}
+                                           :scope     scope
+                                           :flow-path [fid]
+                                           :at        (now)}))
+                            (recur))))]
      (pubsub/pub raw-ps (run-subject-for scope :run-started)
                  {:kind :run-started :flow-path [fid] :scope scope :at (now)})
      (flow/resume g)
-     (a/thread (when-let [ex (a/<!! error-chan)] (deliver err-p ex)))
      {::step        instrumented
       ::graph       g
       ::pubsub      raw-ps
@@ -923,7 +958,7 @@
       ::quiescent-p quiescent-p
       ::main-sub    main-sub
       ::user-unsubs user-unsubs
-      ::err-p       err-p
+      ::err-done    err-done
       ::port-index  port-index})))
 
 (defn inject!
@@ -990,34 +1025,35 @@
   "Block until quiescence or error."
   ([handle] (await-quiescent! handle nil))
   ([handle timeout-ms]
-   (let [{::keys [quiescent-p err-p]} handle
-         deadline (when timeout-ms (+ (System/currentTimeMillis) timeout-ms))]
+   (let [{::keys [quiescent-p events]} handle
+         deadline (when timeout-ms (+ (System/currentTimeMillis) timeout-ms))
+         find-err #(some (fn [ev] (when (= :flow-error (:kind ev)) ev)) @events)]
      (loop []
-       (cond
-         (realized? err-p)
-         [:failed @err-p]
+       (if-let [err (find-err)]
+         [:failed (:error err)]
+         (cond
+           (and deadline (>= (System/currentTimeMillis) deadline))
+           :timeout
 
-         (and deadline (>= (System/currentTimeMillis) deadline))
-         :timeout
-
-         :else
-         (let [current @quiescent-p
-               v       (deref current 10 ::pending)]
-           (if (= ::pending v) (recur) v)))))))
+           :else
+           (let [current @quiescent-p
+                 v       (deref current 10 ::pending)]
+             (if (= ::pending v) (recur) v))))))))
 
 (defn stop!
   "Tear down the graph."
   [handle]
-  (let [{::keys [graph main-sub user-unsubs cancel err-p events counters]} handle]
+  (let [{::keys [graph main-sub user-unsubs cancel err-done events counters]} handle]
     (when-not (realized? cancel) (deliver cancel :stopped))
     (flow/stop graph)
+    (a/<!! err-done)
     (main-sub)
     (doseq [u user-unsubs] (u))
-    (let [err (when (realized? err-p) @err-p)]
+    (let [err (some #(when (= :flow-error (:kind %)) %) @events)]
       {:state    (if err :failed :completed)
        :events   @events
        :counters @counters
-       :error    err})))
+       :error    (:error err)})))
 
 (defn run!
   "Convenience: start, inject one message, wait for quiescence, stop."
@@ -1026,8 +1062,7 @@
     (inject! handle (select-keys opts [:in :port :data]))
     (let [signal (await-quiescent! handle)]
       (-> (stop! handle)
-          (assoc :state (if (= :quiescent signal) :completed :failed))
-          (cond-> (vector? signal) (assoc :error (second signal)))))))
+          (assoc :state (if (= :quiescent signal) :completed :failed))))))
 
 (defn- collector-step
   "Terminal step that appends `{:msg-id ... :data ...}` to `a` for every
