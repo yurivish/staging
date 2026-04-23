@@ -1,7 +1,7 @@
 (ns toolkit.datapotamus2.combinators
-  "User-land combinators that produce flow step factories
-   (fn [ctx] step-fn). These live at the same layer as any user-written
-   factory — no framework privilege."
+  "Factory helpers that produce dp2 step-fns (fn [ctx] step-fn). Drop
+   these into a :procs map or wrap with `dsl/step` for DSL-style
+   composition."
   (:require [clojure.string :as str]
             [toolkit.datapotamus2.core :as dp2]
             [toolkit.datapotamus2.token :as tok]))
@@ -9,8 +9,8 @@
 (set! *warn-on-reflection* true)
 
 (defn wrap
-  "1-in 1-out. Wrap a pure (data → data) fn."
-  [_step-id f]
+  "1-in 1-out. Lift a pure (data → data) fn to a step factory."
+  [f]
   (fn [_ctx]
     (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
         ([_] {}) ([s _] s)
@@ -18,18 +18,18 @@
 
 (defn absorb-sink
   "Terminal sink — consumes input, emits nothing."
-  [_step-id]
+  []
   (fn [_ctx]
     (fn ([] {:params {} :ins {:in ""} :outs {}})
         ([_] {}) ([s _] s)
         ([s _ _] [s {}]))))
 
 (defn fan-out
-  "Emit N copies of the input on :out. Introduces a fresh zero-sum token
-   group (key = \"<step-id>-<input-msg-id>\") so a downstream fan-in can
-   detect when all N children have arrived (group XORs to zero)."
-  [step-id n]
-  (let [group-prefix (str (name step-id) "-")]
+  "Emit N copies of the input on :out with a fresh zero-sum token group
+   keyed `\"<group-id>-<input-msg-id>\"`. Pair with `(fan-in group-id)`
+   downstream to detect completion of all N branches."
+  [group-id n]
+  (let [group-prefix (str (name group-id) "-")]
     (fn [_ctx]
       (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
           ([_] {}) ([s _] s)
@@ -43,10 +43,10 @@
              [s {:out kids}]))))))
 
 (defn router
-  "Route input to multiple ports based on (route-fn data) →
-   [{:data d :port p} ...]. Splits existing tokens across outputs; does
+  "Route input to multiple ports based on `(route-fn data) →
+   [{:data d :port p} ...]`. Splits existing tokens across outputs; does
    not introduce a new zero-group (routing is dispatch, not coordination)."
-  [_step-id ports route-fn]
+  [ports route-fn]
   (let [port-set (set ports)]
     (fn [_ctx]
       (fn ([] {:params {} :ins {:in ""} :outs (zipmap ports (repeat ""))})
@@ -67,11 +67,11 @@
              [s out-map]))))))
 
 (defn retry
-  "Wrap a (data → data) fn. On exception, retry up to max-attempts
+  "Wrap a (data → data) fn. On exception, retry up to `max-attempts`
    times. Retries are invisible in the trace (internal to the step);
    on exhausted attempts the final exception propagates, surfacing as
    a :failure event."
-  [_step-id f max-attempts]
+  [f max-attempts]
   (fn [_ctx]
     (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
         ([_] {}) ([s _] s)
@@ -86,41 +86,42 @@
                  (throw (:err result))))))))))
 
 (defn fan-in
-  "Accumulate inputs grouped by token-id matching `ns-prefix`. When a
-   group's XOR reaches zero, emit a merge msg on :out whose:
+  "Accumulate inputs grouped by token-ids produced by `(fan-out group-id …)`.
+   When a group's XOR reaches zero, emit a merge msg on :out whose:
      - parents are the accumulated input msg-ids
      - data is a vector of accumulated datas (in arrival order)
      - tokens are the XOR-merge of all inputs' tokens, with the
        completing group removed."
-  [_step-id ns-prefix]
-  (fn [_ctx]
-    (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-        ([_] {}) ([s _] s)
-        ([s _ m]
-         (let [gids (filterv (fn [k] (and (string? k) (str/starts-with? k ns-prefix)))
-                             (keys (:tokens m)))]
-           (reduce
-            (fn [[s' output] gid]
-              (let [v     (long (get (:tokens m) gid))
-                    grp   (get-in s' [:groups gid] {:value 0 :msgs []})
-                    grp'  (-> grp
-                              (update :value (fn [x] (bit-xor (long x) v)))
-                              (update :msgs conj m))]
-                (if (zero? (long (:value grp')))
-                  (let [merge-id (random-uuid)
-                        parents  (mapv :msg-id (:msgs grp'))
-                        mtokens  (-> (reduce tok/merge-tokens {} (map :tokens (:msgs grp')))
-                                     (dissoc gid))
-                        out-msg  {:msg-id        (random-uuid)
-                                  :data-id       (random-uuid)
-                                  :data          (mapv :data (:msgs grp'))
-                                  :tokens        mtokens
-                                  :parent-msg-ids [merge-id]}]
-                    [(update s' :groups dissoc gid)
-                     (-> output
-                         (update :out (fnil conj []) out-msg)
-                         (update ::dp2/merges (fnil conj [])
-                                 {:msg-id merge-id :parents parents}))])
-                  [(assoc-in s' [:groups gid] grp') output])))
-            [s {}]
-            gids))))))
+  [group-id]
+  (let [group-prefix (str (name group-id) "-")]
+    (fn [_ctx]
+      (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
+          ([_] {}) ([s _] s)
+          ([s _ m]
+           (let [gids (filterv (fn [k] (and (string? k) (str/starts-with? k group-prefix)))
+                               (keys (:tokens m)))]
+             (reduce
+              (fn [[s' output] gid]
+                (let [v     (long (get (:tokens m) gid))
+                      grp   (get-in s' [:groups gid] {:value 0 :msgs []})
+                      grp'  (-> grp
+                                (update :value (fn [x] (bit-xor (long x) v)))
+                                (update :msgs conj m))]
+                  (if (zero? (long (:value grp')))
+                    (let [merge-id (random-uuid)
+                          parents  (mapv :msg-id (:msgs grp'))
+                          mtokens  (-> (reduce tok/merge-tokens {} (map :tokens (:msgs grp')))
+                                       (dissoc gid))
+                          out-msg  {:msg-id        (random-uuid)
+                                    :data-id       (random-uuid)
+                                    :data          (mapv :data (:msgs grp'))
+                                    :tokens        mtokens
+                                    :parent-msg-ids [merge-id]}]
+                      [(update s' :groups dissoc gid)
+                       (-> output
+                           (update :out (fnil conj []) out-msg)
+                           (update ::dp2/merges (fnil conj [])
+                                   {:msg-id merge-id :parents parents}))])
+                    [(assoc-in s' [:groups gid] grp') output])))
+              [s {}]
+              gids)))))))

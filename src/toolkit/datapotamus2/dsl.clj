@@ -3,15 +3,21 @@
    {:procs :conns :in :out}. This namespace provides thin builders
    that produce those maps via composition.
 
-   Category-theoretic flavor: every flow has an implicit :in input port
-   and :out output port. `step` makes a 1-in 1-out primitive. `serial`
-   is sequential composition (gluing :out → :in). `as-step` takes
-   an arbitrary flow and black-boxes it as a single :in/:out node inside
-   a larger flow.
+   Every flow has a single :in and a single :out boundary. `step` makes
+   a 1-in 1-out primitive; `serial` glues :out → :in sequentially;
+   `as-step` black-boxes an arbitrary flow as a single :in/:out node
+   inside a larger flow.
 
-   For multi-port cases (agent tool-ports, routers, etc.), fall back to
-   explicit composition: `merge-flows` unions procs/conns, `connect` adds
-   explicit wires, `input-at` / `output-at` override the boundary step."
+   For independent parallel streams (e.g. two pipelines that share trace
+   infrastructure but don't exchange data), run multiple flows on a
+   shared pubsub rather than trying to express them as one flow with
+   multi-wire boundaries — dp2 intentionally stays 1-in 1-out.
+
+   For multi-port cases inside a single flow (agents with tool-ports,
+   routers, back-edges, etc.), drop down to the lower level: `merge-flows`
+   unions procs/conns, `connect` adds explicit wires, `input-at` /
+   `output-at` override the boundary step (and can take `[sid port]`
+   vectors to point at specific ports)."
   (:require [clojure.set :as set]
             [toolkit.datapotamus2.core :as dp2]))
 
@@ -27,9 +33,38 @@
 
 (defn step
   "A 1-in 1-out flow containing a single proc. `factory` is a dp2 factory
-   `(fn [ctx] step-fn)`. Omitting `id` auto-generates one."
+   `(fn [ctx] step-fn)`. Omitting `id` auto-generates one.
+
+   For the common case of writing a step from scratch (custom handler,
+   span usage, state threading), prefer `from-handler` which drops the
+   vestigial 4-arity ceremony of the raw factory form."
   ([factory]    (step (gen-id :step) factory))
   ([id factory] {:procs {id factory} :conns [] :in id :out id}))
+
+(defn from-handler
+  "Build a 1-proc flow around a message handler.
+
+   `handler` is `(fn [ctx s m] -> [s' port-map])` — the same contract as
+   the 4-arity step-fn's message handler, without the three vestigial
+   arities.
+
+   2-arg form is 1-in 1-out (ports `:in` / `:out`). 3-arg form takes a
+   `ports` map `{:ins {...} :outs {...}}` for multi-port steps.
+
+     (from-handler :work
+       (fn [{:keys [trace] :as ctx} s m]
+         (let [v (trace ctx :op {} (fn [_] (inc (:data m))))]
+           [s (emit m :out v)])))"
+  ([id handler]        (from-handler id {} handler))
+  ([id ports handler]
+   (let [ins  (:ins  ports {:in  "Datapotamus flow step input port"})
+         outs (:outs ports {:out "Datapotamus flow step output port"})]
+     (step id
+           (fn [ctx]
+             (fn ([]      {:params {} :ins ins :outs outs})
+                 ([_]     {})
+                 ([s _]   s)
+                 ([s _ m] (handler ctx s m))))))))
 
 (defn id-flow
   "Identity / pass-through flow: receives on :in, emits the same data on
@@ -119,3 +154,17 @@
    port) or `[step-id port]` for an explicit port."
   [flow ref]
   (assoc flow :out ref))
+
+;; --- inside a step-fn: emission helper -------------------------------------
+
+(defn emit
+  "Build an output port-map from port/data pairs. Each `data` becomes one
+   child msg carrying `m`'s lineage.
+
+     (dsl/emit m :out result)            ;; one port, one msg
+     (dsl/emit m :a x :b y)              ;; multi-port, one msg each"
+  [m & port-data-pairs]
+  (reduce (fn [acc [port data]]
+            (assoc acc port [(dp2/child-with-data m data)]))
+          {}
+          (partition 2 port-data-pairs)))

@@ -1,12 +1,17 @@
 (ns toolkit.datapotamus2.examples-test
   "Tests-as-examples for Datapotamus2. Each deftest is a single-vignette
    demonstrating one capability; the suite ordered simplest → most
-   sophisticated."
+   sophisticated.
+
+   Most tests use the DSL (`dsl/serial`, `dsl/step`, `dsl/as-step`, etc.)
+   since it's the recommended authoring surface. A handful keep hand-
+   authored flow maps to document that the lower layer also works."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [com.stuartsierra.dependency :as dep]
             [toolkit.datapotamus2.combinators :as c]
             [toolkit.datapotamus2.core :as dp2]
+            [toolkit.datapotamus2.dsl :as dsl]
             [toolkit.datapotamus2.token :as tok]
             [toolkit.pubsub :as pubsub]))
 
@@ -29,13 +34,16 @@
           {:g (dep/graph) :kinds {}}
           events))
 
+;; -----------------------------------------------------------------------------
+;; Linear chains (serial composition)
+;; -----------------------------------------------------------------------------
+
 (deftest linear-chain
-  (let [spec {:procs {:inc  (c/wrap :inc inc)
-                      :dbl  (c/wrap :dbl #(* 2 %))
-                      :sink (c/absorb-sink :sink)}
-              :conns [[[:inc :out] [:dbl :in]]
-                      [[:dbl :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :inc :data 5})]
+  (let [flow   (dsl/serial
+                (dsl/step :inc  (c/wrap inc))
+                (dsl/step :dbl  (c/wrap #(* 2 %)))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data 5})]
     (testing "run completes"
       (is (= :completed (:state result)))
       (is (nil? (:error result))))
@@ -58,10 +66,10 @@
         (is (= sink-recv-id (:msg-id dbl-send-child)))))))
 
 (deftest static-fan-out
-  (let [spec {:procs {:split (c/fan-out :split 3)
-                      :sink  (c/absorb-sink :sink)}
-              :conns [[[:split :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :split :data :x})]
+  (let [flow   (dsl/serial
+                (dsl/step :split (c/fan-out :split 3))
+                (dsl/step :sink  (c/absorb-sink)))
+        result (dp2/run! flow {:data :x})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "three children emitted from fan-out"
@@ -82,33 +90,12 @@
               vs (mapv (fn [e] (get-in e [:tokens gk])) split-sends)]
           (is (= 0 (reduce bit-xor vs))))))))
 
-(deftest dynamic-fan-out
-  (let [spec {:procs {:route     (c/router :route [:odd :even]
-                                           (fn [xs]
-                                             (for [x xs]
-                                               {:data x
-                                                :port (if (odd? x) :odd :even)})))
-                      :odd-sink  (c/absorb-sink :odd-sink)
-                      :even-sink (c/absorb-sink :even-sink)}
-              :conns [[[:route :odd]  [:odd-sink  :in]]
-                      [[:route :even] [:even-sink :in]]]}
-        result (dp2/run! spec {:in :route :data [1 2 3 4 5]})]
-    (testing "run completes"
-      (is (= :completed (:state result))))
-    (testing "odds routed to :odd-sink (3: 1, 3, 5), evens to :even-sink (2: 2, 4)"
-      (is (= 3 (count (filterv #(= :odd-sink  (:step-id %)) (events-of result :recv)))))
-      (is (= 2 (count (filterv #(= :even-sink (:step-id %)) (events-of result :recv))))))
-    (testing "router emitted 5 send-outs total"
-      (is (= 5 (count (filterv #(and (= :route (:step-id %)) (:port %))
-                               (events-of result :send-out))))))))
-
 (deftest token-fan-in
-  (let [spec {:procs {:split (c/fan-out :split 3)
-                      :fi    (c/fan-in  :fi "split-")
-                      :sink  (c/absorb-sink :sink)}
-              :conns [[[:split :out] [:fi :in]]
-                      [[:fi :out]    [:sink :in]]]}
-        result (dp2/run! spec {:in :split :data :x})]
+  (let [flow   (dsl/serial
+                (dsl/step :split (c/fan-out :split 3))
+                (dsl/step :fi    (c/fan-in  :split))
+                (dsl/step :sink  (c/absorb-sink)))
+        result (dp2/run! flow {:data :x})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "exactly one merge event with three parents"
@@ -127,29 +114,56 @@
                                        (events-of result :send-out)))]
         (is (= [merge-id] (:parent-msg-ids fi-send)))))))
 
+;; -----------------------------------------------------------------------------
+;; Multi-port routing — needs merge-flows + connect
+;; -----------------------------------------------------------------------------
+
+(deftest dynamic-fan-out
+  (let [flow   (-> (dsl/merge-flows
+                    (dsl/step :route     (c/router [:odd :even]
+                                                   (fn [xs]
+                                                     (for [x xs]
+                                                       {:data x
+                                                        :port (if (odd? x) :odd :even)}))))
+                    (dsl/step :odd-sink  (c/absorb-sink))
+                    (dsl/step :even-sink (c/absorb-sink)))
+                   (dsl/connect [:route :odd]  [:odd-sink :in])
+                   (dsl/connect [:route :even] [:even-sink :in])
+                   (dsl/input-at :route))
+        result (dp2/run! flow {:data [1 2 3 4 5]})]
+    (testing "run completes"
+      (is (= :completed (:state result))))
+    (testing "odds routed to :odd-sink (3: 1, 3, 5), evens to :even-sink (2: 2, 4)"
+      (is (= 3 (count (filterv #(= :odd-sink  (:step-id %)) (events-of result :recv)))))
+      (is (= 2 (count (filterv #(= :even-sink (:step-id %)) (events-of result :recv))))))
+    (testing "router emitted 5 send-outs total"
+      (is (= 5 (count (filterv #(and (= :route (:step-id %)) (:port %))
+                               (events-of result :send-out))))))))
+
 (deftest agent-loop
   ;; Agent calls the tool up to N times, then emits :final. The tool's
   ;; output flows back to the agent's :tool-result port — a back-edge in
-  ;; the graph. No new framework concept — just another conn.
-  (let [calls      (atom 0)
-        agent-step (fn [_ctx]
-                     (fn ([] {:params {}
-                              :ins  {:user-in "" :tool-result ""}
-                              :outs {:tool-call "" :final ""}})
-                         ([_] {}) ([s _] s)
-                         ([s _ m]
-                          (let [n (swap! calls inc)]
-                            (if (< n 4)
-                              [s {:tool-call [(dp2/child-with-data m :query)]}]
-                              [s {:final     [(dp2/child-with-data m :done)]}])))))
-        spec {:procs {:agent agent-step
-                      :tool  (c/wrap :tool (fn [_] :tool-response))
-                      :sink  (c/absorb-sink :sink)}
-              :conns [[[:agent :tool-call] [:tool  :in]]
-                      [[:tool  :out]       [:agent :tool-result]]
-                      [[:agent :final]     [:sink  :in]]]}
-        result (dp2/run! spec
-                         {:in :agent :port :user-in :data :question})]
+  ;; the graph. Declared boundary uses [:agent :user-in] so no :port
+  ;; override is needed at inject time.
+  (let [calls (atom 0)
+        agent (dsl/from-handler :agent
+                {:ins  {:user-in "" :tool-result ""}
+                 :outs {:tool-call "" :final ""}}
+                (fn [_ctx s m]
+                  (let [n (swap! calls inc)]
+                    (if (< n 4)
+                      [s (dsl/emit m :tool-call :query)]
+                      [s (dsl/emit m :final     :done)]))))
+        flow (-> (dsl/merge-flows
+                  agent
+                  (dsl/step :tool (c/wrap (fn [_] :tool-response)))
+                  (dsl/step :sink (c/absorb-sink)))
+                 (dsl/connect [:agent :tool-call] [:tool  :in])
+                 (dsl/connect [:tool  :out]       [:agent :tool-result])
+                 (dsl/connect [:agent :final]     [:sink  :in])
+                 (dsl/input-at [:agent :user-in])
+                 (dsl/output-at :sink))
+        result (dp2/run! flow {:data :question})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "agent recv'd 4 times (1 initial + 3 tool results)"
@@ -165,6 +179,10 @@
       (is (= 3 (count (filterv #(and (= :agent (:step-id %)) (= :tool-call (:port %)))
                                (events-of result :send-out))))))))
 
+;; -----------------------------------------------------------------------------
+;; Retries + failures
+;; -----------------------------------------------------------------------------
+
 (deftest retry-succeeds-after-transient-failures
   (let [attempts (atom 0)
         flaky   (fn [x]
@@ -172,10 +190,10 @@
                     (do (swap! attempts inc)
                         (throw (ex-info "transient" {:attempt @attempts})))
                     x))
-        spec {:procs {:try  (c/retry :try flaky 3)
-                      :sink (c/absorb-sink :sink)}
-              :conns [[[:try :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :try :data 42})]
+        flow   (dsl/serial
+                (dsl/step :try  (c/retry flaky 3))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data 42})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "retries are invisible in the trace (exactly one recv per step)"
@@ -190,10 +208,10 @@
   ;; the run as a whole still completes. retry exhausts its attempts
   ;; and the final throw reaches wrap-proc's catch.
   (let [permafail (fn [_] (throw (ex-info "boom" {:reason :permafail})))
-        spec {:procs {:try  (c/retry :try permafail 2)
-                      :sink (c/absorb-sink :sink)}
-              :conns [[[:try :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :try :data 42})]
+        flow   (dsl/serial
+                (dsl/step :try  (c/retry permafail 2))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data 42})]
     (testing "run completes (failure is message-level, not run-level)"
       (is (= :completed (:state result)))
       (is (nil? (:error result))))
@@ -208,10 +226,10 @@
 (deftest uncaught-failure-continues-run
   ;; Isolates wrap-proc's swallow from retry. A plain throw in step-fn
   ;; yields :failure + run completion, with no downstream emission.
-  (let [spec {:procs {:boom (c/wrap :boom (fn [_] (throw (ex-info "oops" {}))))
-                      :sink (c/absorb-sink :sink)}
-              :conns [[[:boom :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :boom :data 1})]
+  (let [flow   (dsl/serial
+                (dsl/step :boom (c/wrap (fn [_] (throw (ex-info "oops" {})))))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data 1})]
     (testing "run completes"
       (is (= :completed (:state result)))
       (is (nil? (:error result))))
@@ -224,13 +242,16 @@
     (testing "failed msg does not propagate to sink"
       (is (empty? (filterv #(= :sink (:step-id %)) (events-of result :recv)))))))
 
+;; -----------------------------------------------------------------------------
+;; Provenance DAG + multiplicity assertions
+;; -----------------------------------------------------------------------------
+
 (deftest provenance-dag-is-well-formed
-  (let [spec {:procs {:split (c/fan-out :split 3)
-                      :fi    (c/fan-in  :fi "split-")
-                      :sink  (c/absorb-sink :sink)}
-              :conns [[[:split :out] [:fi :in]]
-                      [[:fi :out]    [:sink :in]]]}
-        result (dp2/run! spec {:in :split :data :x})
+  (let [flow   (dsl/serial
+                (dsl/step :split (c/fan-out :split 3))
+                (dsl/step :fi    (c/fan-in  :split))
+                (dsl/step :sink  (c/absorb-sink)))
+        result (dp2/run! flow {:data :x})
         {:keys [g kinds]} (events->dag (:events result))]
     (testing "graph is acyclic (topo-sort succeeds)"
       (is (some? (dep/topo-sort g))))
@@ -244,10 +265,10 @@
 
 (deftest multiplicity-frequencies
   ;; Demonstrates the frequencies-based assertion style (per user memory).
-  (let [spec {:procs {:split (c/fan-out :split 3)
-                      :sink  (c/absorb-sink :sink)}
-              :conns [[[:split :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :split :data :x})]
+  (let [flow   (dsl/serial
+                (dsl/step :split (c/fan-out :split 3))
+                (dsl/step :sink  (c/absorb-sink)))
+        result (dp2/run! flow {:data :x})]
     (testing "each step's :recv, :success, :send-out frequencies"
       (is (= {:split 1 :sink 3}
              (frequencies (map :step-id (events-of result :recv)))))
@@ -268,10 +289,9 @@
         recv-count (atom 0)
         u (pubsub/sub ps "recv.flow.run-A.>"
                       (fn [_ _ _] (swap! recv-count inc)))
-        flow {:procs {:split (c/fan-out :split 3)
-                      :sink  (c/absorb-sink :sink)}
-              :conns [[[:split :out] [:sink :in]]]
-              :in :split}
+        flow (dsl/serial
+              (dsl/step :split (c/fan-out :split 3))
+              (dsl/step :sink  (c/absorb-sink)))
         result (dp2/run! flow {:pubsub ps :flow-id "run-A" :data :x})]
     (u)
     (is (= :completed (:state result)))
@@ -284,12 +304,10 @@
         u (pubsub/sub ps "recv.flow.*.>"
                       (fn [_ ev _]
                         (swap! tallies update (first (:flow-path ev)) (fnil inc 0))))
-        flow-A {:procs {:a (c/wrap :a inc) :sa (c/absorb-sink :sa)}
-                :conns [[[:a :out] [:sa :in]]]
-                :in :a}
-        flow-B {:procs {:b (c/wrap :b dec) :sb (c/absorb-sink :sb)}
-                :conns [[[:b :out] [:sb :in]]]
-                :in :b}
+        flow-A (dsl/serial (dsl/step :a  (c/wrap inc))
+                           (dsl/step :sa (c/absorb-sink)))
+        flow-B (dsl/serial (dsl/step :b  (c/wrap dec))
+                           (dsl/step :sb (c/absorb-sink)))
         ra (dp2/run! flow-A {:pubsub ps :flow-id "A" :data 1})
         rb (dp2/run! flow-B {:pubsub ps :flow-id "B" :data 2})]
     (u)
@@ -302,21 +320,18 @@
 ;; -----------------------------------------------------------------------------
 
 (deftest trace-span-flat
-  ;; A factory step-fn uses `trace` to observe two sibling operations.
+  ;; A step uses `trace` to observe two sibling operations.
   ;; Spans emit :span-start / :span-success; run completion is unaffected.
-  (let [factory (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ m]
-                       (let [a (trace ctx :step-a {:kind :first}
-                                      (fn [_] (+ (:data m) 1)))
-                             b (trace ctx :step-b {:kind :second}
-                                      (fn [_] (* a 10)))]
-                         [s {:out [(dp2/child-with-data m b)]}]))))
-        spec {:procs {:work factory
-                      :sink (c/absorb-sink :sink)}
-              :conns [[[:work :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :work :data 4})]
+  (let [flow   (dsl/serial
+                (dsl/from-handler :work
+                  (fn [ctx s m]
+                    (let [a (dp2/with-span ctx :step-a {:kind :first}
+                                   (fn [_] (+ (:data m) 1)))
+                          b (dp2/with-span ctx :step-b {:kind :second}
+                                   (fn [_] (* a 10)))]
+                      [s (dsl/emit m :out b)])))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data 4})]
     (testing "run completes and sink received the final value"
       (is (= :completed (:state result)))
       (is (= 50 (:data (first (filterv #(= :sink (:step-id %))
@@ -340,19 +355,16 @@
 
 (deftest trace-span-nested
   ;; A span inside a span: inner scope nests under outer.
-  (let [factory (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ m]
-                       (let [v (trace ctx :outer {}
-                                      (fn [ctx']
-                                        (trace ctx' :inner {}
-                                               (fn [_] (+ (:data m) 100)))))]
-                         [s {:out [(dp2/child-with-data m v)]}]))))
-        spec {:procs {:work factory
-                      :sink (c/absorb-sink :sink)}
-              :conns [[[:work :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :work :data 1})]
+  (let [flow   (dsl/serial
+                (dsl/from-handler :work
+                  (fn [ctx s m]
+                    (let [v (dp2/with-span ctx :outer {}
+                                   (fn [ctx']
+                                     (dp2/with-span ctx' :inner {}
+                                            (fn [_] (+ (:data m) 100)))))]
+                      [s (dsl/emit m :out v)])))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data 1})]
     (testing "inner span's scope contains the outer span"
       (let [inner-start (first (filterv #(= :inner (:span-name %))
                                         (events-of result :span-start)))
@@ -367,18 +379,15 @@
 (deftest trace-span-failure-propagates-to-step
   ;; A throw inside a span emits :span-failure, rethrows, and the step's
   ;; wrap-proc converts it into a :failure event. Run still completes.
-  (let [factory (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ m]
-                       (let [v (trace ctx :risky {}
-                                      (fn [_]
-                                        (throw (ex-info "nope" {:d (:data m)}))))]
-                         [s {:out [(dp2/child-with-data m v)]}]))))
-        spec {:procs {:work factory
-                      :sink (c/absorb-sink :sink)}
-              :conns [[[:work :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :work :data 7})]
+  (let [flow   (dsl/serial
+                (dsl/from-handler :work
+                  (fn [ctx s m]
+                    (let [v (dp2/with-span ctx :risky {}
+                                   (fn [_]
+                                     (throw (ex-info "nope" {:d (:data m)}))))]
+                      [s (dsl/emit m :out v)])))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data 7})]
     (testing "run completes (message-level failure, not run-level)"
       (is (= :completed (:state result))))
     (testing "exactly one :span-failure and one step :failure"
@@ -398,15 +407,12 @@
         subjects (atom [])
         u (pubsub/sub ps "span-start.flow.run-T.>"
                       (fn [subj _ _] (swap! subjects conj subj)))
-        factory (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ _]
-                       (trace ctx :outer {}
-                              (fn [ctx']
-                                (trace ctx' :inner {} (fn [_] :ok))))
-                       [s {}])))
-        flow {:procs {:work factory} :conns [] :in :work}
+        flow   (dsl/from-handler :work
+                 (fn [ctx s _m]
+                   (dp2/with-span ctx :outer {}
+                          (fn [ctx']
+                            (dp2/with-span ctx' :inner {} (fn [_] :ok))))
+                   [s {}]))
         result (dp2/run! flow {:pubsub ps :flow-id "run-T" :data :x})]
     (u)
     (is (= :completed (:state result)))
@@ -415,19 +421,15 @@
            (set @subjects)))))
 
 (deftest nested-flow-namespaced
-  ;; Subflow embedded as data in :procs. Step-ids can collide between
-  ;; outer and inner; flattening namespaces inner procs (e.g. :sub.inc)
+  ;; Inner flow embedded via `as-step`. Step-ids can collide between
+  ;; outer and inner; `as-step` namespaces inner procs (e.g. :sub.inc)
   ;; and scope composition gives inner events a distinct subject path.
   (let [ps (pubsub/make)
-        inner {:procs {:inc (c/wrap :inc #(+ % 100))}
-               :conns []
-               :in :inc :out :inc}
-        outer {:procs {:inc  (c/wrap :inc inc)        ; SAME step-id as inner's :inc
-                       :sub  inner                     ; <-- subflow is data
-                       :sink (c/absorb-sink :sink)}
-               :conns [[[:inc :out] [:sub :in]]
-                       [[:sub :out] [:sink :in]]]
-               :in :inc}
+        inner (dsl/step :inc (c/wrap #(+ % 100)))
+        outer (dsl/serial
+               (dsl/step :inc (c/wrap inc))       ; SAME step-id as inner's :inc
+               (dsl/as-step :sub inner)
+               (dsl/step :sink (c/absorb-sink)))
         outer-recvs (atom [])
         inner-recvs (atom [])
         u1 (pubsub/sub ps "recv.flow.outer.step.inc"
@@ -451,37 +453,36 @@
 (deftest span-step-id-attribution
   ;; Every span event's :step-id is the ENCLOSING step, never the span's own
   ;; name — regardless of nesting depth.
-  (let [factory (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ m]
-                       (trace ctx :outer {}
-                              (fn [c] (trace c :inner {} (fn [_] :ok))))
-                       [s {:out [(dp2/child-with-data m :ok)]}])))
-        spec {:procs {:only factory :sink (c/absorb-sink :sink)}
-              :conns [[[:only :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :only :data :x})
+  (let [flow   (dsl/serial
+                (dsl/from-handler :only
+                  (fn [ctx s m]
+                    (dp2/with-span ctx :outer {}
+                           (fn [c] (dp2/with-span c :inner {} (fn [_] :ok))))
+                    [s (dsl/emit m :out :ok)]))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data :x})
         spans  (concat (events-of result :span-start) (events-of result :span-success))]
     (is (seq spans))
     (is (every? #(= :only (:step-id %)) spans))
     (is (= #{:outer :inner} (set (map :span-name spans))))))
 
 (deftest span-in-multi-port-step
-  ;; Spans don't perturb multi-port output.
-  (let [factory (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:a "" :b ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ m]
-                       (let [x (trace ctx :compute-a {} (fn [_] (+ (:data m) 1)))
-                             y (trace ctx :compute-b {} (fn [_] (* (:data m) 10)))]
-                         [s {:a [(dp2/child-with-data m x)]
-                             :b [(dp2/child-with-data m y)]}]))))
-        spec {:procs {:work   factory
-                      :sink-a (c/absorb-sink :sink-a)
-                      :sink-b (c/absorb-sink :sink-b)}
-              :conns [[[:work :a] [:sink-a :in]]
-                      [[:work :b] [:sink-b :in]]]}
-        result (dp2/run! spec {:in :work :data 5})]
+  ;; Spans don't perturb multi-port output. Uses merge-flows + connect
+  ;; because the step emits to :a and :b.
+  (let [work (dsl/from-handler :work
+               {:outs {:a "" :b ""}}
+               (fn [ctx s m]
+                 (let [x (dp2/with-span ctx :compute-a {} (fn [_] (+ (:data m) 1)))
+                       y (dp2/with-span ctx :compute-b {} (fn [_] (* (:data m) 10)))]
+                   [s (dsl/emit m :a x :b y)])))
+        flow   (-> (dsl/merge-flows
+                    work
+                    (dsl/step :sink-a (c/absorb-sink))
+                    (dsl/step :sink-b (c/absorb-sink)))
+                   (dsl/connect [:work :a] [:sink-a :in])
+                   (dsl/connect [:work :b] [:sink-b :in])
+                   (dsl/input-at :work))
+        result (dp2/run! flow {:data 5})]
     (is (= 6  (:data (first (filterv #(= :sink-a (:step-id %)) (events-of result :recv))))))
     (is (= 50 (:data (first (filterv #(= :sink-b (:step-id %)) (events-of result :recv))))))
     (is (= {:compute-a 1 :compute-b 1}
@@ -490,19 +491,14 @@
 (deftest span-in-nested-flow
   ;; Full scope composition: inner flow's step emits a span. Scope must be
   ;; [[:flow outer-fid] [:flow sub-sid] [:step inner-sid] [:span name]].
-  (let [inner {:procs {:work (fn [{:keys [trace] :as ctx}]
-                               (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                                   ([_] {}) ([s _] s)
-                                   ([s _ m]
-                                    (let [v (trace ctx :nested-op {:src :inner}
-                                                   (fn [_] (* (:data m) 2)))]
-                                      [s {:out [(dp2/child-with-data m v)]}]))))}
-               :conns []
-               :in :work :out :work}
-        outer {:procs {:sub  inner
-                       :sink (c/absorb-sink :sink)}
-               :conns [[[:sub :out] [:sink :in]]]
-               :in :sub}
+  (let [inner  (dsl/from-handler :work
+                 (fn [ctx s m]
+                   (let [v (dp2/with-span ctx :nested-op {:src :inner}
+                                  (fn [_] (* (:data m) 2)))]
+                     [s (dsl/emit m :out v)])))
+        outer  (dsl/serial
+                (dsl/as-step :sub inner)
+                (dsl/step :sink (c/absorb-sink)))
         result (dp2/run! outer {:flow-id "F" :data 5})
         span   (first (events-of result :span-start))]
     (is (= :completed (:state result)))
@@ -513,15 +509,13 @@
 
 (deftest span-event-ordering
   ;; Within one step invocation: :recv < :span-start < :span-success < :success.
-  (let [factory (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ m]
-                       (let [v (trace ctx :op {} (fn [_] (inc (:data m))))]
-                         [s {:out [(dp2/child-with-data m v)]}]))))
-        spec {:procs {:step factory :sink (c/absorb-sink :sink)}
-              :conns [[[:step :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :step :data 1})
+  (let [flow   (dsl/serial
+                (dsl/from-handler :step
+                  (fn [ctx s m]
+                    (let [v (dp2/with-span ctx :op {} (fn [_] (inc (:data m))))]
+                      [s (dsl/emit m :out v)])))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data 1})
         events (:events result)
         idx-of (fn [pred] (first (keep-indexed (fn [i e] (when (pred e) i)) events)))
         recv-i (idx-of #(and (= :recv (:kind %)) (= :step (:step-id %))))
@@ -531,8 +525,10 @@
     (is (< recv-i ss-i sx-i succ-i))))
 
 (deftest factory-ctx-has-scope-and-step-id
-  ;; Factory is called once per proc with a ctx carrying the proc's
-  ;; identity. Scope lives on the pubsub's prefix.
+  ;; The step's factory is called once per proc with a ctx carrying the
+  ;; proc's identity. Scope lives on the pubsub's prefix. This test uses
+  ;; the raw factory form (dsl/step) to capture ctx at factory time —
+  ;; from-handler doesn't expose that moment.
   (let [captured (atom nil)
         factory  (fn [ctx]
                    (reset! captured {:step-id (:step-id ctx)
@@ -540,40 +536,41 @@
                    (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
                        ([_] {}) ([s _] s)
                        ([s _ _] [s {}])))
-        spec  {:procs {:my-step factory}
-               :conns []
-               :in :my-step}
-        _     (dp2/run! spec {:flow-id "F" :data :x})]
+        flow     (dsl/step :my-step factory)
+        _        (dp2/run! flow {:flow-id "F" :data :x})]
     (is (= {:step-id :my-step
             :scope   [[:flow "F"] [:step :my-step]]}
            @captured))))
 
-(deftest multiple-factory-styles
-  ;; Combinator factory, user-written factory, and another ad-hoc factory
-  ;; all compose in one flow.
-  (let [combinator-factory (c/wrap :a inc)
-        user-factory       (fn [_ctx]
-                             (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                                 ([_] {}) ([s _] s)
-                                 ([s _ m]
-                                  [s {:out [(dp2/child-with-data m (* (:data m) 10))]}])))
-        third-factory      (fn [_ctx]
-                             (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                                 ([_] {}) ([s _] s)
-                                 ([s _ m]
-                                  [s {:out [(dp2/child-with-data m (dec (:data m)))]}])))
-        spec {:procs {:a    combinator-factory
-                      :b    user-factory
-                      :c    third-factory
-                      :sink (c/absorb-sink :sink)}
-              :conns [[[:a :out] [:b :in]]
-                      [[:b :out] [:c :in]]
-                      [[:c :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :a :data 5})]
+(deftest multiple-step-styles
+  ;; Combinator factory + two handler-based steps compose in one flow.
+  (let [flow   (dsl/serial
+                (dsl/step :a (c/wrap inc))
+                (dsl/from-handler :b (fn [_ctx s m] [s (dsl/emit m :out (* (:data m) 10))]))
+                (dsl/from-handler :c (fn [_ctx s m] [s (dsl/emit m :out (dec (:data m)))]))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data 5})]
     (is (= :completed (:state result)))
     ;; 5 → a(inc) → 6 → b(*10) → 60 → c(dec) → 59
     (is (= 59 (:data (first (filterv #(= :sink (:step-id %))
                                      (events-of result :recv))))))))
+
+;; -----------------------------------------------------------------------------
+;; Hand-authored flow map (documents the raw layer below the DSL)
+;; -----------------------------------------------------------------------------
+
+(deftest hand-authored-flow-map
+  ;; The DSL is optional sugar; a flow is just a map. This test uses a
+  ;; raw flow map directly to show the underlying shape that dsl/serial
+  ;; produces.
+  (let [flow   {:procs {:inc  (c/wrap inc)
+                        :sink (c/absorb-sink)}
+                :conns [[[:inc :out] [:sink :in]]]
+                :in    :inc}
+        result (dp2/run! flow {:data 3})]
+    (is (= :completed (:state result)))
+    (is (= 4 (:data (first (filterv #(= :sink (:step-id %))
+                                    (events-of result :recv))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Long-running handle API: start! / inject! / await-quiescent! / stop!
@@ -582,10 +579,9 @@
 (deftest long-running-multiple-injects
   ;; Start a flow, inject several messages over time, await quiescence
   ;; between batches, then stop cleanly.
-  (let [flow {:procs {:inc  (c/wrap :inc inc)
-                      :sink (c/absorb-sink :sink)}
-              :conns [[[:inc :out] [:sink :in]]]
-              :in :inc}
+  (let [flow (dsl/serial
+              (dsl/step :inc  (c/wrap inc))
+              (dsl/step :sink (c/absorb-sink)))
         h (dp2/start! flow)]
     (dp2/inject! h {:data 1})
     (dp2/await-quiescent! h)
@@ -606,16 +602,13 @@
   ;; A step can poll (:cancel ctx); when stop! is called, the promise
   ;; is delivered. The step sees it and can exit early.
   (let [observed (atom nil)
-        factory  (fn [{:keys [cancel] :as _ctx}]
-                   (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                       ([_] {}) ([s _] s)
-                       ([s _ m]
-                        (reset! observed (realized? cancel))
-                        [s {:out [(dp2/child-with-data m (:data m))]}])))
-        flow    {:procs {:step factory :sink (c/absorb-sink :sink)}
-                 :conns [[[:step :out] [:sink :in]]]
-                 :in :step}
-        h (dp2/start! flow)
+        flow (dsl/serial
+              (dsl/from-handler :step
+                (fn [{:keys [cancel]} s m]
+                  (reset! observed (realized? cancel))
+                  [s (dsl/emit m :out (:data m))]))
+              (dsl/step :sink (c/absorb-sink)))
+        h    (dp2/start! flow)
         {:keys [::dp2/cancel]} h]
     (dp2/inject! h {:data :x})
     (dp2/await-quiescent! h)
@@ -659,7 +652,7 @@
 
 (defn- dyn-fan-out-factory
   "Emit one child per input item (data is a vector). Fresh zero-sum token
-   group keyed by \"group-<parent-msg-id>\"; a downstream (c/fan-in _ \"group-\")
+   group keyed by \"dyn-<parent-msg-id>\"; a downstream `(c/fan-in :dyn)`
    will merge them."
   []
   (fn [_ctx]
@@ -667,7 +660,7 @@
         ([_] {}) ([s _] s)
         ([s _ m]
          (let [items  (:data m)
-               gid    (str "group-" (:msg-id m))
+               gid    (str "dyn-" (:msg-id m))
                values (tok/split-value 0 (count items))
                kids   (mapv (fn [item v]
                               (-> (dp2/child-with-data m item)
@@ -680,30 +673,27 @@
 (deftest example-podcast-sequential-pipeline
   ;; One coarse step does the whole per-podcast sequence. Each operation is
   ;; a span with useful metadata.
-  (let [process (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ m]
-                       (let [url      (:url (:data m))
-                             rss      (trace ctx :fetch-rss {:url url}
-                                             (fn [_] (fake-fetch-rss url)))
-                             episodes (trace ctx :parse-feed
-                                             {:count (count (:items rss))}
-                                             (fn [_] (fake-parse-feed rss)))
-                             done     (mapv (fn [ep]
-                                              (trace ctx :process-episode
-                                                     {:id (:id ep)}
-                                                     (fn [_]
-                                                       (-> ep fake-download
-                                                           fake-transcribe
-                                                           fake-chunk
-                                                           fake-summarize))))
-                                            episodes)]
-                         [s {:out [(dp2/child-with-data m (mapv :summary done))]}]))))
-        spec {:procs {:process process :sink (c/absorb-sink :sink)}
-              :conns [[[:process :out] [:sink :in]]]}
-        result (dp2/run! spec
-                         {:in :process :data {:url "https://example.com/feed.xml"}})]
+  (let [flow   (dsl/serial
+                (dsl/from-handler :process
+                  (fn [ctx s m]
+                    (let [url      (:url (:data m))
+                          rss      (dp2/with-span ctx :fetch-rss {:url url}
+                                          (fn [_] (fake-fetch-rss url)))
+                          episodes (dp2/with-span ctx :parse-feed
+                                          {:count (count (:items rss))}
+                                          (fn [_] (fake-parse-feed rss)))
+                          done     (mapv (fn [ep]
+                                           (dp2/with-span ctx :process-episode
+                                                  {:id (:id ep)}
+                                                  (fn [_]
+                                                    (-> ep fake-download
+                                                        fake-transcribe
+                                                        fake-chunk
+                                                        fake-summarize))))
+                                         episodes)]
+                      [s (dsl/emit m :out (mapv :summary done))])))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data {:url "https://example.com/feed.xml"}})]
     (testing "run completes, sink received the summaries"
       (is (= :completed (:state result)))
       (is (= ["summary-e1" "summary-e2" "summary-e3"]
@@ -721,28 +711,23 @@
 (deftest example-podcast-graph-fanout
   ;; N podcasts fanned out as separate msgs. A coarse :process step runs
   ;; per podcast with spans; fan-in collects into one aggregate.
-  (let [process-one (fn [{:keys [trace] :as ctx}]
-                      (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                          ([_] {}) ([s _] s)
-                          ([s _ m]
-                           (let [url      (:url (:data m))
-                                 episodes (trace ctx :fetch-and-parse {:url url}
-                                                 (fn [_] (fake-parse-feed (fake-fetch-rss url))))
-                                 sums     (mapv (fn [ep]
-                                                  (trace ctx :episode {:id (:id ep)}
-                                                         (fn [_] (:summary (fake-summarize
-                                                                            (fake-transcribe ep))))))
-                                                episodes)]
-                             [s {:out [(dp2/child-with-data m {:podcast url :summaries sums})]}]))))
-        spec {:procs {:split   (dyn-fan-out-factory)
-                      :process process-one
-                      :merge   (c/fan-in :merge "group-")
-                      :sink    (c/absorb-sink :sink)}
-              :conns [[[:split   :out] [:process :in]]
-                      [[:process :out] [:merge   :in]]
-                      [[:merge   :out] [:sink    :in]]]}
+  (let [flow     (dsl/serial
+                  (dsl/step :split (dyn-fan-out-factory))
+                  (dsl/from-handler :process
+                    (fn [ctx s m]
+                      (let [url      (:url (:data m))
+                            episodes (dp2/with-span ctx :fetch-and-parse {:url url}
+                                            (fn [_] (fake-parse-feed (fake-fetch-rss url))))
+                            sums     (mapv (fn [ep]
+                                             (dp2/with-span ctx :episode {:id (:id ep)}
+                                                    (fn [_] (:summary (fake-summarize
+                                                                       (fake-transcribe ep))))))
+                                           episodes)]
+                        [s (dsl/emit m :out {:podcast url :summaries sums})])))
+                  (dsl/step :merge (c/fan-in :dyn))
+                  (dsl/step :sink  (c/absorb-sink)))
         podcasts [{:url "https://a"} {:url "https://b"} {:url "https://c"}]
-        result   (dp2/run! spec {:in :split :data podcasts})]
+        result   (dp2/run! flow {:data podcasts})]
     (testing "run completes; sink receives one merged msg"
       (is (= :completed (:state result)))
       (is (= 1 (count (filterv #(= :sink (:step-id %)) (events-of result :recv))))))
@@ -761,20 +746,18 @@
   ;; Inside one step: transcribe, chunk, analyze chunks in parallel via
   ;; virtual threads. Spans emitted from worker threads still slot into
   ;; the caller's step scope because ctx is captured lexically.
-  (let [factory (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ m]
-                       (let [ep      (:data m)
-                             chunks  (:chunks (fake-chunk (fake-transcribe ep)))
-                             analyze (fn [[i c]]
-                                       (trace ctx :analyze-chunk {:idx i :size (count c)}
-                                              (fn [_] (fake-analyze-part c))))
-                             results (vt-map analyze (map-indexed vector chunks))]
-                         [s {:out [(dp2/child-with-data m results)]}]))))
-        spec {:procs {:episode factory :sink (c/absorb-sink :sink)}
-              :conns [[[:episode :out] [:sink :in]]]}
-        result (dp2/run! spec {:in :episode :data {:id :e1}})
+  (let [flow   (dsl/serial
+                (dsl/from-handler :episode
+                  (fn [ctx s m]
+                    (let [ep      (:data m)
+                          chunks  (:chunks (fake-chunk (fake-transcribe ep)))
+                          analyze (fn [[i c]]
+                                    (dp2/with-span ctx :analyze-chunk {:idx i :size (count c)}
+                                           (fn [_] (fake-analyze-part c))))
+                          results (vt-map analyze (map-indexed vector chunks))]
+                      [s (dsl/emit m :out results)])))
+                (dsl/step :sink (c/absorb-sink)))
+        result (dp2/run! flow {:data {:id :e1}})
         out    (:data (first (filterv #(= :sink (:step-id %)) (events-of result :recv))))]
     (testing "run completes; sink received a vector of analysis maps"
       (is (= :completed (:state result)))
@@ -796,27 +779,24 @@
 (deftest example-cross-podcast-aggregation
   ;; After fan-in collects per-podcast summaries, one aggregation step does
   ;; multi-pass analysis as distinct spans. This is the "pulse" phase.
-  (let [aggregate (fn [{:keys [trace] :as ctx}]
-                    (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                        ([_] {}) ([s _] s)
-                        ([s _ m]
-                         (let [vs     (:data m)
-                               topics (trace ctx :detect-topics {:n (count vs)}
-                                             (fn [_] (set (mapcat :keywords vs))))
-                               drift  (trace ctx :spectrum-drift {}
-                                             (fn [_] (reduce + 0 (map :stance vs))))
-                               ranked (trace ctx :rank-stories {}
-                                             (fn [_] (vec (sort-by :score > vs))))]
-                           [s {:out [(dp2/child-with-data m
-                                                          {:topics topics
-                                                           :drift  drift
-                                                           :top    (first ranked)})]}]))))
-        spec {:procs {:agg aggregate :sink (c/absorb-sink :sink)}
-              :conns [[[:agg :out] [:sink :in]]]}
+  (let [flow   (dsl/serial
+                (dsl/from-handler :agg
+                  (fn [ctx s m]
+                    (let [vs     (:data m)
+                          topics (dp2/with-span ctx :detect-topics {:n (count vs)}
+                                        (fn [_] (set (mapcat :keywords vs))))
+                          drift  (dp2/with-span ctx :spectrum-drift {}
+                                        (fn [_] (reduce + 0 (map :stance vs))))
+                          ranked (dp2/with-span ctx :rank-stories {}
+                                        (fn [_] (vec (sort-by :score > vs))))]
+                      [s (dsl/emit m :out {:topics topics
+                                           :drift  drift
+                                           :top    (first ranked)})])))
+                (dsl/step :sink (c/absorb-sink)))
         feed [{:keywords [:climate :election] :stance  1 :score 0.8}
               {:keywords [:tech :election]    :stance -1 :score 0.9}
               {:keywords [:climate :economy]  :stance  0 :score 0.5}]
-        result (dp2/run! spec {:in :agg :data feed})
+        result (dp2/run! flow {:data feed})
         out    (:data (first (filterv #(= :sink (:step-id %)) (events-of result :recv))))]
     (testing "run completes; aggregation results are correct"
       (is (= :completed (:state result)))
@@ -836,35 +816,30 @@
   ;;   inner  — per-episode span fans out analysis parts on virtual threads
   ;; Spans emitted from deep nested virtual threads still attribute to the
   ;; outer :process step; scopes compose correctly.
-  (let [process (fn [{:keys [trace] :as ctx}]
-                  (fn ([] {:params {} :ins {:in ""} :outs {:out ""}})
-                      ([_] {}) ([s _] s)
-                      ([s _ m]
-                       (let [url      (:url (:data m))
-                             episodes (trace ctx :fetch {:url url}
-                                             (fn [_] (fake-parse-feed (fake-fetch-rss url))))
-                             per-ep   (fn [ep]
-                                        (trace ctx :episode {:id (:id ep)}
-                                               (fn [c]
-                                                 (let [chunks (:chunks (fake-chunk (fake-transcribe ep)))
-                                                       analyze-part (fn [[i p]]
-                                                                      (trace c :analyze-part
-                                                                             {:idx i}
-                                                                             (fn [_] (fake-analyze-part p))))]
-                                                   {:id (:id ep)
-                                                    :parts (vt-map analyze-part
-                                                                   (map-indexed vector chunks))}))))
-                             results  (vt-map per-ep episodes)]
-                         [s {:out [(dp2/child-with-data m {:podcast url :episodes results})]}]))))
-        spec {:procs {:split   (dyn-fan-out-factory)
-                      :process process
-                      :merge   (c/fan-in :merge "group-")
-                      :sink    (c/absorb-sink :sink)}
-              :conns [[[:split   :out] [:process :in]]
-                      [[:process :out] [:merge   :in]]
-                      [[:merge   :out] [:sink    :in]]]}
+  (let [flow     (dsl/serial
+                  (dsl/step :split (dyn-fan-out-factory))
+                  (dsl/from-handler :process
+                    (fn [ctx s m]
+                      (let [url      (:url (:data m))
+                            episodes (dp2/with-span ctx :fetch {:url url}
+                                            (fn [_] (fake-parse-feed (fake-fetch-rss url))))
+                            per-ep   (fn [ep]
+                                       (dp2/with-span ctx :episode {:id (:id ep)}
+                                              (fn [c]
+                                                (let [chunks (:chunks (fake-chunk (fake-transcribe ep)))
+                                                      analyze-part (fn [[i p]]
+                                                                     (dp2/with-span c :analyze-part
+                                                                            {:idx i}
+                                                                            (fn [_] (fake-analyze-part p))))]
+                                                  {:id (:id ep)
+                                                   :parts (vt-map analyze-part
+                                                                  (map-indexed vector chunks))}))))
+                            results  (vt-map per-ep episodes)]
+                        [s (dsl/emit m :out {:podcast url :episodes results})])))
+                  (dsl/step :merge (c/fan-in :dyn))
+                  (dsl/step :sink  (c/absorb-sink)))
         podcasts [{:url "https://a"} {:url "https://b"}]
-        result   (dp2/run! spec {:in :split :data podcasts})]
+        result   (dp2/run! flow {:data podcasts})]
     (testing "run completes; sink received one merged msg"
       (is (= :completed (:state result)))
       (is (= 1 (count (filterv #(= :sink (:step-id %)) (events-of result :recv))))))

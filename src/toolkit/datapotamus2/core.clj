@@ -17,7 +17,10 @@
 
      :pubsub   — ScopedPubsub prefixed with this step's scope
      :step-id  — this step's id, as it appears in trace events
-     :trace    — span helper (see `trace-span`)
+     :cancel   — promise, delivered on stop!; poll with `realized?`
+
+   Users call `with-span` (a fn taking ctx) to annotate work inside a
+   step with named spans.
 
    Subjects compose uniformly across flow / step / span:
 
@@ -191,18 +194,19 @@
 (defn- sp-extend [^ScopedPubsub sp segment]
   (->ScopedPubsub (.raw sp) (conj (.prefix sp) segment)))
 
-;; --- trace (spans) ----------------------------------------------------------
+;; --- spans ------------------------------------------------------------------
 
-(defn trace-span
-  "Run body-fn within a span scope. Emits :span-start, then either
-   :span-success or :span-failure, and rethrows on failure.
+(defn with-span
+  "Run body-fn inside a span scope. Emits :span-start, then runs body-fn,
+   then emits :span-success (carrying body-fn's return value) or
+   :span-failure (rethrowing the exception). Returns body-fn's result.
 
-   body-fn receives an inner ctx whose pubsub's scope is extended with
-   [:span span-name]; nested `trace-span` calls made from inside body-fn
-   therefore nest correctly.
+   `body-fn` is `(fn [inner-ctx] -> result)`. The inner ctx has its
+   pubsub scope extended by [:span span-name]; nested `with-span` calls
+   made with inner-ctx therefore nest correctly.
 
-   Span events are observability only — they fall through the completion
-   counter's `case` and do not affect run completion."
+   Span events are observability only — they do not affect run
+   completion counters."
   [{:keys [pubsub step-id] :as ctx} span-name metadata body-fn]
   (let [inner-sp  (sp-extend pubsub [:span span-name])
         inner-ctx (assoc ctx :pubsub inner-sp)]
@@ -275,8 +279,7 @@
     (prefix-sid prefix ref)))
 
 (defn- instrument-step [trace-sid factory step-sp cancel-p]
-  (let [proc-ctx {:pubsub step-sp :step-id trace-sid
-                  :trace  trace-span :cancel cancel-p}
+  (let [proc-ctx {:pubsub step-sp :step-id trace-sid :cancel cancel-p}
         step-fn  (factory proc-ctx)]
     (wrap-proc trace-sid step-sp step-fn)))
 
@@ -296,8 +299,8 @@
                               [(prefix-endpoint sid from)
                                (prefix-endpoint sid to)])
                             (:conns inner-inst))
-        in-ref        (prefix-ref sid (:in subflow))
-        out-ref       (prefix-ref sid (or (:out subflow) (:in subflow)))]
+        in-ref        (prefix-ref sid (:in inner-inst))
+        out-ref       (prefix-ref sid (or (:out inner-inst) (:in inner-inst)))]
     {:procs renamed-procs
      :conns renamed-conns
      :in in-ref
