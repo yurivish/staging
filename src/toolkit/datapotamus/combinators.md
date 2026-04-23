@@ -54,9 +54,7 @@ unaffected.
 
 **Problem.** `fan-out` requires a fixed N at construction time. To
 process a vector of unknown length you currently write a custom step
-that calls `tok/split-value` and emits children manually. This exact
-pattern appears in `examples_test.clj` (the `named-port-fan-out-fan-in`
-test) with a "promote to combinator later" comment.
+that calls `tok/split-value` and emits children manually.
 
 **Sketch.** Two layers — a low-level `fan-out-coll` that emits one child
 per element of `(coll-fn data)`, and a high-level `for-each` that wraps
@@ -380,6 +378,6 @@ user structure. Well-nesting is the recommended shape for predictable
 `[[a b] [c d]]`-style results. This is captured in the `fan-out`
 docstring.
 
-The `nested-fan-out-fan-in-composes` test in `examples_test.clj`
-exercises the nesting case end-to-end and pins the invariant: outer
-fan-in fires exactly once with three parents.
+The `nested-fan-out-fan-in-composes` test in `datapotamus_test.clj`
+(Act VIII) exercises the nesting case end-to-end and pins the
+invariant: outer fan-in fires exactly once with three parents.

@@ -26,7 +26,7 @@
      :msg      — the current input message envelope
 
    The message-construction helpers (`child`, `children`, `pass`,
-   `signal`, `merge`) are pure — they return provisional messages
+   `signal`, `merge`) are pure — they return draft messages
    carrying in-memory refs to their direct parents under `::parents`.
    The wrapper walks those refs at handler return to reconstruct the
    DAG and distribute tokens.
@@ -51,19 +51,61 @@
      (3) Merge combines tokens.
          (merge [p_1..p_N] d).tokens = XOR over p_i.tokens
 
-   Fan-out introduces a fresh zero-sum group: N children tagged with
-   values XOR-summing to 0. Fan-in closes the group when it sees
-   arrivals whose XOR-sum returns to 0 — emitting a merge msg and
-   stripping the closed group's key. Because (1)(2)(3) compose, any
-   chain of steps preserves every upstream group's XOR sum; downstream
-   fan-ins fire exactly when their groups actually close.
+   Fan-out mints a fresh zero-sum group: N children tagged with values
+   XOR-summing to 0. Fan-in closes the group when it sees arrivals whose
+   XOR for that group returns to 0 — emitting a merge and stripping the
+   group's key. (1)(2)(3) compose, so any chain of steps preserves every
+   upstream group's XOR sum; downstream fan-ins fire when their groups
+   actually close.
 
-   Users who stay within the helpers (`child`/`children`/`pass`/
-   `signal`/`merge`) get these invariants by construction. Hand-built
-   messages that stamp `::extra-tokens` metadata (e.g. inside custom
-   combinators) are the one place where the invariant becomes a manual
-   obligation — the combinator is responsible for XOR-summing its
-   stamped values to 0 across siblings.
+   ### Single-consumption invariant
+
+   Conservation holds *per handler invocation*: XOR over (input +
+   stashed `merge` parents pulled from state) = XOR over emitted
+   outputs, per group. Users who stay within the helpers
+   (`child`/`children`/`pass`/`signal`/`merge`) satisfy this by
+   construction.
+
+   State-stashing across invocations is fine — it's just deferred
+   consumption. The rule: when you derive from a stashed message, emit
+   all its derivatives in that same invocation and remove it from
+   state. Pair-merger (collect two, emit one):
+
+     (fn [ctx s _d]
+       (let [pending (:pending s)]
+         (if (nil? pending)
+           ;; First half: stash, emit nothing.
+           [(assoc s :pending (:msg ctx)) []]
+           ;; Second half: consume both in one invocation.
+           [(dissoc s :pending)
+            [[:out (merge ctx [pending (:msg ctx)]
+                          [(:data pending) (:data (:msg ctx))])]]])))
+
+   ### Escape hatch
+
+   For patterns the helpers can't express — custom group minting,
+   dribbling a source's tokens across many invocations — stamp
+   `assoc-tokens` / `dissoc-tokens` on drafts. Synthesis
+   XOR-merges extras into final tokens and dissocs any drop-keys. The
+   combinator is responsible for XOR-balancing stamped values so that
+   global conservation holds. Dribble sketch (emit K chunks carrying
+   a source's tokens across K invocations):
+
+     ;; On :start: stash residual in state, emit nothing.
+     [(assoc s :residual (:tokens (:msg ctx)) :left K) []]
+
+     ;; On each :tick: emit a chunk. Last tick carries the residual
+     ;; to close the XOR equation.
+     (let [{:keys [residual left]} s
+           last? (= 1 left)
+           chunk (if last? residual (random-tokens-like residual))
+           out   (-> (child ctx {:i left}) (assoc-tokens chunk))]
+       [(-> s (assoc :residual (tok/merge-tokens residual chunk))
+              (update :left dec))
+        [[:out out]]])
+
+   Fan-out and fan-in are the canonical in-repo escape-hatch users
+   (Part 6) — both call `assoc-tokens` / `dissoc-tokens`.
 
    ## Trace events
 
@@ -111,10 +153,9 @@
 ;; and the synthesis pass entirely.
 ;;
 ;; Data and signal messages go through synthesis — the helpers return
-;; rich provisionals with an in-memory `::parents` field, and the
-;; wrapper walks that ref graph at handler return to assign tokens.
-;; `::pending` marks a provisional's tokens field until synthesis
-;; stamps the real value.
+;; drafts with an in-memory `::parents` field, and the wrapper walks
+;; that ref graph at handler return to assign tokens. `::pending` marks
+;; a draft's tokens field until synthesis stamps the real value.
 ;; ============================================================================
 
 (defn new-msg
@@ -144,11 +185,11 @@
 
 ;; --- derivation envelopes ----------------------------------------------------
 ;;
-;; Helpers return rich provisional messages: the normal wire-format
-;; envelope plus an in-memory `::parents` field holding refs to the
-;; direct parent value(s). Each entry in `::parents` is either another
-;; rich provisional (`:tokens ::pending`) or a vanilla message — the
-;; handler's input or an external message reached via `merge`.
+;; Helpers return draft messages: the normal wire-format envelope plus
+;; an in-memory `::parents` field holding refs to the direct parent
+;; value(s). Each entry in `::parents` is either another draft
+;; (`:tokens ::pending`) or a vanilla message — the handler's input or
+;; an external message reached via `merge`.
 ;;
 ;; Synthesis at handler return walks outputs backward through
 ;; `::parents` to recover the in-handler DAG, distributes tokens
@@ -166,15 +207,8 @@
    :tokens tokens
    :parent-msg-ids (vec parent-ids)})
 
-(defn- split-across-children
-  "Split `parent-tokens` K-ways and produce K derived envelopes whose
-   `:parent-msg-ids` is `[parent-msg-id]`."
-  [parent-msg-id parent-tokens k]
-  (mapv #(derive-msg [parent-msg-id] %)
-        (tok/split-tokens (or parent-tokens {}) k)))
-
-(defn- provisional?
-  "True iff `x` is an in-handler provisional built by a helper."
+(defn- draft?
+  "True iff `x` is an in-handler draft built by a helper."
   [x]
   (and (map? x) (= ::pending (:tokens x))))
 
@@ -182,7 +216,7 @@
 
 (defn child
   "Single-parent derive. 2-arity uses `(:msg ctx)` as parent; 3-arity
-   takes an explicit parent. Returns a provisional message carrying
+   takes an explicit parent. Returns a draft message carrying
    `::pending` tokens; the wrapper stamps final tokens after the
    handler returns."
   ([ctx data] (child ctx (:msg ctx) data))
@@ -224,6 +258,41 @@
   (-> (derive-msg (mapv :msg-id parents) ::pending)
       (assoc :data data
              ::parents (vec parents))))
+
+;; --- escape hatch -----------------------------------------------------------
+;;
+;; For patterns the helpers can't express — custom group minting,
+;; dribbling a source across multiple invocations — stamp tokens
+;; directly on a draft. Synthesis XOR-merges `::assoc-tokens`
+;; into the final tokens and dissocs any keys in `::dissoc-tokens`.
+;; The user is responsible for XOR-balancing stamped values so that
+;; global conservation holds.
+
+(defn assoc-tokens
+  "XOR-merge `token-map` into the draft's final tokens during synthesis.
+   Like `assoc` on the token-map, except XOR-merged on key collision
+   (which is how token-maps combine throughout the system). Repeated
+   tagging composes via XOR-merge.
+
+   Example — mint a fresh zero-sum pair on two siblings:
+     (let [gid     [::my-group (random-uuid)]
+           [v1 v2] (tok/split-value 0 2)
+           a (-> (child ctx data-a) (assoc-tokens {gid v1}))
+           b (-> (child ctx data-b) (assoc-tokens {gid v2}))]
+       [s [[:a a] [:b b]]])"
+  [draft token-map]
+  (update draft ::assoc-tokens #(tok/merge-tokens (or % {}) token-map)))
+
+(defn dissoc-tokens
+  "Remove `group-keys` from the draft's final tokens during synthesis.
+   Like `dissoc` on the token-map. Repeated tagging composes via
+   set-union.
+
+   Example — strip a closed group after its zero-sum members have merged:
+     (-> (merge ctx (:msgs grp) (mapv :data (:msgs grp)))
+         (dissoc-tokens [gid]))"
+  [draft group-keys]
+  (update draft ::dissoc-tokens (fnil into #{}) group-keys))
 
 ;; --- fcatch -----------------------------------------------------------------
 
@@ -281,7 +350,7 @@
   {:kind :split :step-id step-id
    :msg-id (:msg-id child) :data-id (:data-id child)
    :parent-msg-ids (vec (:parent-msg-ids child))
-   :tokens (:tokens child) :data (:data child) :at (now)})
+   :data (:data child) :at (now)})
 
 (defn- merge-event [step-id msg-id parents]
   {:kind :merge :step-id step-id :msg-id msg-id
@@ -344,122 +413,107 @@
 ;; Part 3 — Synthesis
 ;;
 ;; After a handler returns, we walk outputs backward through `::parents`
-;; refs to collect the in-handler DAG (topologically ordered). For each
-;; node we compute final tokens = XOR of contributions from its parents:
-;;   - resolvable parent (root or in-handler): contributes its K-way slice
-;;   - external parent: contributes its full :tokens directly
-;; Then we stamp final tokens onto each provisional, strip `::parents`,
-;; and emit :split / :merge trace events in topological order.
+;; refs to enumerate the in-handler DAG and find each emitted draft's
+;; set of "ultimate sources" — the vanilla-message ancestors (the handler
+;; input, or external messages reached via `merge`). Token assignment is
+;; then: for each source S, let K = number of emissions reached from S;
+;; split S.tokens K-ways across those emissions and XOR each slice into
+;; the emission's running total.
+;;
+;; Intermediate drafts (in-handler nodes that are parents-of-outputs
+;; but not themselves emitted) get `:split` / `:merge` trace events for
+;; lineage purposes but do NOT get tokens assigned — tokens live on
+;; wire-format emissions only, and trace events are token-free for
+;; structural `:split` / `:merge` kinds (see Part 2).
+;;
+;; Any assignment that satisfies per-source XOR conservation is valid;
+;; the ultimate-source K-way split is the simplest such assignment.
 ;; ============================================================================
 
 (defn- coerce-bare-outputs
-  "Replace bare-data values in `raw-outputs` with provisional children."
+  "Replace bare-data values in `raw-outputs` with draft children."
   [ctx raw-outputs]
   (mapv (fn [[port v]]
-          (if (provisional? v) [port v] [port (child ctx v)]))
+          (if (draft? v) [port v] [port (child ctx v)]))
         raw-outputs))
 
 (defn- collect-dag
-  "Walk outputs backward through `::parents`. Returns [topo nodes]
-   where topo lists provisional msg-ids in topological order (parents
-   before children) and nodes maps msg-id → provisional."
+  "Walk outputs backward through `::parents`. Returns [topo nodes sources]
+   where topo lists draft msg-ids parents-before-children, nodes
+   maps msg-id → draft, and sources maps msg-id → #{vanilla-msg ...}
+   (its set of ultimate-source ancestors)."
   [outputs]
-  (letfn [(visit [[topo nodes :as acc] node]
+  (letfn [(visit [[topo nodes sources :as acc] node]
             (let [id (:msg-id node)]
               (if (contains? nodes id)
                 acc
-                (let [[topo' nodes'] (reduce visit acc
-                                             (filter provisional? (::parents node)))]
-                  [(conj topo' id) (assoc nodes' id node)]))))]
-    (reduce visit [[] {}] (map second outputs))))
+                (let [[topo' nodes' sources'] (reduce visit acc
+                                                     (filter draft?
+                                                             (::parents node)))
+                      own-sources (reduce (fn [s p]
+                                            (if (draft? p)
+                                              (into s (get sources' (:msg-id p)))
+                                              (conj s p)))
+                                          #{}
+                                          (::parents node))]
+                  [(conj topo' id)
+                   (assoc nodes' id node)
+                   (assoc sources' id own-sources)]))))]
+    (reduce visit [[] {} {}] (map second outputs))))
 
 (defn- synthesize-tokens
-  "Return {msg-id tokens} for every node in `topo`. Uniform rule:
-   tokens = XOR of contributions from every parent. External parents
-   contribute their full :tokens; resolvable parents contribute their
-   K-way slice."
-  [input-msg topo nodes]
-  (let [root-id     (:msg-id input-msg)
-        root-tokens (:tokens input-msg {})
-        resolvable? #(or (= % root-id) (contains? nodes %))
-        children-idx
-        (reduce (fn [acc id]
-                  (reduce (fn [a p]
-                            (cond-> a
-                              (resolvable? (:msg-id p))
-                              (update (:msg-id p) (fnil conj []) id)))
-                          acc
-                          (::parents (nodes id))))
-                {} topo)
-        ;; Seed: root has its tokens; every node starts with the XOR sum
-        ;; of its external parents' tokens (omitted if none).
-        initial
-        (reduce (fn [acc id]
-                  (let [ext (reduce (fn [t p]
-                                      (if (resolvable? (:msg-id p))
-                                        t
-                                        (tok/merge-tokens t (:tokens p {}))))
-                                    {}
-                                    (::parents (nodes id)))]
-                    (cond-> acc (seq ext) (assoc id ext))))
-                {root-id root-tokens}
-                topo)]
-    ;; Distribute: for each resolvable parent, split its tokens K-ways
-    ;; across its resolvable children and XOR-merge each slice in.
-    (reduce
-     (fn [tokens parent-id]
-       (let [kids (get children-idx parent-id)]
-         (if (empty? kids)
-           tokens
-           (let [splits (tok/split-tokens (get tokens parent-id {}) (count kids))]
-             (reduce (fn [t [kid slice]]
-                       (update t kid #(tok/merge-tokens (or % {}) slice)))
-                     tokens
-                     (map vector kids splits))))))
-     initial
-     (cons root-id topo))))
+  "Return {emission-msg-id tokens} by grouping emitted drafts
+   under each of their ultimate sources and splitting each source's
+   tokens K-ways across the emissions that reach it."
+  [outputs sources]
+  (let [emits (keep (fn [[_ v]] (when (draft? v) v)) outputs)
+        by-source (reduce (fn [acc e]
+                            (reduce (fn [a s]
+                                      (update a s (fnil conj []) e))
+                                    acc
+                                    (get sources (:msg-id e))))
+                          {} emits)]
+    (reduce-kv
+     (fn [tokens src emissions]
+       (let [slices (tok/split-tokens (:tokens src {}) (count emissions))]
+         (reduce (fn [t [e slice]]
+                   (update t (:msg-id e) #(tok/merge-tokens (or % {}) slice)))
+                 tokens
+                 (map vector emissions slices))))
+     {} by-source)))
 
 (defn- materialize-msg
-  "Strip the in-memory `::parents` ref, clear metadata, and stamp final
-   `:tokens` (after applying ::extra-tokens / ::drop-tokens stamped by
-   combinators)."
-  [node tokens extra-tokens drop-tokens]
-  (let [tokens'  (tok/merge-tokens tokens (or extra-tokens {}))
-        tokens'' (if (seq drop-tokens) (apply dissoc tokens' drop-tokens) tokens')]
-    (-> node (with-meta nil) (dissoc ::parents) (assoc :tokens tokens''))))
+  "Strip the in-memory `::parents` ref and the `::assoc-tokens` /
+   `::dissoc-tokens` overlays, then stamp final `:tokens` (with those
+   overlays applied)."
+  [node tokens]
+  (let [added    (::assoc-tokens node)
+        dropped  (::dissoc-tokens node)
+        tokens'  (tok/merge-tokens tokens (or added {}))
+        tokens'' (if (seq dropped) (apply dissoc tokens' dropped) tokens')]
+    (-> node
+        (dissoc ::parents ::assoc-tokens ::dissoc-tokens)
+        (assoc :tokens tokens''))))
 
-(defn- emit-event [step-sp step-id node msg]
+(defn- emit-event [step-sp step-id node]
   (if (> (count (::parents node)) 1)
-    (sp-pub step-sp (merge-event step-id (:msg-id msg) (:parent-msg-ids msg)))
-    (sp-pub step-sp (split-event step-id msg))))
+    (sp-pub step-sp (merge-event step-id (:msg-id node) (:parent-msg-ids node)))
+    (sp-pub step-sp (split-event step-id node))))
 
 (defn- process-outputs
   "Post-handler pipeline. Returns `{port [final-msg ...]}` and publishes
    :split / :merge events in topological order."
-  [ctx input-msg raw-outputs]
+  [ctx raw-outputs]
   (let [outputs      (coerce-bare-outputs ctx (or raw-outputs []))
-        [topo nodes] (collect-dag outputs)
-        tokens-by    (synthesize-tokens input-msg topo nodes)
-        meta-by-id   (into {} (keep (fn [[_ prov]]
-                                      (when-let [mm (meta prov)]
-                                        (when (or (::extra-tokens mm)
-                                                  (::drop-tokens mm))
-                                          [(:msg-id prov) mm])))
-                                    outputs))
-        final-by-id  (into {} (map (fn [id]
-                                     (let [n  (nodes id)
-                                           mm (meta-by-id id)]
-                                       [id (materialize-msg n
-                                                            (tokens-by id {})
-                                                            (::extra-tokens mm)
-                                                            (::drop-tokens mm))])))
-                           topo)
+        [topo nodes sources] (collect-dag outputs)
+        tokens-by    (synthesize-tokens outputs sources)
         step-sp      (:pubsub ctx)
         step-id      (:step-id ctx)]
     (doseq [id topo]
-      (emit-event step-sp step-id (nodes id) (final-by-id id)))
+      (emit-event step-sp step-id (nodes id)))
     (reduce (fn [acc [port prov]]
-              (update acc port (fnil conj []) (final-by-id (:msg-id prov))))
+              (let [final (materialize-msg prov (tokens-by (:msg-id prov) {}))]
+                (update acc port (fnil conj []) final)))
             {} outputs)))
 
 ;; ============================================================================
@@ -498,7 +552,7 @@
         ([s in-port m]
          (let [ctx      (assoc factory-ctx :in-port in-port :msg m)
                [s' raw] (handler ctx s (:data m))]
-           [s' (process-outputs ctx m raw)]))))))
+           [s' (process-outputs ctx raw)]))))))
 
 (defn proc
   "Low-level: wrap a raw core.async.flow factory `(fn [ctx] step-fn)`
@@ -616,8 +670,7 @@
             (let [gid    [group-id (:msg-id (:msg ctx))]
                   values (tok/split-value 0 n)
                   kids   (children ctx (repeat n d))
-                  kids'  (mapv (fn [k v]
-                                 (vary-meta k assoc ::extra-tokens {gid v}))
+                  kids'  (mapv (fn [k v] (assoc-tokens k {gid v}))
                                kids values)]
               [s (mapv (fn [k] [:out k]) kids')]))))))
 
@@ -641,7 +694,7 @@
                                 (update :msgs conj m))]
                    (if (zero? (long (:value grp')))
                      (let [merged (-> (merge ctx (:msgs grp') (mapv :data (:msgs grp')))
-                                      (vary-meta assoc ::drop-tokens #{gid}))]
+                                      (dissoc-tokens [gid]))]
                        [(update s' :groups dissoc gid)
                         (conj output [:out merged])])
                      [(assoc-in s' [:groups gid] grp') output])))
@@ -713,15 +766,20 @@
 
          (signal? m)
          (let [_         (sp-pub step-sp (recv-event trace-sid :signal m))
-               out-ports (vec (keys outs))
-               n         (count out-ports)]
-           (if (pos? n)
-             (let [kids     (split-across-children (:msg-id m) (:tokens m) n)
-                   forwards (zipmap out-ports (map vector kids))]
-               (doseq [[p [sig]] forwards]
-                 (sp-pub step-sp (send-out-event trace-sid :signal p sig)))
-               (sp-pub step-sp (success-event trace-sid :signal m))
-               [s forwards])
+               out-ports (vec (keys outs))]
+           (if (seq out-ports)
+             (try
+               (let [ctx      {:pubsub step-sp :step-id trace-sid :msg m}
+                     raw      (mapv (fn [p] [p (signal ctx)]) out-ports)
+                     port-map (process-outputs ctx raw)]
+                 (doseq [[port msgs] port-map
+                         msg msgs]
+                   (sp-pub step-sp (send-out-event trace-sid :signal port msg)))
+                 (sp-pub step-sp (success-event trace-sid :signal m))
+                 [s port-map])
+               (catch Throwable ex
+                 (sp-pub step-sp (failure-event trace-sid m ex))
+                 [s {}]))
              (do
                (sp-pub step-sp (success-event trace-sid :signal m))
                [s {}])))
@@ -1008,7 +1066,7 @@
   "Convenience: start, inject one message, wait for quiescence, stop."
   [step opts]
   (let [handle (start! step (select-keys opts [:pubsub :flow-id :subscribers]))]
-    (inject! handle (select-keys opts [:in :port :data]))
+    (inject! handle (select-keys opts [:in :port :data :tokens]))
     (let [signal (await-quiescent! handle)]
       (-> (stop! handle)
           (assoc :state (if (= :quiescent signal) :completed :failed))))))
