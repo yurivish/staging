@@ -11,11 +11,12 @@
    `nil` is a valid data value; envelope kind is structural, not a
    sentinel. Token conservation laws are XOR-based (see `token.clj`).
 
-   Handlers do not construct messages directly. They return **drafts**
-   built by the free-algebra constructors below (`child`, `children`,
-   `pass`, `signal`, `merge`). Each draft carries an in-memory
-   `::parents` ref to its direct parents (real messages or other
-   drafts). The drafts form a DAG whose leaves are the handler's input
+   Handlers return outputs in a per-port map. Each output is either a
+   **draft** (built by the free-algebra constructors below — `child`,
+   `children`, `pass`, `signal`, `merge`) or a plain value that gets
+   auto-wrapped as a `child` of the input message. Drafts carry an
+   in-memory `::parents` ref to their direct parents (real messages or
+   other drafts), forming a DAG whose leaves are the handler's input
    messages.
 
    `synthesize` is a single pure fold over that DAG. For each leaf,
@@ -137,8 +138,8 @@
     (into #{} (mapcat leaves-of) (::parents d))
     #{d}))
 
-(defn- coerce-bare
-  "Replace bare output values with `child` drafts of `parent-msg`."
+(defn- coerce-plain
+  "Replace plain output values with `child` drafts of `parent-msg`."
   [outputs parent-msg]
   (mapv (fn [[port v]]
           (if (draft? v) [port v] [port (child nil parent-msg v)]))
@@ -177,15 +178,15 @@
 (defn synthesize
   "Post-handler fold. Pure.
 
-   `outputs`    : {port [draft-or-bare ...]}
-   `input-msg`  : the message that triggered the handler (parent for bare values)
+   `outputs`    : {port [draft-or-plain ...]}
+   `input-msg`  : the message that triggered the handler (parent for plain values)
    `step-id`    : trace subject for generated events
 
    Returns [msgs-per-port events]
      msgs-per-port : {port [concrete-msg ...]}
      events        : [split-or-merge-event ...]"
   [outputs input-msg step-id]
-  (let [pairs       (coerce-bare (flatten-outputs outputs) input-msg)
+  (let [pairs       (coerce-plain (flatten-outputs outputs) input-msg)
         leaf-sets   (into {}
                           (map (fn [[_ d]] [(:msg-id d) (leaves-of d)]))
                           pairs)

@@ -58,3 +58,42 @@
                          [(assoc-in s' [:groups gid] grp') output])))
                    [s {}]
                    gids))))))
+
+(defn workers
+  "K parallel copies of `inner` behind a round-robin router.
+
+   Each worker runs in its own proc (core.async.flow gives each proc one
+   thread), so per-message parallelism is real. Per-worker trace scopes
+   (<id>.w0, <id>.w1, ...) surface utilization and latency directly in
+   the event stream. Backpressure arrives via channel buffers — a slow
+   worker blocks the router only on its own port.
+
+   `inner` may be an arrow or a step (any shape; internal sids are
+   prefixed per-worker so state is isolated)."
+  ([k inner]     (workers (gensym "workers-") k inner))
+  ([id k inner]
+   (assert (pos-int? k) "workers: k must be a positive integer")
+   (let [nm        #(keyword (str (name id) "." %))
+         ws        (mapv #(nm (str "w" %)) (range k))
+         router-id (nm "router")
+         join-id   (nm "join")
+         join-ins  (mapv #(keyword (str "in" %)) (range k))
+         route     (fn [ctx s draft-fn]
+                     (let [i (mod (long (:i s 0)) k)]
+                       [(assoc s :i (unchecked-inc (long i)))
+                        {(ws i) [(draft-fn ctx)]}]))
+         router    (step/leaf-proc
+                    {:ports     {:ins {:in ""} :outs (zipmap ws (repeat ""))}
+                     :on-data   (fn [ctx s _d] (route ctx s msg/pass))
+                     :on-signal (fn [ctx s]    (route ctx s msg/signal))})
+         join      (step/leaf-proc
+                    {:ports   {:ins (zipmap join-ins (repeat "")) :outs {:out ""}}
+                     :on-data (fn [ctx _s _d] {:out [(msg/pass ctx)]})})
+         procs     (clojure.core/merge
+                    {router-id router join-id join}
+                    (zipmap ws (repeat inner)))
+         conns     (vec (mapcat (fn [i w]
+                                  [[[router-id w] [w :in]]
+                                   [[w :out]      [join-id (join-ins i)]]])
+                                (range) ws))]
+     {:procs procs :conns conns :in router-id :out join-id})))

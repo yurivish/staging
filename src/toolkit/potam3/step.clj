@@ -1,36 +1,38 @@
 (ns toolkit.potam3.step
-  "Step arrows + composition. Pure, no runtime.
-
-   An **arrow** is a plain map with three callable slots:
-
-     {:on-data       (fn [ctx state data] → return)
-      :on-signal     (fn [ctx state]      → return)   ; default: broadcast
-      :on-all-closed (fn [ctx state]      → return)   ; default: emit nothing
-      :ports         {:ins {port-kw doc} :outs {port-kw doc}}}
-
-   Handler return is one of:
-     • {port [draft-or-bare ...]}                — no state change
-     • [state' {port [draft-or-bare ...]}]        — state updated
-
-   Drafts come from `toolkit.potam3.msg`. Bare values are automatically
-   wrapped as `child` drafts of the input message during synthesis.
+  "Steps + composition. Pure, no runtime.
 
    A **step** is a wiring container:
 
-     {:procs {sid arrow-or-step}   ; subflows compose recursively
+     {:procs {sid handler-map-or-step}   ; nested steps compose recursively
       :conns [[[from-sid port] [to-sid port]] ...]
       :in    sid-or-[sid port]
       :out   sid-or-[sid port]}
 
-   A single-arrow step is still a step. All composition operators return
-   steps. Nothing here touches pubsub or core.async."
+   Most users build steps with `step/step` (1-proc) and compose them with
+   `serial`, `merge-steps`, `connect`, `input-at`, `output-at`, and
+   `as-step`. The handler function you pass to `step/step` has signature
+   `(fn [ctx state data] → return)` and returns one of:
+
+     • {port [draft-or-plain ...]}                 ; no state change
+     • [state' {port [draft-or-plain ...]}]        ; state updated
+
+   Drafts come from `toolkit.potam3.msg`. Plain values auto-wrap as
+   `child` drafts of the input message during synthesis.
+
+   Under the hood, each leaf entry in `:procs` is a map with three
+   callable slots — `:on-data`, `:on-signal`, `:on-all-closed` — plus
+   `:ports`. `step/step` fills in sensible defaults for signal/done
+   handling; construct the map by hand only when you need custom
+   behavior there (Tier-3).
+
+   Nothing in this namespace touches pubsub or core.async."
   (:require [toolkit.potam3.msg :as msg]))
 
 ;; ============================================================================
-;; Arrow defaults
+;; Default signal / all-closed handlers
 ;; ============================================================================
 ;;
-;; The interpreter calls these when the arrow doesn't supply a custom version.
+;; The interpreter uses these when a leaf proc map doesn't supply its own.
 ;; They read the current port spec from ctx (:ins / :outs), which the
 ;; interpreter injects before every call.
 
@@ -44,24 +46,26 @@
   [_ctx _state]
   {})
 
-(defn- ensure-defaults [arrow]
-  (cond-> arrow
-    (nil? (:on-signal arrow))     (assoc :on-signal default-on-signal)
-    (nil? (:on-all-closed arrow)) (assoc :on-all-closed default-on-all-closed)))
+(defn- ensure-defaults [m]
+  (cond-> m
+    (nil? (:on-signal m))     (assoc :on-signal default-on-signal)
+    (nil? (:on-all-closed m)) (assoc :on-all-closed default-on-all-closed)))
 
 ;; ============================================================================
 ;; Predicates
 ;; ============================================================================
 
-(defn arrow? [v] (and (map? v) (contains? v :on-data) (contains? v :ports)))
-(defn step?  [v] (and (map? v) (contains? v :procs)   (contains? v :conns)))
+(defn leaf-proc? [v] (and (map? v) (contains? v :on-data) (contains? v :ports)))
+(defn step?      [v] (and (map? v) (contains? v :procs)   (contains? v :conns)))
 
 ;; ============================================================================
-;; Arrow + step constructors
+;; Leaf-proc + step constructors
 ;; ============================================================================
 
-(defn arrow
-  "Build an arrow from a partial spec, filling in defaults."
+(defn leaf-proc
+  "Build a leaf proc map from a partial spec, filling in defaults.
+   Tier-3 escape hatch: use this when you need a custom :on-signal or
+   :on-all-closed. For ordinary handlers, prefer `step`."
   [m]
   (ensure-defaults
    (cond-> m
@@ -80,25 +84,25 @@
      (step id ports handler)
        ports   = {:ins {port-kw doc} :outs {port-kw doc}}  ; nil ⇒ defaults
        handler = (fn [ctx state data] → return)
-       return  = {port [draft-or-bare ...]}        ; no state change
-               | [state' {port [draft-or-bare ...]}] ; state updated"
+       return  = {port [draft-or-plain ...]}        ; no state change
+               | [state' {port [draft-or-plain ...]}] ; state updated"
   ([id f]
    (step id nil (fn [_ctx _s d] {:out [(f d)]})))
   ([id ports handler]
-   (mk-step id (arrow (cond-> {:on-data handler}
-                        ports (assoc :ports ports))))))
+   (mk-step id (leaf-proc (cond-> {:on-data handler}
+                            ports (assoc :ports ports))))))
 
 (defn sink
   "Terminal step — consumes input, emits nothing."
   ([] (sink :sink))
   ([id]
-   (mk-step id (arrow {:on-data (fn [_ctx _s _d] {})
-                       :ports   {:ins {:in ""} :outs {}}}))))
+   (mk-step id (leaf-proc {:on-data (fn [_ctx _s _d] {})
+                           :ports   {:ins {:in ""} :outs {}}}))))
 
 (defn passthrough
   "Forward data unchanged, preserving :data-id through lineage."
   [id]
-  (mk-step id (arrow {:on-data (fn [ctx _s _d] {:out [(msg/pass ctx)]})})))
+  (mk-step id (leaf-proc {:on-data (fn [ctx _s _d] {:out [(msg/pass ctx)]})})))
 
 (defn as-step
   "Wrap any step into a single-entry step under `id`. Use to give a subflow

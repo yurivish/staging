@@ -5,7 +5,7 @@
    This is the only namespace that requires `core.async.flow`.
 
    Responsibilities:
-     * `run-step`   — pure dispatch: envelope → arrow → synthesis → events.
+     * `run-step`   — pure dispatch: envelope → handler → synthesis → events.
      * `proc-fn`    — adapter to core.async.flow's 4-arity proc-fn shape.
      * `instrument-flow` — inline subflows, resolve endpoints, wrap procs.
      * `start!` / `inject!` / `stop!` / `await-quiescent!` / `run!` / `run-seq`.
@@ -59,13 +59,13 @@
   (if (vector? ret) [(first ret) (second ret)] [s ret]))
 
 (defn- run-data-or-signal
-  "Data and signal share a code path. Both call the arrow, synthesize,
-   validate, and collect events."
-  [arrow m s ctx trace-sid outs kind]
+  "Data and signal share a code path. Both call the leaf-proc handler,
+   synthesize, validate, and collect events."
+  [leaf m s ctx trace-sid outs kind]
   (try
     (let [ret                  (case kind
-                                 :signal ((:on-signal arrow) ctx s)
-                                 :data   ((:on-data   arrow) ctx s (:data m)))
+                                 :signal ((:on-signal leaf) ctx s)
+                                 :data   ((:on-data   leaf) ctx s (:data m)))
           [s' drafts]          (normalize-return s ret)
           [port-map synth-evs] (msg/synthesize drafts m trace-sid)
           _                    (validate-ports! trace-sid port-map outs)
@@ -82,12 +82,12 @@
   "Done cascade: track closed-ins in framework state. When all inputs are
    closed, call :on-all-closed (drain hook), then forward (new-done) on
    every output port."
-  [arrow m ctx s trace-sid ins outs]
+  [leaf m ctx s trace-sid ins outs]
   (let [closed  (conj (::closed-ins s #{}) (:in-port ctx))
         all-ins (set (keys ins))]
     (if (= closed all-ins)
       (try
-        (let [ret                  ((:on-all-closed arrow) ctx s)
+        (let [ret                  ((:on-all-closed leaf) ctx s)
               [s' drafts]          (normalize-return s ret)
               [synth-pm synth-evs] (msg/synthesize drafts m trace-sid)
               port-map             (reduce (fn [pm p]
@@ -111,24 +111,24 @@
 (defn run-step
   "Pure dispatch. Returns [new-state port-map events].
    Never throws (user exceptions become :failure events)."
-  [arrow m in-port s trace-sid step-sp cancel-p]
-  (let [ins  (-> arrow :ports :ins)
-        outs (-> arrow :ports :outs)
+  [leaf m in-port s trace-sid step-sp cancel-p]
+  (let [ins  (-> leaf :ports :ins)
+        outs (-> leaf :ports :outs)
         ctx  (mk-ctx step-sp trace-sid cancel-p in-port m ins outs)]
     (case (msg/envelope-kind m)
-      :done   (run-done               arrow m ctx s trace-sid ins outs)
-      :signal (run-data-or-signal     arrow m s ctx trace-sid outs :signal)
-      :data   (run-data-or-signal     arrow m s ctx trace-sid outs :data))))
+      :done   (run-done               leaf m ctx s trace-sid ins outs)
+      :signal (run-data-or-signal     leaf m s ctx trace-sid outs :signal)
+      :data   (run-data-or-signal     leaf m s ctx trace-sid outs :data))))
 
 ;; ============================================================================
 ;; proc-fn — the core.async.flow 4-arity adapter
 ;; ============================================================================
 
 (defn- proc-fn
-  "Adapt an arrow to a 4-arity core.async.flow proc-fn. All publishing
-   happens here; arrows are pure."
-  [arrow trace-sid step-sp cancel-p]
-  (let [ports (:ports arrow)
+  "Adapt a leaf-proc map to a 4-arity core.async.flow proc-fn. All publishing
+   happens here; the leaf-proc map is pure."
+  [leaf trace-sid step-sp cancel-p]
+  (let [ports (:ports leaf)
         ins   (:ins ports)
         outs  (:outs ports)]
     (fn
@@ -136,7 +136,7 @@
       ([_]     {})
       ([s _]   s)
       ([s in-port m]
-       (let [[s' port-map events] (run-step arrow m in-port s trace-sid step-sp cancel-p)]
+       (let [[s' port-map events] (run-step leaf m in-port s trace-sid step-sp cancel-p)]
          (doseq [e events] (trace/sp-pub step-sp e))
          [s' port-map])))))
 
@@ -198,7 +198,7 @@
                           (update :inner-conns into conns)
                           (assoc-in [:aliases sid] {:in in :out out})))
 
-                    (step/arrow? p)
+                    (step/leaf-proc? p)
                     (let [step-sp (update outer-sp :prefix conj [:step sid])
                           wrapped (proc-fn p sid step-sp cancel-p)]
                       (assoc-in acc [:procs sid] wrapped))
@@ -320,11 +320,14 @@
       ::port-index  port-index})))
 
 (defn inject!
-  "Seed a message into the running step. Returns the handle.
+  "Route a work item into the running step. Returns the handle.
+
+   Long-running use: call repeatedly to route items in as they arrive;
+   observe via counters/events/pubsub; `stop!` when done.
 
    Opts:
      :in    — step id or [step-id port] to target (defaults to flow's :in)
-     :port  — override the port (when :in is bare sid)
+     :port  — override the port (when :in is a bare sid)
      :data  — data value; presence ⇒ data envelope
      :tokens — token map; presence without :data ⇒ signal envelope
      (neither) ⇒ done marker"
@@ -347,7 +350,7 @@
                                       {:step flow-in :port port :declared (:ins step-ports)})))
         has-data?           (contains? opts :data)
         has-tokens?         (contains? opts :tokens)
-        seed                (cond
+        item                (cond
                               has-data?
                               (cond-> (msg/new-msg (:data opts))
                                 has-tokens? (assoc :tokens (:tokens opts)))
@@ -361,15 +364,15 @@
         msg-kind            (cond has-data? :data has-tokens? :signal :else :done)]
     (swap! done-p (fn [p] (if (realized? p) (promise) p)))
     (swap! counters update :sent inc)
-    (pubsub/pub pubsub (trace/run-subject-for scope :seed)
-                (cond-> {:kind :seed :msg-kind msg-kind
+    (pubsub/pub pubsub (trace/run-subject-for scope :inject)
+                (cond-> {:kind :inject :msg-kind msg-kind
                          :flow-path [fid] :scope scope
-                         :msg-id (:msg-id seed)
+                         :msg-id (:msg-id item)
                          :in flow-in :port port
                          :at (System/currentTimeMillis)}
-                  has-data?   (assoc :data-id (:data-id seed))
-                  has-tokens? (assoc :tokens  (:tokens seed))))
-    @(flow/inject graph [flow-in port] [seed])
+                  has-data?   (assoc :data-id (:data-id item))
+                  has-tokens? (assoc :tokens  (:tokens item))))
+    @(flow/inject graph [flow-in port] [item])
     handle))
 
 (defn counters   [handle] @(::counters handle))
@@ -419,16 +422,16 @@
                (swap! a conj {:msg-id (:msg-id (:msg ctx)) :data d})
                {})))
 
-(defn- seed-attribution
-  "Forward pass over time-ordered events. Returns {msg-id #{seed-idx ...}}."
-  [events seed->idx]
+(defn- inject-attribution
+  "Forward pass over time-ordered events. Returns {msg-id #{inject-idx ...}}."
+  [events inject->idx]
   (reduce (fn [acc ev]
             (case (:kind ev)
-              :seed
-              (update acc (:msg-id ev) (fnil conj #{}) (seed->idx (:msg-id ev)))
+              :inject
+              (update acc (:msg-id ev) (fnil conj #{}) (inject->idx (:msg-id ev)))
               (:split :merge :send-out)
-              (let [parent-seeds (reduce set/union #{} (map acc (:parent-msg-ids ev)))]
-                (update acc (:msg-id ev) (fnil set/union #{}) parent-seeds))
+              (let [parent-injects (reduce set/union #{} (map acc (:parent-msg-ids ev)))]
+                (update acc (:msg-id ev) (fnil set/union #{}) parent-injects))
               acc))
           {} events))
 
@@ -449,14 +452,14 @@
              result    (-> (stop! handle)
                            (assoc :state (if (= :quiescent signal) :completed :failed))
                            (cond-> (vector? signal) (assoc :error (second signal))))
-             evs       (:events result)
-             seed-ids  (mapv :msg-id (filter #(= :seed (:kind %)) evs))
-             seed->idx (zipmap seed-ids (range))
-             seed-map  (seed-attribution evs seed->idx)
-             outputs   (reduce (fn [acc {:keys [msg-id data]}]
-                                 (reduce (fn [a s] (update a s conj data))
-                                         acc
-                                         (seed-map msg-id)))
+             evs         (:events result)
+             inject-ids  (mapv :msg-id (filter #(= :inject (:kind %)) evs))
+             inject->idx (zipmap inject-ids (range))
+             attribution (inject-attribution evs inject->idx)
+             outputs     (reduce (fn [acc {:keys [msg-id data]}]
+                                   (reduce (fn [a s] (update a s conj data))
+                                           acc
+                                           (attribution msg-id)))
                                (vec (repeat (count coll) []))
                                @collected)]
          (assoc result :outputs outputs))))))
