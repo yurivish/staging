@@ -2,7 +2,7 @@
   "Trace events + scoped pubsub + counters.
 
    Events are plain maps keyed on two axes: :kind (lifecycle role —
-   :recv :success :failure :send-out :split :merge :seed :flow-error
+   :recv :success :failure :send-out :split :merge :inject :flow-error
    :run-started) × :msg-kind (envelope type — :data :signal :done).
    Subjects use :kind only. Consumers filter on :msg-kind in the handler.
 

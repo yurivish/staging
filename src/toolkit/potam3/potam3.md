@@ -180,7 +180,7 @@ Everything else in the file is glue around these.
 
 Forget the code for a moment. Here's the entire machine in one paragraph.
 
-> You have a labeled DAG of **steps**. Each step is a state-ful arrow: it eats a message envelope and spits out (new state, outputs per port). Messages carry two decorations: **lineage** (which messages are my parents?) and **tokens** (an abelian-group element per coordination group — XOR on u64). The token invariant is that every step preserves group-XOR mass from input to output. Outputs aren't built directly; they're **drafts** — terms in a tiny free algebra (`child`, `children`, `pass`, `signal`, `merge`) whose leaves are the step's actual input messages. After the arrow runs, a single pure **synthesis** fold walks each draft to its leaves, counts how many drafts reference each leaf, splits that leaf's tokens K-ways, and XOR-merges the slices back into the drafts. The result is a concrete message per draft, ready to flow on its port.
+> You have a labeled DAG of **steps**. Each step is a state-ful transformer: it eats a message envelope and spits out (new state, outputs per port). Messages carry two decorations: **lineage** (which messages are my parents?) and **tokens** (an abelian-group element per coordination group — XOR on u64). The token invariant is that every step preserves group-XOR mass from input to output. Outputs aren't built directly; they're **drafts** — terms in a tiny free algebra (`child`, `children`, `pass`, `signal`, `merge`) whose leaves are the step's actual input messages. After the handler runs, a single pure **synthesis** fold walks each draft to its leaves, counts how many drafts reference each leaf, splits that leaf's tokens K-ways, and XOR-merges the slices back into the drafts. The result is a concrete message per draft, ready to flow on its port.
 
 That's it. A state monad over a writer over a free algebra with a fold. Channels, pubsub, core.async are **how**; they aren't **what**.
 
@@ -214,7 +214,7 @@ An atom is there because the current shape lifts this concern *above* user state
 
 ### G3. Tracing is a side-effecting printf, not a writer log.
 
-The algebra says: each arrow returns `(s', drafts, events)`. Events accumulate purely; the interpreter publishes them at the edge.
+The algebra says: each handler-map slot returns `(s', drafts, events)`. Events accumulate purely; the interpreter publishes them at the edge.
 
 The code says: every phase boundary calls `sp-pub` directly — there are ~15 `sp-pub` calls spread across `wrap-proc`, `process-outputs`, `emit-event`, and lifecycle functions. This means:
 - The "pure" synthesis pass (`process-outputs`, line 506) actually has side effects (emits `:split`/`:merge` via `emit-event` at line 501).
@@ -230,18 +230,18 @@ A writer-log encoding returns `(drafts, [events])` from synthesis and lets the i
 - `handler-factory` fn: `([] spec) ([_] {}) ([s _] s) ([s in-port m] ...)`
 - `wrap-proc` fn: `([] (inner)) ([arg] (inner arg)) ([s arg] (inner s arg)) ([s in-id m] ...)` — three pure forwarding arities (763-765) because the outer wrapper duplicates the shape.
 
-The forwarding arities are not doing any work. They exist because the code is expressed as "wrapper around wrapper." A single function that takes `(id, ports, arrow, ctx)` and directly produces the 4-arity proc-fn erases them.
+The forwarding arities are not doing any work. They exist because the code is expressed as "wrapper around wrapper." A single function that takes `(id, ports, handler-map, ctx)` and directly produces the 4-arity proc-fn erases them.
 
 ### G5. Two-pass synthesis where one fold suffices.
 
 `process-outputs` (506) does this:
-1. `coerce-bare-outputs` — normalize bare values to drafts.
+1. `coerce-plain-outputs` — normalize plain values to drafts.
 2. `collect-dag` (447) — backward walk to produce `[topo nodes sources]`.
 3. `synthesize-tokens` (471) — iterate by source, split K-ways, merge slices into drafts.
 4. `materialize-msg` — strip refs, apply stamped metadata.
 5. `emit-event` — side-effect per node.
 
-The algebra is: one backward fold from drafts to sources, assigning tokens during the walk using out-degree at each branch. Steps 2 + 3 are two passes over the same tree returning intermediates that feed each other; they can be one pass. Step 5 is a writer log (G3). Step 1 is sugar that could move into draft constructors (bare values become `child` drafts at construction, not coercion time).
+The algebra is: one backward fold from drafts to sources, assigning tokens during the walk using out-degree at each branch. Steps 2 + 3 are two passes over the same tree returning intermediates that feed each other; they can be one pass. Step 5 is a writer log (G3). Step 1 is sugar that could move into draft constructors (plain values become `child` drafts at construction, not coercion time).
 
 ## The Feynman-sparse form
 
@@ -276,7 +276,7 @@ Here's the whole machine in ~60 lines of pseudo-Clojure, with every piece of gun
                        (xor-split (:tokens src) (out-degree src))))]
         [port (materialize draft tokens) (split-event ...)]))))
 
-;; -- Step arrow: three fields, defaults for two ---------------------
+;; -- Step handler-map: five slots, defaults for four -----------------
 
 {:on-data   (fn [ctx s data] ...user...)
  :on-signal (fn [ctx s]      [s (for [p outs] [p (signal-d (:msg ctx))]) []])
@@ -289,21 +289,21 @@ Here's the whole machine in ~60 lines of pseudo-Clojure, with every piece of gun
 
 ;; -- Interpreter: core.async.flow adapter ---------------------------
 
-(defn run-step [arrow envelope s]
+(defn run-step [hmap envelope s]
   (let [dispatch     (case (kind-of envelope)
-                       :data   #(:on-data   arrow ctx s (:data envelope))
-                       :signal #(:on-signal arrow ctx s)
-                       :done   #(:on-done   arrow ctx s (:port envelope)))
+                       :data   #(:on-data   hmap ctx s (:data envelope))
+                       :signal #(:on-signal hmap ctx s)
+                       :done   #(:on-done   hmap ctx s (:port envelope)))
         [s' drafts evs1]      (dispatch)
         [concrete evs2]       (synthesize drafts (:tokens envelope))]
     [s' concrete (concat evs1 evs2)]))
 
-(defn proc-fn [arrow pubsub]
-  (fn ([]      {:params {} :ins (-> arrow :ports :ins) :outs (-> arrow :ports :outs)})
+(defn proc-fn [hmap pubsub]
+  (fn ([]      {:params {} :ins (-> hmap :ports :ins) :outs (-> hmap :ports :outs)})
       ([_]     {})
       ([s _]   s)
       ([s port m]
-       (let [[s' outs events] (run-step arrow (envelope-of port m) s)]
+       (let [[s' outs events] (run-step hmap (envelope-of port m) s)]
          (doseq [e events] (sp-pub pubsub e))
          [s' outs]))))
 ```
@@ -314,7 +314,7 @@ What disappeared: `handler-factory`, `wrap-proc` cond, the `done-ins` atom, `spl
 
 - **Reactive signals.** A user who wants to flush a buffer on a tick supplies `:on-signal`. Today that requires raw `proc` and reimplementing envelope dispatch.
 - **Participating in done.** `:on-done` can drain pending state (e.g., emit a final partial batch) instead of the framework dropping it. This is what combinators.clj's `batch` wants and can't have.
-- **Pure testing of step arrows.** `(run-step arrow envelope state)` is a pure function. No flow, no pubsub, no core.async. You drive it with synthetic envelopes and check the returned tuple.
+- **Pure testing of handler-maps.** `(run-step hmap envelope state)` is a pure function. No flow, no pubsub, no core.async. You drive it with synthetic envelopes and check the returned tuple.
 - **Pure testing of synthesis.** `(synthesize drafts input-tokens)` is a pure function over the free algebra. Property tests become trivial.
 - **One place to look for the interpreter.** When something goes wrong at runtime, there is exactly one function that does dispatch + tracing + lifecycle. Not three.
 
@@ -344,7 +344,7 @@ Four files + one unchanged. Each has a clearly defined algebraic role; nothing c
 
 1. `token.clj` → keep as-is.
 2. `msg.clj` → envelope + free algebra + synthesis. Unit-test the three token conservation laws as property tests over randomized draft forests. No core.async anywhere.
-3. `step.clj` → the arrow record, composition, defaults. Drive it with synthetic envelopes and the pure `synthesize` to confirm behavior end-to-end without a flow.
+3. `step.clj` → the handler-map record, composition, defaults. Drive it with synthetic envelopes and the pure `synthesize` to confirm behavior end-to-end without a flow.
 4. `trace.clj` → drop-in for event constructors and pubsub scoping.
 5. `flow.clj` → interpreter. Port `start!`/`inject!`/`stop!`/`await-quiescent!`/`run!`/`run-seq`. This is the only place effects live.
 6. Combinators: `fan-out` and `fan-in` are primitives (they exercise the token algebra in user-visible ways); `router`, `retry`, `fcatch` move to a `recipes.md` because they're ≤6-line patterns, not framework features.
