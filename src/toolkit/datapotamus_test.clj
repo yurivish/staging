@@ -1232,14 +1232,14 @@
         h  (start! wf)]
     (try
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"unknown step :nonexistent"
+                            #"unknown step \[:nonexistent\]"
                             (flow/inject! h {:in :nonexistent :data 1})))
       (testing "ex-info's :known carries the actual sids for helpful debugging"
         (try
           (flow/inject! h {:in :nonexistent :data 1})
           (catch clojure.lang.ExceptionInfo e
-            (is (contains? (:known (ex-data e)) :a))
-            (is (contains? (:known (ex-data e)) :sink)))))
+            (is (contains? (:known (ex-data e)) [:a]))
+            (is (contains? (:known (ex-data e)) [:sink])))))
       (finally (stop! h)))))
 
 ;; inject! rejects an unknown port on a known step; ex-data lists declared ports.

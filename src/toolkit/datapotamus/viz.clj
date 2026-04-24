@@ -122,13 +122,10 @@
 ;;
 ;; Events tell us what handlers are doing; they don't show messages sitting
 ;; in core.async channels between procs. `flow/ping` does — each proc
-;; reports `:ins` with buffer counts. We periodically ping, map runtime
-;; proc sids (dot-mangled) back onto topology paths, and stash the sum of
-;; input buffer counts per path under `:queues`.
+;; reports `:ins` with buffer counts. We periodically ping and stash the
+;; sum of input buffer counts per topology path under `:queues`. Runtime
+;; proc ids ARE topology paths (vectors of keyword sids).
 ;; ============================================================================
-
-(defn- proc-sid->path [sid]
-  (mapv keyword (str/split (name sid) #"\.")))
 
 (defn- sum-in-buffers [proc-info]
   (reduce-kv
@@ -142,10 +139,10 @@
    result. Only paths with non-zero queue are stored."
   [flow-state ping]
   (let [queues (reduce-kv
-                (fn [acc sid proc]
+                (fn [acc path proc]
                   (let [q (sum-in-buffers (dat/datafy proc))]
                     (if (pos? q)
-                      (assoc acc (proc-sid->path sid) q)
+                      (assoc acc path q)
                       acc)))
                 {}
                 ping)]

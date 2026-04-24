@@ -172,49 +172,48 @@
 ;; Instrumentation — subflow inlining + endpoint resolution
 ;; ============================================================================
 
-(defn- prefix-sid [prefix sid]
-  (keyword (str (name prefix) "." (name sid))))
+;; Post-instrumentation, every proc id is a path vector ([:foo] for top-level,
+;; [:bar :foo] for nested) and every conn endpoint / boundary ref is uniformly
+;; [path port]. User-facing step data still uses keyword sids; normalize-ref
+;; converts at the boundary.
 
-(defn- prefix-endpoint [prefix [sid port]]
-  [(prefix-sid prefix sid) port])
-
-(defn- prefix-ref [prefix ref]
+(defn- normalize-ref
+  "User-form ref (kw | [kw port] | [path port]) → [path port]."
+  [ref default-port]
   (if (vector? ref)
-    [(prefix-sid prefix (first ref)) (second ref)]
-    (prefix-sid prefix ref)))
+    (let [[s p] ref] [(if (vector? s) s [s]) p])
+    [[ref] default-port]))
+
+(defn- prefix-endpoint [outer-sid [path port]]
+  [(into [outer-sid] path) port])
 
 (declare instrument-flow)
 
-(defn- inline-subflow [sid subflow outer-sp cancel-p counters done-p]
-  (let [inner-sp      (trace/push-scope outer-sp [:flow (name sid)])
-        inner-inst    (instrument-flow subflow inner-sp cancel-p counters done-p)
-        renamed-procs (into {}
-                            (for [[k v] (:procs inner-inst)]
-                              [(prefix-sid sid k) v]))
-        renamed-conns (mapv (fn [[from to opts]]
-                              (cond-> [(prefix-endpoint sid from)
-                                       (prefix-endpoint sid to)]
-                                opts (conj opts)))
-                            (:conns inner-inst))
-        in-ref        (prefix-ref sid (:in inner-inst))
-        out-ref       (prefix-ref sid (or (:out inner-inst) (:in inner-inst)))]
-    {:procs renamed-procs :conns renamed-conns :in in-ref :out out-ref}))
+(defn- inline-subflow [outer-sid subflow outer-sp cancel-p counters done-p]
+  (let [inner-sp (trace/push-scope outer-sp [:flow (name outer-sid)])
+        inner    (instrument-flow subflow inner-sp cancel-p counters done-p)]
+    {:procs (update-keys (:procs inner) #(into [outer-sid] %))
+     :conns (mapv (fn [[from to opts]]
+                    (cond-> [(prefix-endpoint outer-sid from)
+                             (prefix-endpoint outer-sid to)]
+                      opts (conj opts)))
+                  (:conns inner))
+     :in    (prefix-endpoint outer-sid (:in inner))
+     :out   (prefix-endpoint outer-sid (or (:out inner) (:in inner)))}))
 
-(defn- resolve-endpoint [aliases which [sid port]]
-  (if-let [a (get aliases sid)]
-    (let [target (get a which)]
-      (if (vector? target) target [target port]))
-    [sid port]))
-
-(defn- resolve-flow-ref [ref aliases which]
-  (let [sid (if (vector? ref) (first ref) ref)]
-    (if-let [a (get aliases sid)]
-      (get a which)
-      ref)))
+(defn- resolve-ref
+  "Look up a normalized [path port] endpoint against the alias map keyed by
+   the bare outer sid. Returns the alias's [path port] resolution or the
+   endpoint unchanged."
+  [aliases which [path _ :as ep]]
+  (or (when (= 1 (count path))
+        (some-> (get aliases (first path)) (get which)))
+      ep))
 
 (defn- instrument-flow
   "Recursively inline subflows and wrap handler-maps with proc-fn. Returns a
-   flat step map with concrete proc-fns under :procs."
+   flat step map with concrete proc-fns under :procs (keyed by path vectors)
+   and conns / :in / :out as [path port] pairs."
   [stepmap outer-sp cancel-p counters done-p]
   (let [{:keys [procs inner-conns aliases]}
         (reduce (fn [acc [sid p]]
@@ -223,14 +222,14 @@
                     (let [{:keys [procs conns in out]}
                           (inline-subflow sid p outer-sp cancel-p counters done-p)]
                       (-> acc
-                          (update :procs clojure.core/merge procs)
+                          (update :procs into procs)
                           (update :inner-conns into conns)
                           (assoc-in [:aliases sid] {:in in :out out})))
 
                     (step/handler-map? p)
                     (let [step-sp (trace/push-scope outer-sp [:step sid])
                           wrapped (proc-fn p sid step-sp cancel-p counters done-p)]
-                      (assoc-in acc [:procs sid] wrapped))
+                      (assoc-in acc [:procs [sid]] wrapped))
 
                     :else
                     (throw (ex-info (str "Unrecognized proc value at " sid)
@@ -238,12 +237,12 @@
                 {:procs {} :inner-conns [] :aliases {}}
                 (:procs stepmap))
         resolved-conns (mapv (fn [[from to opts]]
-                               (cond-> [(resolve-endpoint aliases :out from)
-                                        (resolve-endpoint aliases :in to)]
+                               (cond-> [(resolve-ref aliases :out (normalize-ref from :out))
+                                        (resolve-ref aliases :in  (normalize-ref to   :in))]
                                  opts (conj opts)))
                              (:conns stepmap))
-        in-resolved  (when-let [r (:in  stepmap)] (resolve-flow-ref r aliases :in))
-        out-resolved (when-let [r (:out stepmap)] (resolve-flow-ref r aliases :out))]
+        in-resolved  (when-let [r (:in  stepmap)] (resolve-ref aliases :in  (normalize-ref r :in)))
+        out-resolved (when-let [r (:out stepmap)] (resolve-ref aliases :out (normalize-ref r :out)))]
     (cond-> (assoc stepmap
                    :procs procs
                    :conns (into resolved-conns inner-conns))
@@ -296,10 +295,9 @@
   "Every declared output port must be consumed by a conn, or match the
    flow's :out boundary. An unwired port would block `flow/inject` forever."
   [instrumented port-index]
-  (let [out-ref (:out instrumented)
-        out-ep  (when out-ref (if (vector? out-ref) out-ref [out-ref :out]))
-        used    (cond-> (set (map first (:conns instrumented)))
-                  out-ep (conj out-ep))
+  (let [out-ep (:out instrumented)
+        used   (cond-> (set (map first (:conns instrumented)))
+                 out-ep (conj out-ep))
         unwired (vec (for [[sid {:keys [outs]}] port-index
                            port outs
                            :when (not (used [sid port]))]
@@ -378,7 +376,7 @@
   [handle {:keys [in port] :as opts}]
   (let [{::keys [step graph pubsub scope fid counters done-p port-index]} handle
         ref                 (or in (:in step))
-        [flow-in flow-port] (if (vector? ref) ref [ref :in])
+        [flow-in flow-port] (normalize-ref ref :in)
         port                (or port flow-port)
         step-ports          (get port-index flow-in)
         _                   (when-not step-ports
