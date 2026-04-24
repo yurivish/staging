@@ -8,7 +8,7 @@
      I    — A step is the smallest unit
      II   — Linear composition with `serial`
      III  — Beyond linear: explicit graphs
-     IV   — Nesting with wrapped `serial` / `merge-steps`
+     IV   — Nesting with wrapped `serial` / `beside`
      V    — Message kinds: data, signal, done
      VI   — Derivation helpers + ctx :in-port
      VII  — Provenance & trace events
@@ -254,13 +254,13 @@
 ;; Act III — Beyond linear: explicit graphs
 ;;
 ;; When the topology isn't a line, assemble the graph by hand:
-;; `merge-steps` unions procs; `connect` adds conns; `input-at` / `output-at`
+;; `beside` unions procs; `connect` adds conns; `input-at` / `output-at`
 ;; set the boundary. This unlocks feedback loops and multi-port routing.
 ;; ============================================================================
 
-;; The minimal hand-wired graph: merge-steps + a single connect + input-at.
+;; The minimal hand-wired graph: beside + a single connect + input-at.
 (deftest hand-authored-step-map
-  (let [wf     (-> (step/merge-steps
+  (let [wf     (-> (step/beside
                     (step/step :inc inc)
                     (step/sink))
                    (step/connect [:inc :out] [:sink :in])
@@ -284,7 +284,7 @@
                        (if (< n 3)
                          [s {:tool-call [:query]}]
                          [s {:final     [:done]}]))))
-        wf (-> (step/merge-steps
+        wf (-> (step/beside
                 agent-step
                 (step/step :tool (constantly :tool-response))
                 (step/sink))
@@ -304,7 +304,7 @@
 ;; per-element routes across :odd and :even. Potam3 doesn't ship a
 ;; `router`; the same idea is one short handler.
 (deftest dynamic-fan-out
-  (let [wf     (-> (step/merge-steps
+  (let [wf     (-> (step/beside
                     (step/step :route {:ins {:in ""} :outs {:odd "" :even ""}}
                                (fn [ctx _s xs]
                                  {:odd  (mapv #(msg/child ctx %) (filter odd? xs))
@@ -325,9 +325,9 @@
                                (events-of result :send-out))))))))
 
 ;; ============================================================================
-;; Act IV — Nesting with wrapped `serial` / `merge-steps`
+;; Act IV — Nesting with wrapped `serial` / `beside`
 ;;
-;; `serial`/`merge-steps` given an id wrap an inner (composed) step as a single
+;; `serial`/`beside` given an id wrap an inner (composed) step as a single
 ;; proc under that id. Scopes nest one [:scope] segment per level; `:step-id`
 ;; remains the original leaf id.
 ;; ============================================================================
@@ -448,7 +448,7 @@
 (deftest signal-broadcasts-to-all-declared-output-ports
   (let [gid    "xo-group"
         v      424242
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (step/step :route
                                {:ins {:in ""} :outs {:odd "" :even ""}}
                                (fn [ctx _s d]
@@ -553,7 +553,7 @@
 ;; A multi-input step holds its :done cascade until every input port has
 ;; received its own :done marker — only then does it close downstream.
 (deftest done-multi-input-holds-until-all-inputs-closed
-  (let [wf (-> (step/merge-steps
+  (let [wf (-> (step/beside
                 (step/step :merge
                            {:ins  {:left "" :right ""}
                             :outs {:out ""}}
@@ -615,7 +615,7 @@
                            :outs {:out ""}}
                           (fn [{:keys [in-port]} s d]
                             [s {:out [{:port in-port :data d}]}]))
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (step/step :src-l identity)
                     (step/step :src-r identity)
                     tagger
@@ -636,7 +636,7 @@
 ;; `child` emits one derived message per call; multi-port handlers call it
 ;; once per output port.
 (deftest child-single-and-multi-port-outputs
-  (let [wf (-> (step/merge-steps
+  (let [wf (-> (step/beside
                 (step/step :emit {:ins {:in ""} :outs {:a "" :b ""}}
                            (fn [ctx s d]
                              [s {:a [(msg/child ctx (str "a-" d))]
@@ -657,7 +657,7 @@
 ;; slices equals the parent's token for each group.
 (deftest children-splits-tokens-across-siblings
   (let [seen (atom [])
-        wf (-> (step/merge-steps
+        wf (-> (step/beside
                 (c/fan-out :fo [:out])
                 (step/step :burst {:ins {:in ""} :outs {:out ""}}
                            (fn [ctx s _d]
@@ -726,7 +726,7 @@
                                                   in-port         d-val})]}]
                               [(assoc s :pending {:port in-port :msg (:msg ctx) :data d-val})
                                msg/drain])))
-        wf     (-> (step/merge-steps split b c joiner (step/sink))
+        wf     (-> (step/beside split b c joiner (step/sink))
                    (step/connect [:split :to-b] [:b :in])
                    (step/connect [:split :to-c] [:c :in])
                    (step/connect [:b :out]      [:d :left])
@@ -776,7 +776,7 @@
 ;; :split / :merge.
 (deftest provenance-dag-is-well-formed
   (let [ports  [:a :b :c]
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (c/fan-out :split ports)
                     (c/fan-in :fi :split ports)
                     (step/sink))
@@ -799,7 +799,7 @@
 ;; Frequency summaries match the topology: one fan-out input → three sink recvs.
 (deftest multiplicity-frequencies
   (let [ports  [:a :b :c]
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (c/fan-out :split ports)
                     (step/sink))
                    (wire-all :split ports :sink)
@@ -827,7 +827,7 @@
 ;; fan-out emits N children on :out whose fresh group token XOR-sums to 0.
 (deftest static-fan-out
   (let [ports  [:a :b :c]
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (c/fan-out :split ports)
                     (step/sink))
                    (wire-all :split ports :sink)
@@ -879,7 +879,7 @@
 ;; exactly one downstream send-out, one sink recv.
 (deftest token-fan-in
   (let [ports  [:a :b :c]
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (c/fan-out :split ports)
                     (c/fan-in :fi :split ports)
                     (step/sink))
@@ -913,7 +913,7 @@
 (deftest nested-fan-out-fan-in-composes
   (let [outer-ports [:o0 :o1 :o2]
         inner-ports [:i0 :i1]
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (c/fan-out :outer outer-ports)
                     (c/fan-out :inner inner-ports)
                     (c/fan-in  :fi-inner :inner inner-ports)
@@ -992,7 +992,7 @@
 (deftest empty-return-auto-propagates-to-every-output-port
   (let [multi  (step/step :multi {:ins {:in ""} :outs {:a "" :b ""}}
                           (fn [_ctx s _d] [s {}]))
-        wf     (-> (step/merge-steps multi (step/sink :sa) (step/sink :sb))
+        wf     (-> (step/beside multi (step/sink :sa) (step/sink :sb))
                    (step/connect [:multi :a] [:sa :in])
                    (step/connect [:multi :b] [:sb :in])
                    (step/input-at :multi))
@@ -1046,7 +1046,7 @@
                            a (-> (msg/child ctx :a-side) (msg/assoc-tokens {gid v1}))
                            b (-> (msg/child ctx :b-side) (msg/assoc-tokens {gid v2}))]
                        [s {:a [a] :b [b]}])))
-        wf (-> (step/merge-steps minter (c/fan-in :fi gid-key [:in]) (step/sink))
+        wf (-> (step/beside minter (c/fan-in :fi gid-key [:in]) (step/sink))
                (step/connect [:minter :a] [:fi :in])
                (step/connect [:minter :b] [:fi :in])
                (step/connect [:fi :out] [:sink :in])
@@ -1212,7 +1212,7 @@
            #"unwired output port"
            (flow/run-seq wf [1])))))
   (testing "the same step becomes valid once every out is wired"
-    (let [wf (-> (step/merge-steps
+    (let [wf (-> (step/beside
                   (step/step :route
                              {:ins {:in ""} :outs {:out "" :drop ""}}
                              (fn [ctx _s d]
@@ -1733,7 +1733,7 @@
 ;; ports named by the selector, broadcasting the input payload to each.
 (deftest fan-out-dynamic-selector-vector-return
   (let [ports  [:a :b :c]
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (c/fan-out :dyn ports (fn [d] (:pick d)))
                     (step/sink))
                    (wire-all :dyn ports :sink)
@@ -1751,7 +1751,7 @@
 ;; distinct payload computed by the selector.
 (deftest fan-out-dynamic-selector-map-return
   (let [ports  [:a :b :c]
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (c/fan-out :dyn ports (fn [d] {:a (:x d) :b (:y d)}))
                     (step/sink))
                    (wire-all :dyn ports :sink)
@@ -1767,7 +1767,7 @@
 ;; keyed by the port each sibling arrived on.
 (deftest fan-in-preserves-port-of-origin
   (let [ports  [:a :b :c]
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (c/fan-out :split ports (fn [_] {:a 1 :b 2 :c 3}))
                     (c/fan-in :gather :split ports)
                     (step/sink))
@@ -1784,7 +1784,7 @@
 ;; fan-in post-fn — `vals` drops the port keys, leaving just the payloads.
 (deftest fan-in-post-fn-drops-port-keys
   (let [ports  [:a :b :c]
-        wf     (-> (step/merge-steps
+        wf     (-> (step/beside
                     (c/fan-out :split ports (fn [_] {:a 1 :b 2 :c 3}))
                     (c/fan-in :gather :split ports vals)
                     (step/sink))

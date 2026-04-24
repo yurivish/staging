@@ -158,7 +158,7 @@
                    (fan-out fo-id ports select)
                    (fan-out fo-id ports))
         fi       (fan-in fi-id fo-id ports post)
-        base     (apply step/merge-steps fo fi (vals port->step))
+        base     (apply step/beside fo fi (vals port->step))
         wired    (reduce-kv
                   (fn [wf port inner]
                     (-> wf

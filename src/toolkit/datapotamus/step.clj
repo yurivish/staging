@@ -12,8 +12,8 @@
    consumer's input channel — `{:buf-or-n N :xform xf}` — see `connect`.
 
    Most users build steps with `step/step` (1-proc) and compose them with
-   `serial`, `merge-steps`, `connect`, `input-at`, and `output-at`.
-   `serial` and `merge-steps` accept an optional keyword id as their first
+   `serial`, `beside`, `connect`, `input-at`, and `output-at`.
+   `serial` and `beside` accept an optional keyword id as their first
    argument — when present, the result is self-wrapped under that id as a
    named subflow (one `[:scope id]` segment on inner events).
 
@@ -149,7 +149,7 @@
     (throw (ex-info (str "Step composition: proc-id collision " (vec shared))
                     {:colliding-ids (vec shared)}))))
 
-(defn- merge-steps-flat [steps]
+(defn- beside-flat [steps]
   (reduce (fn [acc s]
             (assert-no-collision! acc s)
             (-> acc
@@ -158,16 +158,18 @@
           {:procs {} :conns []}
           steps))
 
-(defn merge-steps
-  "Union procs + conns. Composable via explicit `connect`.
+(defn beside
+  "Place steps side-by-side — disjoint union of procs + conns. Errors on
+   proc-id collision. Leaves `:in`/`:out` unset; designate interfaces with
+   `input-at`/`output-at` or wire with `connect`.
 
    Arity dispatch on first arg:
-     (merge-steps a b c)       — flat; inner procs visible at the outer level.
-     (merge-steps :id a b c)   — self-wrapped under `:id` (one scope segment)."
+     (beside a b c)       — flat; inner procs visible at the outer level.
+     (beside :id a b c)   — self-wrapped under `:id` (one scope segment)."
   [& args]
   (if (keyword? (first args))
-    (mk-step (first args) (merge-steps-flat (rest args)))
-    (merge-steps-flat args)))
+    (mk-step (first args) (beside-flat (rest args)))
+    (beside-flat args)))
 
 (defn connect
   "Add one [from → to] conn to a step.
@@ -182,7 +184,7 @@
              opts (conj opts)))))
 
 (defn- serial-flat [steps]
-  (let [merged (merge-steps-flat steps)
+  (let [merged (beside-flat steps)
         glues  (partition 2 1 steps)
         wired  (reduce (fn [acc [a b]]
                          (connect acc
