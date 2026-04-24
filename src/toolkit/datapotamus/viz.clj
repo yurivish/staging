@@ -71,9 +71,9 @@
 ;; ============================================================================
 ;; Scope decoding
 ;;
-;; Events carry :scope like [[:flow fid] [:flow|:step id] …]. The outer
-;; [:flow fid] identifies the run; everything after maps onto a topology
-;; path. `inline-subflow` uses strings for :flow segments and keywords for
+;; Events carry :scope like [[:scope fid] [:scope|:step id] …]. The outer
+;; [:scope fid] identifies the run; everything after maps onto a topology
+;; path. `inline-subflow` uses strings for :scope segments and keywords for
 ;; :step segments — we keywordize everything so paths match step def sids.
 ;; ============================================================================
 

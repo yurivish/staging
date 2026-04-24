@@ -190,7 +190,7 @@
 (declare instrument-flow)
 
 (defn- inline-subflow [outer-sid subflow outer-sp cancel-p counters done-p]
-  (let [inner-sp (trace/push-scope outer-sp [:flow (name outer-sid)])
+  (let [inner-sp (trace/push-scope outer-sp [:scope (name outer-sid)])
         inner    (instrument-flow subflow inner-sp cancel-p counters done-p)]
     {:procs (update-keys (:procs inner) #(into [outer-sid] %))
      :conns (mapv (fn [[from to opts]]
@@ -316,9 +316,9 @@
   ([stepmap opts]
    (let [fid          (or (:flow-id opts) (str (random-uuid)))
          raw-ps       (or (:pubsub opts) (pubsub/make))
-         outer-sp     {:raw raw-ps :prefix [[:flow fid]]}
+         outer-sp     {:raw raw-ps :prefix [[:scope fid]]}
          cancel-p     (promise)
-         scope        [[:flow fid]]
+         scope        [[:scope fid]]
          counters     (ctrs/make)
          done-p       (atom (promise))
          error        (atom nil)
@@ -339,14 +339,14 @@
                                           :pid       (:clojure.core.async.flow/pid m)
                                           :cid       (:clojure.core.async.flow/cid m)
                                           :msg-id    (get-in m [:clojure.core.async.flow/msg :msg-id])
-                                          :error     err
-                                          :scope     scope
-                                          :flow-path [fid]
-                                          :at        (trace/now)})
+                                          :error      err
+                                          :scope      scope
+                                          :scope-path [fid]
+                                          :at         (trace/now)})
                              (deliver @done-p [:failed err]))
                            (recur))))]
      (pubsub/pub raw-ps (trace/run-subject-for scope :run-started)
-                 {:kind :run-started :flow-path [fid] :scope scope
+                 {:kind :run-started :scope-path [fid] :scope scope
                   :at   (trace/now)})
      (flow/resume g)
      {::step       instrumented
@@ -402,7 +402,7 @@
     (pubsub/pub pubsub (trace/run-subject-for scope :inject)
                 (assoc (trace/msg-envelope item)
                        :kind :inject
-                       :flow-path [fid] :scope scope
+                       :scope-path [fid] :scope scope
                        :in flow-in :port port
                        :at (trace/now)))
     @(flow/inject graph [flow-in port] [item])

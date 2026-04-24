@@ -47,7 +47,7 @@ One step doubling numbers is not very interesting. What we actually want is: rea
 ;; => {:outputs [["2.54 cm"] ["6.35 cm"] ["10.16 cm"]] ...}
 ```
 
-`step/serial` wires the `:out` of each step to the `:in` of the next. You don't name the connections; they're implicit from the ordering. If you want something non-linear, `step/connect`, `step/merge-steps`, `step/input-at`, `step/output-at`, and `step/as-step` let you hand-wire. Chains are common enough to deserve sugar. Two more primitives come up often enough to name: `step/sink` (a terminal step that consumes its input and emits nothing — useful at the tail of a run-to-completion graph) and `step/passthrough` (forwards its input unchanged, preserving `:data-id` — the step-level companion to `msg/pass`).
+`step/serial` wires the `:out` of each step to the `:in` of the next. You don't name the connections; they're implicit from the ordering. If you want something non-linear, `step/connect`, `step/merge-steps`, `step/input-at`, and `step/output-at` let you hand-wire. Both `serial` and `merge-steps` take an optional keyword id as their first argument — when provided, the composed result is self-wrapped under that id as a named subflow (its inner procs get a `[:scope id]` segment on every event, and outer code can't collide with the inner ids). Chains are common enough to deserve sugar. Two more primitives come up often enough to name: `step/sink` (a terminal step that consumes its input and emits nothing — useful at the tail of a run-to-completion graph) and `step/passthrough` (forwards its input unchanged, preserving `:data-id` — the step-level companion to `msg/pass`).
 
 Each step here is written with the simplest possible handler shape — a pure function from data to data. The library wraps it for you. No ctx, no ports, no state, no messages. You hand over a function; it gets called with each value; whatever it returns gets sent on.
 
@@ -65,12 +65,13 @@ Before peeling anything back, one more black box. Suppose each measurement is ex
 
 `workers` gives you `k` parallel copies of an inner step, behind a round-robin router, with a join at the end that puts everything back in one stream. From the outside a `workers` block has one input port and one output port — it looks like a single operation. Internally there are four parallel procs, and each proc has its own trace scope (`<id>.w0`, `<id>.w1`, `<id>.w2`, `<id>.w3`), which surfaces utilization and latency per worker directly in the event stream if you want to look. That is the pattern: parallelism is hidden by default and made observable by stepping down into the decomposition.
 
-Two close relatives, also black boxes for now:
+Three close relatives, also black boxes for now:
 
 - `c/fan-out` — take one message and split it into one sibling per declared output port. `(c/fan-out :dispatch [:solver :skeptic])` emits one copy on `:solver` and one on `:skeptic`, each carrying a slice of a fresh zero-sum group named by the fan-out's id. A 3-arity variant accepts a selector fn so the port subset (and per-port payload) can depend on the input.
 - `c/fan-in` — wait for those siblings to come home, then emit one merged message. The merged payload is a `{port data}` map keyed by the input port each sibling arrived on; pass an optional post-fn (e.g. `vals`) to reshape it.
+- `c/parallel` — scatter-gather bracket. Takes an id and a `{port → step}` map; the keys become the parallel ports. Internally builds a `fan-out`, wires each port to its inner step, wires each step's output to the matching `fan-in` port, and exposes a single-`:in`/single-`:out` wrapped step. `(c/parallel :roles {:solver solver-step :skeptic skeptic-step})` is the "one input, N heterogeneous specialists, collect results" pattern — no ports or wiring repeated by hand. Optional `:select` and `:post` kwargs pass through to the underlying fan-out/fan-in.
 
-They close the loop: you fan out to a set of downstreams, you do work in parallel, you fan in by referencing the fan-out's id.
+They close the loop: you fan out to a set of downstreams, you do work in parallel, you fan in by referencing the fan-out's id. `parallel` is the common case where that loop is local; `fan-out` / `fan-in` are the construction material when you need to do work between them that `parallel` can't express (iterative rounds, routing, custom coordination).
 
 *The trade-off.* `fan-in` waits until *all* the siblings have arrived. If one is lost — dropped, or swallowed by a bug — the fan-in waits forever. We'll see in the next section why "waits for all siblings" doesn't need a counter, and also exactly how sharp the "waits forever" cliff is.
 
@@ -279,7 +280,7 @@ Layer observability on top of the manual tier:
 
 Quiescence is defined arithmetically: `sent = recv + completed`. No polling, no timeouts, just balance. Every injected envelope leaves the system either as a receipt or as a completion event — another conservation law, if you're keeping score.
 
-For a live event firehose, subscribe on the pubsub directly. Pass your own `pubsub/make` via `{:pubsub ps}` to `start!`, register handlers with `pubsub/sub`, and the flow will publish onto it as it runs. Subjects have the shape `[<kind> "flow" <fid> ("flow" <sub>)* ("step" <sid>)?]`. Glob patterns work: `[:* "flow" "ingest" :>]` gets everything in one flow; `["recv" "flow" :* :>]` gets every receive across all of them. The core never self-subscribes — it only publishes — so you own the subscriber lifecycle.
+For a live event firehose, subscribe on the pubsub directly. Pass your own `pubsub/make` via `{:pubsub ps}` to `start!`, register handlers with `pubsub/sub`, and the flow will publish onto it as it runs. Subjects have the shape `[<kind> "scope" <fid> ("scope" <sub>)* ("step" <sid>)?]`. Glob patterns work: `[:* "scope" "ingest" :>]` gets everything in one flow; `["recv" "scope" :* :>]` gets every receive across all of them. The core never self-subscribes — it only publishes — so you own the subscriber lifecycle.
 
 *The trade-off.* Quiescence is a *structural* condition, not a semantic one. If your state machine produces a different number of outputs per input on average than it consumes, quiescence may never trigger. That's a feature for pipelines that emit retries or batched outputs — you don't want `await-quiescent!` to lie to you — but it means "wait until done" is sometimes not a meaningful question to ask.
 
@@ -289,7 +290,7 @@ Back to the running example. We want to open the output file once, write each co
 
 ```clojure
 (defn writer-step [path]
-  (step/as-step :writer
+  (step/serial :writer
     (step/handler-map
      {:ports         {:ins {:in "line to write"} :outs {}}
       :on-init       (fn []

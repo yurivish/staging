@@ -10,9 +10,9 @@
    envelope (via `msg-envelope`), plus kind-specific extras (e.g. :in-port
    on a :done recv, :port on a :send-out, :error on a :failure).
 
-   A scoped pubsub is a plain map `{:raw raw-ps :prefix [[:flow fid] ...]}`.
+   A scoped pubsub is a plain map `{:raw raw-ps :prefix [[:scope fid] ...]}`.
    `sp-pub` prepends the scope to the subject and stamps `:scope`,
-   `:flow-path`, and `:at` onto every event. To extend a scope with a
+   `:scope-path`, and `:at` onto every event. To extend a scope with a
    child segment (e.g. a nested step or subflow), `update :prefix conj
    <segment>`."
   (:require [toolkit.pubsub :as pubsub]))
@@ -62,20 +62,21 @@
 ;; Scope helpers
 ;; ============================================================================
 
-(defn- scope->tokens
-  "Flatten a scope (`[[:flow fid] [:step sid] ...]`) to the vector of
-   name-strings, alternating kind + id: `[\"flow\" fid \"step\" sid]`."
+(defn- scope->subject-prefix
+  "Flatten a scope (`[[:scope fid] [:step sid] ...]`) to the vector of
+   name-strings, alternating kind + id: `[\"scope\" fid \"step\" sid]`.
+   This is the subject body — `sp-pub` prepends the event :kind."
   [scope]
   (vec (mapcat (fn [[k id]]
                  [(name k) (if (keyword? id) (name id) (str id))])
                scope)))
 
 (defn run-subject-for [scope kind]
-  (-> [(name kind)] (into (scope->tokens scope)) (conj "run")))
+  (-> [(name kind)] (into (scope->subject-prefix scope)) (conj "run")))
 
-(defn- flow-path-of [scope]
+(defn- scope-path-of [scope]
   (mapv (fn [[_ id]] (if (keyword? id) (name id) id))
-        (filter (fn [[k _]] (= k :flow)) scope)))
+        (filter (fn [[k _]] (= k :scope)) scope)))
 
 ;; ============================================================================
 ;; Scoped pubsub — publishing helper
@@ -83,22 +84,22 @@
 
 (defn push-scope
   "Extend a scoped pubsub with a new scope segment, precomputing the
-   flattened tokens and flow-path so `sp-pub` doesn't allocate them on
+   subject prefix and scope-path so `sp-pub` doesn't allocate them on
    every event. A step-sp built once at `start!` gets reused for every
    publish from that proc, so the precompute pays for itself immediately
    and is freed naturally when the flow's handle is gc'd."
   [sp segment]
   (let [prefix' (conj (:prefix sp) segment)]
     (assoc sp
-           :prefix    prefix'
-           :tokens    (scope->tokens prefix')
-           :flow-path (flow-path-of prefix'))))
+           :prefix         prefix'
+           :subject-prefix (scope->subject-prefix prefix')
+           :scope-path     (scope-path-of prefix'))))
 
 (defn sp-pub
   "Publish event `ev` on the scoped pubsub. Stamps :at, :scope,
-   :flow-path at publish time. Reads the precomputed :tokens and
-   :flow-path built by `push-scope`."
-  [{:keys [raw prefix tokens flow-path]} ev]
+   :scope-path at publish time. Reads the precomputed :subject-prefix
+   and :scope-path built by `push-scope`."
+  [{:keys [raw prefix subject-prefix scope-path]} ev]
   (pubsub/pub raw
-              (into [(name (:kind ev))] tokens)
-              (assoc ev :scope prefix :flow-path flow-path :at (now))))
+              (into [(name (:kind ev))] subject-prefix)
+              (assoc ev :scope prefix :scope-path scope-path :at (now))))

@@ -8,7 +8,7 @@
      I    — A step is the smallest unit
      II   — Linear composition with `serial`
      III  — Beyond linear: explicit graphs
-     IV   — Nesting with `as-step`
+     IV   — Nesting with wrapped `serial` / `merge-steps`
      V    — Message kinds: data, signal, done
      VI   — Derivation helpers + ctx :in-port
      VII  — Provenance & trace events
@@ -325,18 +325,19 @@
                                (events-of result :send-out))))))))
 
 ;; ============================================================================
-;; Act IV — Nesting with `as-step`
+;; Act IV — Nesting with wrapped `serial` / `merge-steps`
 ;;
-;; `as-step` treats an inner (composed) step as a single proc under a new id.
-;; Scopes nest one [:flow] segment per level; `:step-id` remains the original.
+;; `serial`/`merge-steps` given an id wrap an inner (composed) step as a single
+;; proc under that id. Scopes nest one [:scope] segment per level; `:step-id`
+;; remains the original leaf id.
 ;; ============================================================================
 
-;; Three levels of nesting — each subflow adds one [:flow id] segment to scope.
-(deftest deep-nested-as-step
+;; Three levels of nesting — each subflow adds one [:scope id] segment.
+(deftest deep-nested-subflow
   (let [leaf  (step/step :leaf inc)
-        sub3  (step/as-step :sub3 leaf)
-        sub2  (step/as-step :sub2 sub3)
-        sub1  (step/as-step :sub1 sub2)
+        sub3  (step/serial :sub3 leaf)
+        sub2  (step/serial :sub2 sub3)
+        sub1  (step/serial :sub1 sub2)
         outer (step/serial sub1 (step/sink))
         result (run! outer {:flow-id "F" :data 41})
         leaf-recv (first (filterv #(= :leaf (:step-id %))
@@ -345,27 +346,27 @@
       (is (= :completed (:state result)))
       (is (= 42 (:data (first (filterv #(= :sink (:step-id %))
                                        (events-of result :recv)))))))
-    (testing "leaf step's scope nests one [:flow] per subflow level"
-      (is (= [[:flow "F"]
-              [:flow "sub1"]
-              [:flow "sub2"]
-              [:flow "sub3"]
+    (testing "leaf step's scope nests one [:scope] per subflow level"
+      (is (= [[:scope "F"]
+              [:scope "sub1"]
+              [:scope "sub2"]
+              [:scope "sub3"]
               [:step :leaf]]
              (:scope leaf-recv))))
-    (testing ":flow-path is the [:flow] sids in order"
-      (is (= ["F" "sub1" "sub2" "sub3"] (:flow-path leaf-recv))))
+    (testing ":scope-path is the [:scope] sids in order"
+      (is (= ["F" "sub1" "sub2" "sub3"] (:scope-path leaf-recv))))
     (testing ":step-id stays the original :leaf, not the prefixed graph id"
       (is (= :leaf (:step-id leaf-recv))))))
 
-;; Outer steps see only the flow-level scope; steps inside an as-step get the
-;; extra [:flow :sub] segment, but ids aren't collided between inner and outer.
-(deftest as-step-namespaces-inner-procs
+;; Outer steps see only the flow-level scope; steps inside a wrapped serial get
+;; the extra [:scope :sub] segment, but ids aren't collided between inner/outer.
+(deftest wrapped-serial-namespaces-inner-procs
   (let [inner    (step/serial
                   (step/step :a inc)
                   (step/step :b #(* 10 %)))
         outer    (step/serial
                   (step/step :pre  identity)
-                  (step/as-step :sub inner)
+                  (step/serial :sub inner)
                   (step/step :post identity)
                   (step/sink))
         result   (run! outer {:flow-id "f" :data 2})
@@ -375,17 +376,17 @@
       (is (= :completed (:state result))))
     (testing "data flowed through pre → sub(a,b) → post → sink"
       (is (= 30 (:data sink-recv))))
-    (testing "inner events have the nested [:flow :sub] scope segment"
+    (testing "inner events have the nested [:scope :sub] segment"
       (let [inner-a-recv (first (filterv #(and (= :a (:step-id %))
                                                (= :recv (:kind %)))
                                          (:events result)))]
-        (is (= [[:flow "f"] [:flow "sub"] [:step :a]]
+        (is (= [[:scope "f"] [:scope "sub"] [:step :a]]
                (:scope inner-a-recv)))))
     (testing "outer-level step (e.g. :pre) has only the flow-level scope"
       (let [pre-recv (first (filterv #(and (= :pre (:step-id %))
                                            (= :recv (:kind %)))
                                      (:events result)))]
-        (is (= [[:flow "f"] [:step :pre]]
+        (is (= [[:scope "f"] [:step :pre]]
                (:scope pre-recv)))))))
 
 ;; ============================================================================
@@ -767,7 +768,7 @@
             (step/sink))
         _  (run! wf {:flow-id "F" :data :x})]
     (is (= {:step-id :my-step
-            :scope   [[:flow "F"] [:step :my-step]]}
+            :scope   [[:scope "F"] [:step :my-step]]}
            @captured))))
 
 ;; Folded events form an acyclic graph with exactly one root — every
@@ -1320,7 +1321,7 @@
                           (reset! seen-state s)
                           [(update s :counter inc) {:out [:ok]}])})
         wf   {:procs {:probe hmap} :conns [] :in :probe :out :probe}
-        wf   (step/serial (step/as-step :probe wf) (step/sink))]
+        wf   (step/serial (step/serial :probe wf) (step/sink))]
     (run! wf {:data :x})
     (is (= {:counter 42} @seen-state))))
 
@@ -1337,9 +1338,9 @@
                           (swap! stopped inc)
                           (deliver fired true))})
         wf   (step/serial
-              (step/as-step :probe
-                            {:procs {:probe hmap} :conns []
-                             :in :probe :out :probe})
+              (step/serial :probe
+                           {:procs {:probe hmap} :conns []
+                            :in :probe :out :probe})
               (step/sink))
         h    (start! wf)]
     (flow/inject! h {:data :x})
@@ -1449,20 +1450,21 @@
 ;;
 ;; Every event is published on a subject of the form
 ;;
-;;     [<kind> "flow" <flow-id> ("flow" <sub-id>)* ("step" <sid>)?]
+;;     [<kind> "scope" <flow-id> ("scope" <sub-id>)* ("step" <sid>)?]
 ;;
 ;; where <kind> is one of :recv / :success / :send-out / :failure / :split /
-;; :merge / :inject / :run-started. Nesting via `as-step` inserts one extra
-;; `"flow" <sub-id>` segment per level. Subscribers use glob patterns like
-;; `["recv" "flow" :* :>]` (all recvs across all flows) or
-;; `["recv" "flow" "outer" "flow" "sub" "step" "inc"]` (a specific nested step).
+;; :merge / :inject / :run-started. Nesting via `(step/serial :id inner)`
+;; inserts one extra `"scope" <sub-id>` segment per level. Subscribers use
+;; glob patterns like `["recv" "scope" :* :>]` (all recvs across all flows)
+;; or `["recv" "scope" "outer" "scope" "sub" "step" "inc"]` (a specific
+;; nested step).
 ;; ============================================================================
 
 ;; A user subscriber sees every :recv event under a specific flow-id.
 (deftest watcher-custom-subscriber
   (let [ps (pubsub/make)
         recv-count (atom 0)
-        u (pubsub/sub ps ["recv" "flow" "run-A" :>]
+        u (pubsub/sub ps ["recv" "scope" "run-A" :>]
                       (fn [_ _ _] (swap! recv-count inc)))
         wf (step/serial
            (step/step :split {:ins {:in ""} :outs {:out ""}}
@@ -1478,9 +1480,9 @@
 (deftest multi-flow-shared-pubsub
   (let [ps (pubsub/make)
         tallies (atom {})
-        u (pubsub/sub ps ["recv" "flow" :* :>]
+        u (pubsub/sub ps ["recv" "scope" :* :>]
                       (fn [_ ev _]
-                        (swap! tallies update (first (:flow-path ev)) (fnil inc 0))))
+                        (swap! tallies update (first (:scope-path ev)) (fnil inc 0))))
         wf-A (step/serial (step/step :a  inc)
                           (step/sink :sa))
         wf-B (step/serial (step/step :b  dec)
@@ -1531,21 +1533,21 @@
         inner (step/step :inc #(+ % 100))
         outer (step/serial
               (step/step :inc inc)
-              (step/as-step :sub inner)
+              (step/serial :sub inner)
               (step/sink))
         outer-recvs (atom [])
         inner-recvs (atom [])
-        u1 (pubsub/sub ps ["recv" "flow" "outer" "step" "inc"]
+        u1 (pubsub/sub ps ["recv" "scope" "outer" "step" "inc"]
                        (fn [_ ev _] (swap! outer-recvs conj ev)))
-        u2 (pubsub/sub ps ["recv" "flow" "outer" "flow" "sub" "step" "inc"]
+        u2 (pubsub/sub ps ["recv" "scope" "outer" "scope" "sub" "step" "inc"]
                        (fn [_ ev _] (swap! inner-recvs conj ev)))
         result (run! outer {:pubsub ps :flow-id "outer" :data 5})]
     (u1) (u2)
     (is (= :completed (:state result)))
     (is (= 1 (count @outer-recvs)))
     (is (= 1 (count @inner-recvs)))
-    (is (= ["outer"]       (:flow-path (first @outer-recvs))))
-    (is (= ["outer" "sub"] (:flow-path (first @inner-recvs))))
+    (is (= ["outer"]       (:scope-path (first @outer-recvs))))
+    (is (= ["outer" "sub"] (:scope-path (first @inner-recvs))))
     (is (= 5 (:data (first @outer-recvs))))
     (is (= 6 (:data (first @inner-recvs))))))
 
@@ -1597,13 +1599,13 @@
 ;; merges their outputs through a K-input join. Each worker is a distinct
 ;; proc, so core.async.flow gives each its own thread — per-message
 ;; parallelism is real, not cooperative. The router/join/workers share an
-;; outer [:flow id] scope segment, and each worker adds [:flow wN] below —
+;; outer [:scope id] segment, and each worker adds [:scope wN] below —
 ;; so per-stage aggregation and per-worker distinction are both structural.
 ;; ============================================================================
 
 ;; Round-robin distribution: K=3 against 9 inputs places exactly 3 per worker.
 ;; Per-worker distinction lives in the scope path (each worker adds a
-;; [:flow :wN] segment under the shared [:flow :pool]), so we capture the
+;; [:scope :wN] segment under the shared [:scope :pool]), so we capture the
 ;; scope vector rather than the (still-shared) :step-id.
 (deftest workers-round-robin-distributes-evenly
   (let [seen   (atom [])
@@ -1797,193 +1799,109 @@
       (is (= #{1 2 3} (set (:data merged))))
       (is (= 3 (count (:data merged)))))))
 
-;; Parallel-roles: one question fans out to four heterogeneous specialists,
-;; each running its own prompt fn. Fan-in rejoins a {role result} map.
+;; Parallel-roles: one question fans out to four heterogeneous specialists.
+;; `c/parallel` hides the fan-out/fan-in plumbing; port keys double as role
+;; names, so the scatter-gather bracket is a single map-shaped declaration.
 (deftest parallel-roles-agent-workflow
-  (let [prompt-fn   (fn [role q] (str (name role) ":" q))
-        roles       [:solver :facts :skeptic :second]
-        role-step   (fn [id] (step/step id (fn [{:keys [question]}] (prompt-fn id question))))
-        wf (-> (step/merge-steps
-                (c/fan-out :dispatch roles)
-                (role-step :solver)
-                (role-step :facts)
-                (role-step :skeptic)
-                (role-step :second)
-                (c/fan-in :agg :dispatch roles)
-                (step/sink))
-               (step/connect [:dispatch :solver]  [:solver  :in])
-               (step/connect [:dispatch :facts]   [:facts   :in])
-               (step/connect [:dispatch :skeptic] [:skeptic :in])
-               (step/connect [:dispatch :second]  [:second  :in])
-               (step/connect [:solver  :out] [:agg :solver])
-               (step/connect [:facts   :out] [:agg :facts])
-               (step/connect [:skeptic :out] [:agg :skeptic])
-               (step/connect [:second  :out] [:agg :second])
-               (step/connect [:agg :out] [:sink :in])
-               (step/input-at :dispatch)
-               (step/output-at :sink))
+  (let [prompt-fn (fn [role q] (str (name role) ":" q))
+        role-step (fn [id] (step/step id (fn [{:keys [question]}] (prompt-fn id question))))
+        wf (step/serial
+            (c/parallel :roles
+                        {:solver  (role-step :solver)
+                         :facts   (role-step :facts)
+                         :skeptic (role-step :skeptic)
+                         :second  (role-step :second)})
+            (step/sink))
         result (run! wf {:data {:question "is P true?"}})
         final  (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
     (is (= :completed (:state result)))
-    (testing "each role ran exactly once; agg recv'd 4 msgs but emitted 1 merged output"
-      (let [freqs (frequencies (map :step-id (events-of result :recv)))]
-        (is (= {:dispatch 1 :solver 1 :facts 1 :skeptic 1 :second 1 :sink 1}
-               (select-keys freqs [:dispatch :solver :facts :skeptic :second :sink])))
-        (is (= 4 (:agg freqs)))
-        (is (= 1 (count (filterv #(= :agg (:step-id %))
-                                 (events-of result :merge)))))))
-    (testing "aggregator output preserves role identity via port-of-origin"
+    (testing "output preserves role identity via port-of-origin"
       (is (= {:solver  "solver:is P true?"
               :facts   "facts:is P true?"
               :skeptic "skeptic:is P true?"
               :second  "second:is P true?"}
              (:data final))))))
 
-;; Ensemble: one question to N homogeneous workers at varying temperatures,
-;; fan-in with `vals` strips port keys, judge picks the best candidate.
+;; Ensemble: one question to N homogeneous workers at varying temperatures.
+;; `:post vals` strips port keys since the judge doesn't care which worker
+;; produced which candidate.
 (deftest ensemble-agent-workflow
-  (let [temps       {:w0 0.7 :w1 0.9 :w2 1.0 :w3 1.1}
-        ports       (vec (keys temps))
-        solve-fn    (fn [q temp] {:answer (str q) :temp temp :score (* 10 temp)})
-        worker      (fn [id] (step/step id (fn [q] (solve-fn q (get temps id)))))
-        judge       (step/step :pick (fn [cs] (apply max-key :score cs)))
-        wf (-> (step/merge-steps
-                (c/fan-out :ens ports)
-                (worker :w0) (worker :w1) (worker :w2) (worker :w3)
-                (c/fan-in :judge :ens ports vals)
-                judge
-                (step/sink))
-               (step/connect [:ens :w0] [:w0 :in])
-               (step/connect [:ens :w1] [:w1 :in])
-               (step/connect [:ens :w2] [:w2 :in])
-               (step/connect [:ens :w3] [:w3 :in])
-               (step/connect [:w0 :out] [:judge :w0])
-               (step/connect [:w1 :out] [:judge :w1])
-               (step/connect [:w2 :out] [:judge :w2])
-               (step/connect [:w3 :out] [:judge :w3])
-               (step/connect [:judge :out] [:pick :in])
-               (step/connect [:pick :out] [:sink :in])
-               (step/input-at :ens)
-               (step/output-at :sink))
+  (let [temps    {:w0 0.7 :w1 0.9 :w2 1.0 :w3 1.1}
+        solve-fn (fn [q temp] {:answer (str q) :temp temp :score (* 10 temp)})
+        worker   (fn [id] (step/step id (fn [q] (solve-fn q (get temps id)))))
+        judge    (step/step :pick (fn [cs] (apply max-key :score cs)))
+        wf (step/serial
+            (c/parallel :ens
+                        {:w0 (worker :w0) :w1 (worker :w1)
+                         :w2 (worker :w2) :w3 (worker :w3)}
+                        :post vals)
+            judge
+            (step/sink))
         result (run! wf {:data "explain X"})
         final  (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
     (is (= :completed (:state result)))
-    (testing "every worker ran exactly once; judge picked the highest-score candidate"
-      (is (= {:w0 1 :w1 1 :w2 1 :w3 1}
-             (select-keys (frequencies (map :step-id (events-of result :recv)))
-                          ports)))
+    (testing "judge picked the highest-score candidate (the 1.1-temp worker)"
       (is (= 1.1 (:temp (:data final))))
       (is (= 11.0 (:score (:data final)))))))
 
-;; Subtask-parallel: planner produces a runtime-variable number of subtasks,
-;; routed to a subset of a pre-declared worker pool via fan-out's 3-arity
-;; selector. Fan-in with `vals` collects the answers; combiner finalizes.
+;; Subtask-parallel: planner produces a runtime-variable number of subtasks.
+;; `:select` is a fn from input data to a {port payload} map; ports not chosen
+;; stay idle. Pre-declared K=3 worker pool; planner picks 2 of them.
 (deftest subtask-parallel-agent-workflow
   (let [K            3
         worker-ports (mapv #(keyword (str "w" %)) (range K))
         plan-fn      (fn [q _budget] [(str q "-a") (str q "-b")])
         solve-fn     (fn [{:keys [task budget]}] {:task task :budget budget :answer (str "done:" task)})
         combine-fn   (fn [answers] {:combined (mapv :answer answers) :n (count answers)})
-        planner      (c/fan-out :plan worker-ports
-                                (fn [{:keys [question budget]}]
-                                  (let [tasks (plan-fn question budget)
-                                        each  (quot budget (count tasks))]
-                                    (into {} (map-indexed
-                                              (fn [i t] [(nth worker-ports i)
-                                                         {:task t :budget each}])
-                                              tasks)))))
         worker       (fn [id] (step/step id solve-fn))
-        combiner     (step/step :combine combine-fn)
-        wf (-> (step/merge-steps
-                planner
-                (worker :w0) (worker :w1) (worker :w2)
-                (c/fan-in :gather :plan worker-ports vals)
-                combiner
-                (step/sink))
-               (step/connect [:plan :w0] [:w0 :in])
-               (step/connect [:plan :w1] [:w1 :in])
-               (step/connect [:plan :w2] [:w2 :in])
-               (step/connect [:w0 :out] [:gather :w0])
-               (step/connect [:w1 :out] [:gather :w1])
-               (step/connect [:w2 :out] [:gather :w2])
-               (step/connect [:gather :out] [:combine :in])
-               (step/connect [:combine :out] [:sink :in])
-               (step/input-at :plan)
-               (step/output-at :sink))
+        selector     (fn [{:keys [question budget]}]
+                       (let [tasks (plan-fn question budget)
+                             each  (quot budget (count tasks))]
+                         (into {} (map-indexed
+                                   (fn [i t] [(nth worker-ports i)
+                                              {:task t :budget each}])
+                                   tasks))))
+        wf (step/serial
+            (c/parallel :plan
+                        {:w0 (worker :w0) :w1 (worker :w1) :w2 (worker :w2)}
+                        :select selector
+                        :post   vals)
+            (step/step :combine combine-fn)
+            (step/sink))
         result (run! wf {:data {:question "Q" :budget 100}})
         final  (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
     (is (= :completed (:state result)))
-    (testing "planner produced 2 subtasks; only :w0 and :w1 ran; gather emitted one merge"
+    (testing ":w0 and :w1 ran; :w2 stayed idle"
       (let [freqs (frequencies (map :step-id (events-of result :recv)))]
-        (is (= 1 (:plan freqs)))
         (is (= 1 (:w0 freqs)))
         (is (= 1 (:w1 freqs)))
-        (is (nil? (:w2 freqs)))
-        (is (= 2 (:gather freqs)))
-        (is (= 1 (:combine freqs)))
-        (is (= 1 (:sink freqs)))
-        (is (= 1 (count (filterv #(= :gather (:step-id %))
-                                 (events-of result :merge)))))))
-    (testing "combiner saw both answers in deterministic order"
+        (is (nil? (:w2 freqs)))))
+    (testing "combiner saw both answers"
       (is (= 2 (:n (:data final))))
       (is (= #{"done:Q-a" "done:Q-b"} (set (:combined (:data final))))))))
 
-;; Debate: two debaters answer independently (round 1); a swap step hands
-;; each debater's answer to the opposing critic (round 2); a final fan-in
-;; closes the original fan-out's zero-sum group with all four contributions
-;; carried through the merged lineage.
+;; Debate: two parallel brackets in series. No cross-swap step — the
+;; fan-in's {port data} output IS the round-1 result set; the next
+;; fan-out broadcasts that whole map to each critic, who picks its own
+;; side and peer by key. The debate's "cross" is implicit in the shape
+;; fan-in emits and fan-out consumes; composition does the rest.
 (deftest debate-agent-workflow
-  (let [debater-fn (fn [side q] (str "d-" (name side) ":" q))
-        critic-fn  (fn [{:keys [own peer side]}]
-                     {:side side :own own :peer peer
-                      :verdict (str "c-" (name side) "|own=" own "|peer=" peer)})
-        dA         (step/step :dA (fn [q] (debater-fn :a q)))
-        dB         (step/step :dB (fn [q] (debater-fn :b q)))
-        swap-step  (step/step :swap
-                              {:ins {:a "" :b ""} :outs {:to-a "" :to-b ""}}
-                              (fn [ctx s _d]
-                                (let [p  (:in-port ctx)
-                                      s' (assoc-in s [:msgs p] (:msg ctx))]
-                                  (if (= #{:a :b} (set (keys (:msgs s'))))
-                                    (let [pa (get-in s' [:msgs :a])
-                                          pb (get-in s' [:msgs :b])
-                                          a1 (:data pa)
-                                          b1 (:data pb)]
-                                      [(dissoc s' :msgs)
-                                       {:to-a [(msg/merge ctx [pa pb] {:own a1 :peer b1 :side :a})]
-                                        :to-b [(msg/merge ctx [pa pb] {:own b1 :peer a1 :side :b})]}])
-                                    [s' msg/drain]))))
-        cA         (step/step :cA critic-fn)
-        cB         (step/step :cB critic-fn)
-        wf (-> (step/merge-steps
-                (c/fan-out :r1 [:a :b])
-                dA dB swap-step cA cB
-                (c/fan-in :agg :r1 [:a :b] vals)
-                (step/sink))
-               (step/connect [:r1 :a]   [:dA :in])
-               (step/connect [:r1 :b]   [:dB :in])
-               (step/connect [:dA :out] [:swap :a])
-               (step/connect [:dB :out] [:swap :b])
-               (step/connect [:swap :to-a] [:cA :in])
-               (step/connect [:swap :to-b] [:cB :in])
-               (step/connect [:cA :out] [:agg :a])
-               (step/connect [:cB :out] [:agg :b])
-               (step/connect [:agg :out] [:sink :in])
-               (step/input-at :r1)
-               (step/output-at :sink))
+  (let [debater   (fn [side] (step/step side (fn [q] (str "d-" (name side) ":" q))))
+        critic    (fn [side]
+                    (let [peer (if (= side :a) :b :a)]
+                      (step/step side
+                                 (fn [round1]
+                                   (str "c-" (name side)
+                                        "|own="  (get round1 side)
+                                        "|peer=" (get round1 peer))))))
+        wf (step/serial
+            (c/parallel :r1 {:a (debater :a) :b (debater :b)})
+            (c/parallel :r2 {:a (critic  :a) :b (critic  :b)})
+            (step/sink))
         result (run! wf {:data "is P true?"})
         final  (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
     (is (= :completed (:state result)))
-    (testing "each step received the expected count of messages"
-      ;; r1 1 input; dA/dB each get 1 round-1; swap gets 2 (one per port); each
-      ;; critic gets 1 round-2; agg gets 2 (one per critic); sink gets 1.
-      (is (= {:r1 1 :dA 1 :dB 1 :swap 2 :cA 1 :cB 1 :agg 2 :sink 1}
-             (frequencies (map :step-id (events-of result :recv))))))
-    (testing "swap emitted two merges (one per round-2 child); agg emitted one"
-      (is (= 2 (count (filterv #(= :swap (:step-id %)) (events-of result :merge)))))
-      (is (= 1 (count (filterv #(= :agg (:step-id %)) (events-of result :merge))))))
-    (testing "critics got peer-swapped inputs; aggregator saw both verdicts"
-      (let [verdicts (into #{} (map :verdict) (:data final))]
-        (is (= #{"c-a|own=d-a:is P true?|peer=d-b:is P true?"
-                 "c-b|own=d-b:is P true?|peer=d-a:is P true?"}
-               verdicts))))))
+    (testing "each critic received the full round-1 map and identified own vs peer"
+      (is (= {:a "c-a|own=d-a:is P true?|peer=d-b:is P true?"
+              :b "c-b|own=d-b:is P true?|peer=d-a:is P true?"}
+             (:data final))))))

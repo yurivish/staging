@@ -12,8 +12,12 @@
    consumer's input channel — `{:buf-or-n N :xform xf}` — see `connect`.
 
    Most users build steps with `step/step` (1-proc) and compose them with
-   `serial`, `merge-steps`, `connect`, `input-at`, `output-at`, and
-   `as-step`. The handler function you pass to `step/step` has signature
+   `serial`, `merge-steps`, `connect`, `input-at`, and `output-at`.
+   `serial` and `merge-steps` accept an optional keyword id as their first
+   argument — when present, the result is self-wrapped under that id as a
+   named subflow (one `[:scope id]` segment on inner events).
+
+   The handler function you pass to `step/step` has signature
    `(fn [ctx state data] → return)` and returns one of:
 
      • {port [msg-or-data ...]}                 ; no state change
@@ -133,12 +137,6 @@
   [id]
   (mk-step id (handler-map {:on-data (fn [ctx _s _d] {:out [(msg/pass ctx)]})})))
 
-(defn as-step
-  "Wrap any step into a single-entry step under `id`. Use to give a subflow
-   a stable outer name (scope prefixing derives from it)."
-  [id inner]
-  (mk-step id inner))
-
 ;; ============================================================================
 ;; Composition
 ;; ============================================================================
@@ -151,9 +149,7 @@
     (throw (ex-info (str "Step composition: proc-id collision " (vec shared))
                     {:colliding-ids (vec shared)}))))
 
-(defn merge-steps
-  "Union procs + conns. Composable via explicit `connect`."
-  [& steps]
+(defn- merge-steps-flat [steps]
   (reduce (fn [acc s]
             (assert-no-collision! acc s)
             (-> acc
@@ -161,6 +157,17 @@
                 (update :conns into (:conns s))))
           {:procs {} :conns []}
           steps))
+
+(defn merge-steps
+  "Union procs + conns. Composable via explicit `connect`.
+
+   Arity dispatch on first arg:
+     (merge-steps a b c)       — flat; inner procs visible at the outer level.
+     (merge-steps :id a b c)   — self-wrapped under `:id` (one scope segment)."
+  [& args]
+  (if (keyword? (first args))
+    (mk-step (first args) (merge-steps-flat (rest args)))
+    (merge-steps-flat args)))
 
 (defn connect
   "Add one [from → to] conn to a step.
@@ -174,10 +181,8 @@
            (cond-> [(endpoint from :out) (endpoint to :in)]
              opts (conj opts)))))
 
-(defn serial
-  "Chain steps sequentially, auto-wiring each :out to next :in."
-  [& steps]
-  (let [merged (apply merge-steps steps)
+(defn- serial-flat [steps]
+  (let [merged (merge-steps-flat steps)
         glues  (partition 2 1 steps)
         wired  (reduce (fn [acc [a b]]
                          (connect acc
@@ -187,6 +192,17 @@
     (cond-> wired
       (seq steps) (assoc :in  (:in  (first steps))
                          :out (:out (last  steps))))))
+
+(defn serial
+  "Chain steps sequentially, auto-wiring each :out to next :in.
+
+   Arity dispatch on first arg:
+     (serial a b c)       — flat; inner procs visible at the outer level.
+     (serial :id a b c)   — self-wrapped under `:id` (one scope segment)."
+  [& args]
+  (if (keyword? (first args))
+    (mk-step (first args) (serial-flat (rest args)))
+    (serial-flat args)))
 
 (defn input-at  [s ref] (assoc s :in ref))
 (defn output-at [s ref] (assoc s :out ref))
