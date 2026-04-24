@@ -12,6 +12,21 @@
 (defn make []
   (->Counters (LongAdder.) (LongAdder.) (LongAdder.)))
 
+(defn balanced?
+  "True iff some work has been sent and sent = recv = completed.
+
+   Reads each LongAdder's sum independently — not atomic across the
+   three. Under concurrent writes a transient skew can produce a false
+   negative; it cannot produce a false positive for long, because the
+   counters are monotonic and balance is a steady state. Callers use
+   this as a steady-state quiescence check, not a mid-flight consistency
+   claim."
+  [^Counters c]
+  (let [s  (.sum (.-sent c))
+        r  (.sum (.-recv c))
+        co (.sum (.-completed c))]
+    (and (pos? s) (= s r) (= r co))))
+
 (defn record-event!
   "Apply an event's counter delta in place. Returns `true` iff this event
    advanced `completed` and the flow is now balanced (potentially
@@ -22,11 +37,7 @@
     :recv     (do (.increment (.-recv c)) false)
     :send-out (do (when (:port ev) (.increment (.-sent c))) false)
     (:success :failure)
-    (do (.increment (.-completed c))
-        (let [s  (.sum (.-sent c))
-              r  (.sum (.-recv c))
-              co (.sum (.-completed c))]
-          (and (pos? s) (= s r) (= r co))))
+      (do (.increment (.-completed c)) (balanced? c))
     false))
 
 (defn record-inject!
@@ -44,18 +55,3 @@
   {:sent      (.sum (.-sent c))
    :recv      (.sum (.-recv c))
    :completed (.sum (.-completed c))})
-
-(defn balanced?
-  "True iff some work has been sent and sent = recv = completed.
-
-   Reads each LongAdder's sum independently — not atomic across the
-   three. Under concurrent writes a transient skew can produce a false
-   negative; it cannot produce a false positive for long, because the
-   counters are monotonic and balance is a steady state. Callers use
-   this as a steady-state quiescence check, not a mid-flight consistency
-   claim."
-  [^Counters c]
-  (let [s  (.sum (.-sent c))
-        r  (.sum (.-recv c))
-        co (.sum (.-completed c))]
-    (and (pos? s) (= s r) (= r co))))

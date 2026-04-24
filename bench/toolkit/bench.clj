@@ -71,9 +71,9 @@
   "Entrypoint. First arg selects a suite; default runs both."
   [& args]
   (let [which (or (first args) "all")]
-    (when-not (#{"stree" "sublist" "hist" "datapotamus" "littles" "slow-sub" "all"} which)
+    (when-not (#{"stree" "sublist" "hist" "datapotamus" "littles" "slow-sub" "counters" "all"} which)
       (binding [*out* *err*]
-        (println "usage: clojure -M:bench [stree|sublist|hist|datapotamus|littles|slow-sub]"))
+        (println "usage: clojure -M:bench [stree|sublist|hist|datapotamus|littles|slow-sub|counters]"))
       (System/exit 1))
     (when (#{"stree" "all"} which)
       ((requiring-resolve 'toolkit.stree-bench/run)))
@@ -87,4 +87,6 @@
       ((requiring-resolve 'toolkit.datapotamus-bench/littles-law-sweep)))
     (when (= "slow-sub" which)
       ((requiring-resolve 'toolkit.datapotamus-bench/slow-subscriber-experiment)))
+    (when (= "counters" which)
+      (apply (requiring-resolve 'toolkit.counters-interleaved/-main) (rest args)))
     (shutdown-agents)))

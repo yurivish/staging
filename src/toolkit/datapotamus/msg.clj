@@ -205,23 +205,22 @@
      events        : [split-or-merge-event ...]"
   [outputs input-msg step-id]
   (let [pairs       (coerce-data (flatten-outputs outputs) input-msg)
+        ;; msg-id → #{leaf-msgs}
         leaf-sets   (into {}
                           (map (fn [[_ m]] [(:msg-id m) (leaves-of m)]))
                           pairs)
-        all-leaves  (into #{} (mapcat val) leaf-sets)
-        ;; leaf-id → vector of msg-ids that reach it
+        ;; leaf-msg → [mid ...] — every msg that reaches this leaf
         referrers   (reduce (fn [acc [mid leaves]]
-                              (reduce (fn [a l]
-                                        (update a (:msg-id l) (fnil conj []) mid))
+                              (reduce (fn [a l] (update a l (fnil conj []) mid))
                                       acc leaves))
                             {} leaf-sets)
-        ;; leaf-id → {msg-id → slice}
+        ;; leaf-id → {mid → slice}
         leaf-slices (into {}
-                          (for [leaf all-leaves
-                                :let [mids   (referrers (:msg-id leaf))
-                                      slices (tok/split-tokens (:tokens leaf {})
-                                                               (count mids))]]
-                            [(:msg-id leaf) (zipmap mids slices)]))
+                          (map (fn [[leaf mids]]
+                                 [(:msg-id leaf)
+                                  (zipmap mids (tok/split-tokens (:tokens leaf {})
+                                                                 (count mids)))]))
+                          referrers)
         tokens-of   (fn [m]
                       (reduce tok/merge-tokens {}
                               (for [leaf (leaf-sets (:msg-id m))]

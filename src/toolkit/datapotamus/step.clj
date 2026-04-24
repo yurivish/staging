@@ -50,41 +50,6 @@
   (:require [toolkit.datapotamus.msg :as msg]))
 
 ;; ============================================================================
-;; Handler-map defaults
-;; ============================================================================
-;;
-;; The interpreter uses these when a handler-map doesn't supply its own.
-;; Signal / all-closed defaults read the current port spec from ctx, which
-;; the interpreter injects before every call.
-
-(defn- default-on-signal
-  "Broadcast one signal msg to each output port."
-  [ctx _state]
-  (into {} (map (fn [p] [p [(msg/signal ctx)]])) (keys (:outs ctx))))
-
-(defn- default-on-all-closed
-  "Nothing to drain. Interpreter additionally cascades (new-done) on all outs."
-  [_ctx _state]
-  {})
-
-(defn- default-on-init
-  "Fresh state — empty map."
-  []
-  {})
-
-(defn- default-on-stop
-  "No resources to release."
-  [_ctx _state]
-  nil)
-
-(defn- ensure-defaults [m]
-  (cond-> m
-    (nil? (:on-signal m))     (assoc :on-signal default-on-signal)
-    (nil? (:on-all-closed m)) (assoc :on-all-closed default-on-all-closed)
-    (nil? (:on-init m))       (assoc :on-init default-on-init)
-    (nil? (:on-stop m))       (assoc :on-stop default-on-stop)))
-
-;; ============================================================================
 ;; Predicates
 ;; ============================================================================
 
@@ -95,6 +60,18 @@
 ;; Handler-map + step constructors
 ;; ============================================================================
 
+(def ^:private DEFAULTS
+  "Filled in by `handler-map` when the user omits the slot. Signal broadcasts
+   a signal msg on every output port; all-closed emits nothing (the interpreter
+   cascades `done` onto outs in addition); init is an empty state map; stop
+   releases nothing."
+  {:ports         {:ins {:in ""} :outs {:out ""}}
+   :on-signal     (fn [ctx _state]
+                    (into {} (map (fn [p] [p [(msg/signal ctx)]])) (keys (:outs ctx))))
+   :on-all-closed (fn [_ctx _state] {})
+   :on-init       (fn []            {})
+   :on-stop       (fn [_ctx _state] nil)})
+
 (defn handler-map
   "Build a handler-map from a partial spec, filling in defaults.
 
@@ -102,9 +79,8 @@
    :on-all-closed, :on-init, or :on-stop. For ordinary handlers prefer
    `step`, which wraps a handler-map in a 1-proc step for you."
   [m]
-  (ensure-defaults
-   (cond-> m
-     (nil? (:ports m)) (assoc :ports {:ins {:in ""} :outs {:out ""}}))))
+  (reduce-kv (fn [acc k v] (cond-> acc (nil? (acc k)) (assoc k v)))
+             m DEFAULTS))
 
 (defn- mk-step [id proc-value]
   {:procs {id proc-value} :conns [] :in id :out id})

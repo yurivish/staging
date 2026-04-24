@@ -1,5 +1,5 @@
 (ns toolkit.datapotamus.trace
-  "Trace events + scoped pubsub + counters.
+  "Trace events + scoped pubsub.
 
    Events are plain maps keyed on two axes: :kind (lifecycle role —
    :recv :success :failure :send-out :split :merge :inject :flow-error
@@ -65,7 +65,7 @@
 ;; Scope helpers
 ;; ============================================================================
 
-(defn scope->tokens
+(defn- scope->tokens
   "Flatten a scope (`[[:flow fid] [:step sid] ...]`) to the vector of
    name-strings, alternating kind + id: `[\"flow\" fid \"step\" sid]`."
   [scope]
@@ -73,18 +73,12 @@
                  [(name k) (if (keyword? id) (name id) (str id))])
                scope)))
 
-(defn subject-for [scope kind]
-  (into [(name kind)] (scope->tokens scope)))
-
 (defn run-subject-for [scope kind]
-  (-> (subject-for scope kind) (conj "run")))
+  (-> [(name kind)] (into (scope->tokens scope)) (conj "run")))
 
-(defn flow-path-of [scope]
+(defn- flow-path-of [scope]
   (mapv (fn [[_ id]] (if (keyword? id) (name id) id))
         (filter (fn [[k _]] (= k :flow)) scope)))
-
-(defn scope->glob [scope]
-  (-> [:*] (into (scope->tokens scope)) (conj :>)))
 
 ;; ============================================================================
 ;; Scoped pubsub — publishing helper

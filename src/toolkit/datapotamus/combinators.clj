@@ -5,7 +5,6 @@
    groups. Everything else users want (router, retry, filter, batch...)
    composes from `step` + the message helpers; those recipes live in
    datapotamus.md, not here."
-  (:refer-clojure :exclude [merge])
   (:require [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.token :as tok]))
