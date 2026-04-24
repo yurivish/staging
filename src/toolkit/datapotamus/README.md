@@ -30,7 +30,7 @@ One step. One input port called `:in`. One output port called `:out`. It doubles
 
 The `:outputs` vector is aligned to the inputs: the first input produced `[2.0]`, the second `[4.0]`, the third `[6.0]`. `run-seq` is a convenience — it starts the flow, injects each input as one message, waits for everything to come out the other side, and then stops the flow. There's also `run!` for the single-input case. For long-running pipelines you use neither of these; you call `start!` / `inject!` / `stop!` yourself. We'll get there.
 
-*The trade-off.* `run-seq` blocks until every input has produced everything it's going to produce. That's great for finite collections; it's the wrong shape for a pipeline you feed continuously. When your use case doesn't fit, drop to the manual API (§10).
+*The trade-off.* `run-seq` blocks until every input has produced everything it's going to produce. That's great for finite collections; it's the wrong shape for a pipeline you feed continuously. When your use case doesn't fit, drop to the manual API (§11).
 
 ## A multi-step pipeline
 
@@ -51,33 +51,75 @@ One step doubling numbers is not very interesting. What we actually want is: rea
 
 Each step here is written with the simplest possible handler shape — a pure function from data to data. The library wraps it for you. No ctx, no ports, no state, no messages. You hand over a function; it gets called with each value; whatever it returns gets sent on.
 
-*The trade-off.* A pure `data → data` handler can't split its output across ports, can't drop a message, can't keep state, and can't tell you which input caused which output. Often you don't need any of that; when you do, you peel back the wrapper (§6).
+*The trade-off.* A pure `data → data` handler can't split its output across ports, can't drop a message, can't keep state, and can't tell you which input caused which output. Often you don't need any of that; when you do, you peel back the wrapper (§7).
 
 ## Branching and rejoining
 
-Before peeling anything back, one more black box. Suppose each measurement is expensive to process — say, because conversion involves a network call — and we'd like to work on a batch of them in parallel.
+A pipeline that goes left to right is the easy case. Most real work branches. Work spreads across specialists who return different answers to the same question; work spreads across identical workers to soak up load; and underneath both sits a small algebra of fan-out and fan-in that you reach for when neither of those two shapes fits. In that order.
 
 ```clojure
 (require '[toolkit.datapotamus.combinators :as c])
+```
 
+### Parallel: one input, N specialists
+
+The next feature request: each measurement wants three opinions — a cleaner that normalizes units, a geocoder that resolves where it was taken, and an enricher that pulls adjacent sensor data. Each specialist gets the same measurement; each returns its own view; downstream wants all three bundled into one object so it can decide what to do.
+
+```clojure
+(def annotate
+  (c/parallel :annotate
+    {:clean  clean-step
+     :geo    geocode-step
+     :enrich enrich-step}))
+```
+
+Input to `annotate` is one measurement. Output is one message whose `:data` is `{:clean ... :geo ... :enrich ...}` — the keys are the ports you declared. Port-of-origin doubles as role label through the fan-in, for free; downstream can tell the cleaner's answer from the geocoder's just by looking at the key.
+
+*Runtime planning.* When the set of specialists isn't known until you see the input, `:select` picks a subset of pre-declared ports (optionally with per-port payloads); `:post` reshapes the collected outputs before emission.
+
+```clojure
+(c/parallel :plan
+  {:w0 worker-0 :w1 worker-1 :w2 worker-2}
+  :select (fn [{:keys [question budget]}]
+            (let [tasks (plan-fn question budget)  ; returns 1–3 subtasks
+                  each  (quot budget (count tasks))]
+              (into {} (map-indexed
+                        (fn [i t] [(keyword (str "w" i))
+                                   {:task t :budget each}])
+                        tasks))))
+  :post vals)
+```
+
+`:select` returns a `{port payload}` map; ports not listed stay idle for that input, so the bracket scales its parallelism to the work at hand. `:post vals` drops the port keys when downstream cares about the outputs and not which worker produced each. The design constraint worth naming out loud: `core.async.flow` requires fixed output-port sets at graph-construction time, so "dynamic" here means *picking from a pre-declared pool*, not growing one at runtime. You declare the pool's maximum width once; the selector uses as little of it as it needs.
+
+*The trade-off.* `parallel` is a bracket with one shape: one input in, scatter to declared ports, each port runs its own step, gather, emit one `{port data}` map. Each port's step can itself be a composed pipeline (`step/serial A B`), two `parallel`s in series compose cleanly (the debate shape below does exactly that), and `parallel` nests inside `parallel` (see §6) — so "multi-step per-port work" and "multiple rounds with cross-sibling reads through the merged map" are already in scope. Drop to `fan-out` / `fan-in` directly when the pattern doesn't fit a port-keyed single-input bracket: groups that span several top-level inputs (dribble, pair-merger, batcher), closure protocols that aren't "every sibling emits once" (quorum, signal-driven), or custom token groups designed via `assoc-tokens` / `dissoc-tokens` (§13).
+
+### Workers: K copies of one thing
+
+Orthogonal axis. `parallel` asks "who should look at this?" `workers` asks "how many copies of one specialist do I need, to keep up with the load?" Suppose conversion involves a network call and we want a batch of measurements handled in parallel:
+
+```clojure
 (def parallel-convert (c/workers 4 slow-convert-step))
 ```
 
-`workers` gives you `k` parallel copies of an inner step, behind a round-robin router, with a join at the end that puts everything back in one stream. From the outside a `workers` block has one input port and one output port — it looks like a single operation. Internally there are four parallel procs, and each proc has its own trace scope (`<id>.w0`, `<id>.w1`, `<id>.w2`, `<id>.w3`), which surfaces utilization and latency per worker directly in the event stream if you want to look. That is the pattern: parallelism is hidden by default and made observable by stepping down into the decomposition.
+`workers` gives you `k` parallel copies of an inner step, behind a round-robin router, with a join at the end that puts everything back in one stream. From the outside a `workers` block has one input port and one output port — it looks like a single operation. Internally there are four parallel procs, and the pool lives under a single `[:scope <id>]` segment in the trace with each worker proc carrying a leaf `:step-id` of `:w0`, `:w1`, `:w2`, `:w3` (the port the router chose for it). Filter the event stream by scope to get "everything in the pool," by `:step-id` to get "everything on one worker" — utilization and latency per worker fall out for free. That is the pattern: parallelism is hidden by default and made observable by stepping down into the decomposition.
 
-Three close relatives, also black boxes for now:
+### Fan-out / fan-in: the algebra underneath
 
-- `c/fan-out` — take one message and split it into one sibling per declared output port. `(c/fan-out :dispatch [:solver :skeptic])` emits one copy on `:solver` and one on `:skeptic`, each carrying a slice of a fresh zero-sum group named by the fan-out's id. A 3-arity variant accepts a selector fn so the port subset (and per-port payload) can depend on the input.
-- `c/fan-in` — wait for those siblings to come home, then emit one merged message. The merged payload is a `{port data}` map keyed by the input port each sibling arrived on; pass an optional post-fn (e.g. `vals`) to reshape it.
-- `c/parallel` — scatter-gather bracket. Takes an id and a `{port → step}` map; the keys become the parallel ports. Internally builds a `fan-out`, wires each port to its inner step, wires each step's output to the matching `fan-in` port, and exposes a single-`:in`/single-`:out` wrapped step. `(c/parallel :roles {:solver solver-step :skeptic skeptic-step})` is the "one input, N heterogeneous specialists, collect results" pattern — no ports or wiring repeated by hand. Optional `:select` and `:post` kwargs pass through to the underlying fan-out/fan-in.
+`c/parallel` is built on two lower-level primitives, exposed because some patterns don't fit a port-keyed single-input bracket: groups that span multiple top-level inputs (dribble, pair-merger, batcher), closure protocols that aren't "every sibling emits once" (quorum, signal-driven), and custom token groups designed via `assoc-tokens` / `dissoc-tokens`. They're also the place to look when you want to understand *how* the scatter-gather actually closes.
 
-They close the loop: you fan out to a set of downstreams, you do work in parallel, you fan in by referencing the fan-out's id. `parallel` is the common case where that loop is local; `fan-out` / `fan-in` are the construction material when you need to do work between them that `parallel` can't express (iterative rounds, routing, custom coordination).
+- `c/fan-out` takes an id and a list of output ports; it emits one child per port, each carrying a different slice of a fresh zero-sum group keyed on `[id parent-msg-id]`. A three-arity form takes a selector that returns either a subset of ports (broadcast payload to those) or a `{port payload}` map (distinct payloads per port), so the scatter can depend on the input.
+- `c/fan-in` takes its own id plus the fan-out's id; it accumulates messages whose tokens carry that group, and when the XOR-sum returns to zero it emits one merged message whose `:data` is a `{port data}` map keyed by the arrival port. An optional post-fn (e.g. `vals`) reshapes the map before emission.
+
+The group key is `[fan-out-id parent-msg-id]`, not just the fan-out id. That matters: two different inputs running through the same fan-out open two different groups that close independently. **Nested fan-outs compose the same way** — the inner fan-out's group is keyed on whichever outer sibling spawned it, so three outer siblings each opening their own inner group close their inner groups independently, and only then does the outer group close. Two XOR-sums, no counters, no bookkeeping. You can nest `c/parallel` inside `c/parallel` for the same reason (we'll do exactly that in the debate example in §6).
 
 *The trade-off.* `fan-in` waits until *all* the siblings have arrived. If one is lost — dropped, or swallowed by a bug — the fan-in waits forever. We'll see in the next section why "waits for all siblings" doesn't need a counter, and also exactly how sharp the "waits forever" cliff is.
 
 ## The trick: conservation of token mass
 
 Every message in Datapotamus carries a **token-vector** — a map from `group-id` to `u64`. Tokens compose by XOR. And **every step preserves the XOR-sum of every group from its inputs to its outputs**. Not as a convention; as arithmetic that the machinery enforces.
+
+> **Invariant (conservation of token mass).** For every group `g`, every step `s`, and every invocation of `s`: the XOR-sum of `tokens[g]` over all messages entering `s` equals the XOR-sum over all messages leaving it — counting the signals and merges the framework synthesizes from the handler's recipe. Splits are K-way XOR-partitions; merges are K-way XOR-sums; both preserve the group.
 
 Why do you care? Because XOR-balance is a free timer.
 
@@ -92,6 +134,80 @@ The canonical framing is **conservation of token mass**. Tokens are XOR-balanced
 *Aside: this is Emmy Noether's trick from 1918 — symmetries imply conservation laws — redirected from reformulating Hamiltonian mechanics toward managing async pipelines. XOR commutes with routing; so XOR-sums are conserved; so closure detection is free. She probably had grander applications in mind. This one still works.*
 
 *The trade-off, and it's a real one.* Conservation gives you a free completion signal **only as long as every message arrives exactly once**. If a message is genuinely dropped — a proc crashes, a bug swallows it, the operating system declines to cooperate — the XOR sum for its group never returns to zero, and the downstream `fan-in` waits forever. No timeout fires, because there is no timeout. A duplicated message is worse: its two copies XOR-cancel in the group, so the group appears to close correctly but with fewer payloads than the producer sent. The `:split` and `:merge` events in the trace log let you reconstruct what went missing, but only after the fact, and only manually. You have traded a counter — which could have had a timeout bolted onto it — for arithmetic that genuinely does not know how to panic. Whether that's the right trade is a design decision you make once per pipeline. For work where every message matters, it's wonderful. For best-effort data streams, you'll want to layer a deadline on top.
+
+## Agentic flows
+
+"Agentic," as the term is usually meant: a graph whose nodes are specialists — often LLMs, sometimes smaller tools — whose edges carry intermediate products of reasoning, and whose topology encodes the collaboration protocol. The word means roughly what it wants to mean, and the literature has not fully decided; the interesting object is the graph, not the label. This section tours four shapes that come up often, each built from primitives you've already seen.
+
+The library's three structural properties — conservation of token mass, lineage threaded through every message, and scoped trace events — give you, for free, three things every agent framework reaches for late and awkwardly: reliable completion detection without per-shape counters, a provenance graph that makes "which input caused this output" recoverable, and per-scope observability that maps cleanly onto what a human watching the system wants to see.
+
+### Parallel roles
+
+The simplest multi-agent shape: one question, several heterogeneous roles, one answer per role.
+
+```clojure
+(def panel
+  (c/parallel :roles
+    {:solver  solver-step
+     :facts   facts-step
+     :skeptic skeptic-step
+     :second  second-step}))
+```
+
+`panel` takes one input and emits one output whose `:data` is `{:solver "…" :facts "…" :skeptic "…" :second "…"}`. Port-of-origin preserves role identity through the fan-in automatically — downstream never has to guess which answer came from the skeptic, because the skeptic's answer is under `:skeptic`. This is the shape behind every "ask N specialists and compare" workflow, and because it's scatter-gather, `c/parallel` is the right primitive.
+
+### Tool-call loops
+
+Not every agent shape is acyclic. The canonical agent-with-tools is an `:agent` step with two inputs — `:user-in` for the external drive, `:tool-result` for the loop — and two outputs — `:tool-call` to ask a tool for something, `:final` to answer the user. Wire the tool's output back to the agent's `:tool-result` with a plain `step/connect`:
+
+```clojure
+(def agent-step
+  (step/step :agent
+    {:ins  {:user-in   "" :tool-result ""}
+     :outs {:tool-call "" :final       ""}}
+    (fn [_ctx s _d]
+      (let [n (inc (:n s 0))]
+        (if (< n 3)
+          [(assoc s :n n) {:tool-call [:query]}]
+          [(assoc s :n n) {:final     [:done]}])))))
+
+(def loop-wf
+  (-> (step/beside
+        agent-step
+        (step/step :tool (constantly :tool-response))
+        (step/sink))
+      (step/connect [:agent :tool-call] [:tool  :in])
+      (step/connect [:tool  :out]       [:agent :tool-result])
+      (step/connect [:agent :final]     [:sink  :in])
+      (step/input-at  [:agent :user-in])
+      (step/output-at :sink)))
+```
+
+The external world injects one message on `[:agent :user-in]`; the agent emits a `:tool-call` which becomes a `:tool-result` which becomes another `:tool-call`, and the cycle continues until the agent emits on `:final`. The loop terminates because the agent eventually *chooses* `:final`; conservation holds because every tool-call produces exactly one tool-result that produces exactly one re-entry into the agent. Nothing in the synthesis code cares whether a message's ancestry happens to pass through the agent step a second, third, or seventeenth time — the algebra is structural, not topological. If your handler makes a principled choice to stop, the flow reaches quiescence when the trace catches up to that choice.
+
+### Dynamic subtask planning
+
+A planner with runtime-variable parallelism. Same mechanism as the `:select` example in §4 (the `c/parallel :plan` pool), reframed as the pattern it actually is: decide per-input how many specialists to dispatch, what each one gets, and leave the rest idle. Pre-declare the pool's maximum width; let the planner subset it per input; add `:post vals` when downstream only cares about the answers and not which worker produced each. The pool shape means you can't grow past the declared ports, but any subset is yours for free; the graph stays knowable at construction time and every proc has a stable identity in the trace, which is exactly what you want when something goes wrong at 3am.
+
+### Debate
+
+Two `c/parallel` brackets stacked in series, one per round.
+
+```clojure
+(def debate
+  (step/serial
+    (c/parallel :r1 {:a (debater :a) :b (debater :b)})
+    (c/parallel :r2 {:a (critic  :a) :b (critic  :b)})
+    (step/sink)))
+```
+
+The cross-talk is implicit. Round 1's fan-in emits one message whose `:data` is `{:a "debater-a's answer" :b "debater-b's answer"}` — that's the whole round-1 result set. Round 2's fan-out broadcasts that entire map to each critic (one copy to `:a`, one copy to `:b`), and each critic reads its own side from the map plus its peer's side by the other key. No dedicated "swap" step. The shape the fan-in emits is the shape the next fan-out consumes; composition does the rest.
+
+Because `c/parallel` wraps its inner procs under a `[:scope :r1]` or `[:scope :r2]` segment, a pubsub subscriber filtering on one scope gets "everything that happened in round 1" and nothing else. Debates are inspectable round-by-round without any parsing of step-id conventions, and extending to three rounds is one more `c/parallel` in the `serial`.
+
+---
+
+*A pointer forward.* The termination story for cyclic agents — "the agent eventually emits on `:final`" — rests on the three envelope shapes (data, signal, done) and the closure cascade that drives the flow to quiescence. See §10 for the envelope table and §11 for the lifecycle that uses it.
 
 ## Peeling back: the handler
 
@@ -151,7 +267,7 @@ For that, a small vocabulary of **msg constructors**:
 - `msg/signal ctx` — lineage with no payload.
 - `msg/merge ctx [p1 p2] data` — one child descending from several parents.
 
-The critical idea: the handler doesn't build *finished* output messages. It builds a **recipe** — a tree of pending msgs that records which inputs each output descends from. The framework will fill in the tokens (§8) after the handler returns. If you've met free monads, this is that — the handler says what should happen, the framework fills in details the handler isn't in a position to know.
+The critical idea: the handler doesn't build *finished* output messages. It builds a **recipe** — a tree of pending msgs that records which inputs each output descends from. The framework will fill in the tokens (§9) after the handler returns. If you've met free monads, this is that — the handler says what should happen, the framework fills in details the handler isn't in a position to know.
 
 *The trade-off.* You now have two ways to emit an output (bare data vs. msg constructor), and a reader of your handler has to know which shape applies. The common case (bare data auto-wrapping as `msg/child`) deserves the sugar, but it's a small hazard for someone new to the code.
 
@@ -172,7 +288,7 @@ State in a handler is whatever you want — a map is traditional; a set works; a
                  [(conj state x) {:out [x]}])))) ; emit: state updated
 ```
 
-A plain map return means state is unchanged. A vector `[state' port-map]` means state is updated. The initial state, if you don't configure it (§11), is `{}` — but `state` here is a set because we `conj` onto it, and Clojure is happy with that.
+A plain map return means state is unchanged. A vector `[state' port-map]` means state is updated. The initial state, if you don't configure it (§12), is `{}` — but `state` here is a set because we `conj` onto it, and Clojure is happy with that.
 
 Returning `[state {}]` drops the payload. It doesn't drop the *tokens* — the framework auto-synthesizes a signal on every output port for any data-handler that returns an empty port-map, so the input's tokens propagate onward for downstream closure. This is what you want 99% of the time. For the 1% — pair-mergers, batchers, dribblers that stash the input and emit a merge from it later — return `msg/drain` instead of `{}` to suppress the auto-signal (the stashed ref carries the tokens via the eventual merge, and the auto-signal would double-count).
 
@@ -180,7 +296,7 @@ Returning `[state {}]` drops the payload. It doesn't drop the *tokens* — the f
 
 ### Layer 4: custom signals, done, lifecycle
 
-There is one more layer. It's where we open our output file. We need two more concepts first — the three envelope shapes (§9) and the full lifecycle (§10) — so we'll come back to it in §11.
+There is one more layer. It's where we open our output file. We need two more concepts first — the three envelope shapes (§10) and the full lifecycle (§11) — so we'll come back to it in §12.
 
 ## Peeling back: the recipe
 
@@ -192,7 +308,7 @@ The handler builds this tree and returns it. It doesn't know yet what tokens eac
 
 ### The single-invocation invariant
 
-One rule matters more than almost anything else in this library. The docstring on `step/step` calls it out; it's worth repeating here because it falls out of the synthesis arithmetic in §8 and you need to carry it in your head:
+One rule matters more than almost anything else in this library. The docstring on `step/step` calls it out; it's worth repeating here because it falls out of the synthesis arithmetic in §9 and you need to carry it in your head:
 
 > **Every child message ever derived from a given parent must be emitted from a single handler invocation.**
 
@@ -210,14 +326,14 @@ The fold does this:
 2. For each leaf, count how many pending msgs descend from it. Call that K.
 3. XOR-split the leaf's tokens into K pieces. (Cheap: generate K−1 random u64s; the Kth is whatever XORs with them to equal the leaf's value.)
 4. Merge the right piece into each descendant's token-vector.
-5. Apply any stamped `::assoc-tokens` / `::dissoc-tokens` decorations — the escape hatches for designing custom groups (§12).
+5. Apply any stamped `::assoc-tokens` / `::dissoc-tokens` decorations — the escape hatches for designing custom groups (§13).
 6. Strip the refs. Tag `:tokens` on. Emit a `:split` or `:merge` trace event per materialized msg.
 
 All pure. No channels, no atoms, no runtime. Property-test it over randomized provenance DAGs; conservation holds by construction because the only arithmetic is K-way splitting and XOR-merging, both of which preserve the group operation.
 
 This is where the design earns its keep. Conservation is not *asserted* somewhere and then *checked* later. It's baked into the one path that produces output. A message that comes out of synthesis cannot violate conservation, because that is not a thing the synthesis code is capable of doing.
 
-It is, however, a thing user code *can* do — see the single-invocation invariant in §7 above.
+It is, however, a thing user code *can* do — see the single-invocation invariant in §8 above.
 
 *The trade-off.* The K-way split is positional. Each output's tokens are computed from its place in the DAG at this instant, not from any identity it carries. That means if you want to correlate outputs to inputs in some *application-level* way (e.g., "which input produced this output"), use the `:parent-msg-ids` chain or the `:data-id` field. Tokens are for closure detection. The lineage graph underneath them is the provenance mechanism.
 
@@ -231,7 +347,7 @@ A message envelope is a plain map. Three shapes, distinguished by which keys are
 | **signal** | no  | yes | Tokens alone, no payload. Use it to coordinate. |
 | **done**   | no  | no  | End of stream. |
 
-"Signal" is the interesting one. It's a pulse that carries tokens but no data — send it through the graph when you want the token math to happen without anyone having to process a payload. Most coordination patterns use signals. In fact, the common case is so common that the framework does it for you: a data handler that returns an empty port-map (`{}` or `[state' {}]`) gets a signal auto-synthesized on every declared output port, so the input's tokens propagate for downstream closure. That's what filters, dedups, and skips rely on. Two cases want the opposite — suppress the auto-signal by returning `msg/drain` instead: deferred propagation (pair-mergers, batchers — see §7), and the rare genuine drop where you *really* want the tokens to die here. Conservation is optional on your terms; just say so explicitly.
+"Signal" is the interesting one. It's a pulse that carries tokens but no data — send it through the graph when you want the token math to happen without anyone having to process a payload. Most coordination patterns use signals. In fact, the common case is so common that the framework does it for you: a data handler that returns an empty port-map (`{}` or `[state' {}]`) gets a signal auto-synthesized on every declared output port, so the input's tokens propagate for downstream closure. That's what filters, dedups, and skips rely on. Two cases want the opposite — suppress the auto-signal by returning `msg/drain` instead: deferred propagation (pair-mergers, batchers — see §8), and the rare genuine drop where you *really* want the tokens to die here. Conservation is optional on your terms; just say so explicitly.
 
 Your handler's `:on-data` doesn't see signals; they arrive at `:on-signal` instead (default: broadcast unchanged to every output port).
 
@@ -278,7 +394,7 @@ Layer observability on top of the manual tier:
 (flow/await-quiescent! h)   ; block until they balance
 ```
 
-Quiescence is defined arithmetically: `sent = recv + completed`. No polling, no timeouts, just balance. Every injected envelope leaves the system either as a receipt or as a completion event — another conservation law, if you're keeping score.
+Quiescence is defined arithmetically: `sent > 0` and `sent = recv = completed`. Every message sent lands as a receive somewhere; every receive eventually closes with either `:success` or `:failure`; when all three counts meet, nothing is in flight and nothing is pending. No polling, no timeouts, just balance — two conservation laws stacked on top of each other, if you're keeping score.
 
 For a live event firehose, subscribe on the pubsub directly. Pass your own `pubsub/make` via `{:pubsub ps}` to `start!`, register handlers with `pubsub/sub`, and the flow will publish onto it as it runs. Subjects have the shape `[<kind> "scope" <fid> ("scope" <sub>)* ("step" <sid>)?]`. Glob patterns work: `[:* "scope" "ingest" :>]` gets everything in one flow; `["recv" "scope" :* :>]` gets every receive across all of them. The core never self-subscribes — it only publishes — so you own the subscriber lifecycle.
 
@@ -362,8 +478,9 @@ That seam is the most important design decision in the library. The algebra does
 msg.clj          envelopes, free algebra, pure synthesis
 step.clj         steps, handler-maps, composition
 flow.clj         the interpreter — the only file that imports core.async.flow
-combinators.clj  fan-out, fan-in, workers
+combinators.clj  parallel, fan-out, fan-in, workers
 token.clj        the u64 XOR algebra
+counters.clj     sent / recv / completed; LongAdder-backed
 trace.clj        event constructors and scoped pubsub
                    (don't import this; subscribe on the pubsub instead)
 ```
@@ -375,7 +492,7 @@ Typical aliases:
 | `toolkit.datapotamus.step`        | `:as step` | Always |
 | `toolkit.datapotamus.flow`        | `:as flow` | Always |
 | `toolkit.datapotamus.msg`         | `:as msg`  | Whenever building msgs |
-| `toolkit.datapotamus.combinators` | `:as c`    | Fan-out, fan-in, workers |
+| `toolkit.datapotamus.combinators` | `:as c`    | Parallel, workers, fan-out / fan-in |
 | `toolkit.datapotamus.token`       | `:as tok`  | Designing new combinators |
 
 ---

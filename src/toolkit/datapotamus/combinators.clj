@@ -14,11 +14,14 @@
                  emit a single merge keyed by arrival port.
 
    `fan-out`/`fan-in` are exposed as user primitives because they are
-   the construction material for patterns `parallel` can't express —
-   iterative rounds that keep a group open across intermediate steps,
-   ad-hoc routing, custom coordination protocols (see the dribble /
-   pair-merger exemplars in the tests). A fan-out's id doubles as its
-   group name; `fan-in` references the fan-out by that id.
+   the construction material for patterns that don't fit a port-keyed
+   single-input bracket — groups that span multiple top-level inputs,
+   closure protocols that aren't \"every sibling emits once\", custom
+   token groups designed via `assoc-tokens`/`dissoc-tokens` (see the
+   dribble / pair-merger exemplars in the tests). Per-port multi-step
+   work and nested/serial `parallel`s are already `parallel`'s job —
+   hand it a composed step as a port's value. A fan-out's id doubles
+   as its group name; `fan-in` references the fan-out by that id.
 
    `workers` is a different axis: K round-robin copies of one inner
    step for stream-level throughput parallelism — unrelated to the
@@ -29,10 +32,11 @@
             [toolkit.datapotamus.token :as tok]))
 
 (defn fan-out
-  "Low-level primitive. If your downstream is a simple scatter-gather
-   with no work between split and merge that needs the group open,
-   reach for `parallel` instead — it wraps `fan-out` + inner steps +
-   `fan-in` in one call with no repeated port list.
+  "Low-level primitive. For the common scatter-gather case — one input
+   to a set of per-port steps (each of which may itself be a composed
+   pipeline) and gather the results into a `{port data}` map — reach
+   for `parallel` instead; it wraps `fan-out` + inner steps + `fan-in`
+   in one call with no repeated port list.
 
    Emit one child per declared port, each tagged with a slice of a fresh
    zero-sum group keyed on `[id parent-msg-id]`. Downstream `fan-in`
