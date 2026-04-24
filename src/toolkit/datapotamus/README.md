@@ -67,10 +67,10 @@ Before peeling anything back, one more black box. Suppose each measurement is ex
 
 Two close relatives, also black boxes for now:
 
-- `c/fan-out` — take one message and split it into `n` siblings.
-- `c/fan-in` — wait for those siblings to come home, then emit one merged message.
+- `c/fan-out` — take one message and split it into one sibling per declared output port. `(c/fan-out :dispatch [:solver :skeptic])` emits one copy on `:solver` and one on `:skeptic`, each carrying a slice of a fresh zero-sum group named by the fan-out's id. A 3-arity variant accepts a selector fn so the port subset (and per-port payload) can depend on the input.
+- `c/fan-in` — wait for those siblings to come home, then emit one merged message. The merged payload is a `{port data}` map keyed by the input port each sibling arrived on; pass an optional post-fn (e.g. `vals`) to reshape it.
 
-They close the loop: you fan out, you do work in parallel, you fan in.
+They close the loop: you fan out to a set of downstreams, you do work in parallel, you fan in by referencing the fan-out's id.
 
 *The trade-off.* `fan-in` waits until *all* the siblings have arrived. If one is lost — dropped, or swallowed by a bug — the fan-in waits forever. We'll see in the next section why "waits for all siblings" doesn't need a counter, and also exactly how sharp the "waits forever" cliff is.
 
@@ -325,21 +325,23 @@ Token control has three layers, matching the three ways a message can pick up to
 2. **Annotated.** You return msg envelopes decorated with `msg/assoc-tokens` or `msg/dissoc-tokens`. Synthesis distributes the parent's tokens normally, then applies your annotations on top.
 3. **Raw.** You compute token maps directly with `tok/split-value`, `tok/split-tokens`, `tok/merge-tokens` when designing a new protocol from scratch.
 
-Here is the entire body of `c/fan-out`, minus the id boilerplate:
+Here is the entire body of `c/fan-out`, minus the id/ports boilerplate:
 
 ```clojure
 (fn [ctx _s d]
-  (let [gid    [group-id (:msg-id (:msg ctx))]
-        values (tok/split-value 0 n)           ; n u64s that XOR to 0
-        kids   (msg/children ctx (repeat n d))
-        kids'  (mapv (fn [k v] (msg/assoc-tokens k {gid v}))
-                     kids values)]
-    {:out kids'}))
+  (let [gid     [id (:msg-id (:msg ctx))]
+        by-port (selector-fn d)                ; {port payload}
+        n       (count by-port)
+        values  (tok/split-value 0 n)          ; n u64s that XOR to 0
+        kids    (for [[[port payload] v] (map vector by-port values)]
+                  [port [(-> (msg/child ctx payload)
+                             (msg/assoc-tokens {gid v}))]])]
+    (into {} kids)))
 ```
 
-Four lines. `split-value 0 n` gives us `n` u64 values that XOR to zero — a zero-sum group. `msg/children` builds `n` pending msgs, all descending from the current input. We stamp each one with a different slice using `assoc-tokens`. Synthesis takes care of the rest: the original input's tokens get distributed across the `n` children as usual, and *on top of that*, each child picks up its slice of the new group.
+A handful of lines. `split-value 0 n` gives us `n` u64 values that XOR to zero — a zero-sum group. One `msg/child` is built per declared port, each stamped with a different slice via `assoc-tokens`. Synthesis takes care of the rest: the original input's tokens get distributed across the `n` children as usual, and *on top of that*, each child picks up its slice of the new group.
 
-Downstream, `c/fan-in` accumulates messages tagged with that group, XORs their values, and when the XOR returns to zero calls `msg/dissoc-tokens` to strip the group key from the merged output. The group closes and vanishes. No counter. No accounting. Four lines for fan-out, about ten for fan-in.
+Downstream, `c/fan-in` accumulates messages tagged with that group, XORs their values, and when the XOR returns to zero calls `msg/dissoc-tokens` to strip the group key from the merged output. The merged payload is a `{port data}` map keyed by the port each sibling arrived on (an optional post-fn reshapes it). The group closes and vanishes. No counter. No accounting.
 
 The same technique supports your own protocols. A priority token that a downstream router reads and dispatches on. A dribble pattern where one producer emits N messages over time, each carrying a balancing piece of a zero-sum group, and downstream knows the stream is complete when the XOR closes. The tests under `assoc-tokens-mints-custom-group` and `dribble-closes-conservation` are in-repo exemplars.
 

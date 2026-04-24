@@ -77,6 +77,21 @@
    (filterv #(and (= kind (:kind %)) (= msg-kind (:msg-kind %)))
             (:events result))))
 
+(defn- wire-all
+  "Connect every port of `from-id` in `from-ports` to `[to-id to-port]`.
+   Common when a fan-out's multiple output ports all feed one downstream step."
+  ([wf from-id from-ports to-id]
+   (wire-all wf from-id from-ports to-id :in))
+  ([wf from-id from-ports to-id to-port]
+   (reduce (fn [w p] (step/connect w [from-id p] [to-id to-port]))
+           wf from-ports)))
+
+(defn- wire-ports
+  "Connect each of `ports` on `from-id` to the same-named port on `to-id`.
+   Pairs naturally with `fan-out ports` → `fan-in ports` (symmetric shape)."
+  [wf from-id to-id ports]
+  (reduce (fn [w p] (step/connect w [from-id p] [to-id p])) wf ports))
+
 (defn- events->dag
   "Fold events into a stuartsierra dependency graph + a {msg-id → kind}
    map. Each msg depends on its parents (per :parent-msg-ids). Used by
@@ -642,7 +657,7 @@
 (deftest children-splits-tokens-across-siblings
   (let [seen (atom [])
         wf (-> (step/merge-steps
-                (c/fan-out :fo 1)
+                (c/fan-out :fo [:out])
                 (step/step :burst {:ins {:in ""} :outs {:out ""}}
                            (fn [ctx s _d]
                              (let [kids (msg/children ctx [:a :b :c])]
@@ -759,10 +774,15 @@
 ;; downstream message traces back to the single injected item through
 ;; :split / :merge.
 (deftest provenance-dag-is-well-formed
-  (let [wf     (step/serial
-               (c/fan-out :split 3)
-               (c/fan-in :fi :split)
-               (step/sink))
+  (let [ports  [:a :b :c]
+        wf     (-> (step/merge-steps
+                    (c/fan-out :split ports)
+                    (c/fan-in :fi :split ports)
+                    (step/sink))
+                   (wire-ports :split :fi ports)
+                   (step/connect [:fi :out] [:sink :in])
+                   (step/input-at :split)
+                   (step/output-at :sink))
         result (run! wf {:data :x})
         {:keys [g kinds]} (events->dag (:events result))]
     (testing "graph is acyclic"
@@ -777,9 +797,13 @@
 
 ;; Frequency summaries match the topology: one fan-out input → three sink recvs.
 (deftest multiplicity-frequencies
-  (let [wf     (step/serial
-               (c/fan-out :split 3)
-               (step/sink))
+  (let [ports  [:a :b :c]
+        wf     (-> (step/merge-steps
+                    (c/fan-out :split ports)
+                    (step/sink))
+                   (wire-all :split ports :sink)
+                   (step/input-at :split)
+                   (step/output-at :sink))
         result (run! wf {:data :x})]
     (testing "each step's :recv, :success, :send-out frequencies"
       (is (= {:split 1 :sink 3}
@@ -801,9 +825,13 @@
 
 ;; fan-out emits N children on :out whose fresh group token XOR-sums to 0.
 (deftest static-fan-out
-  (let [wf     (step/serial
-               (c/fan-out :split 3)
-               (step/sink))
+  (let [ports  [:a :b :c]
+        wf     (-> (step/merge-steps
+                    (c/fan-out :split ports)
+                    (step/sink))
+                   (wire-all :split ports :sink)
+                   (step/input-at :split)
+                   (step/output-at :sink))
         result (run! wf {:data :x})]
     (testing "run completes"
       (is (= :completed (:state result))))
@@ -826,12 +854,14 @@
               vs (mapv (fn [e] (get-in e [:tokens gk])) split-sends)]
           (is (= 0 (reduce bit-xor vs))))))))
 
-;; fan-out with ordinary pure-fn steps upstream — each of 3 copies carries
-;; the doubled value downstream.
+;; An upstream pure-fn step doubles, a downstream step emits three copies via
+;; bare-data auto-wrapping (each becomes a msg/child). No tokens minted; this
+;; is the mundane "1 → N outputs" pattern, no zero-sum group required.
 (deftest math-double-and-triple
   (let [wf     (step/serial
                (step/step :dbl #(* 2 %))
-               (c/fan-out :triple 3)
+               (step/step :triple {:ins {:in ""} :outs {:out ""}}
+                          (fn [_ctx _s d] {:out [d d d]}))
                (step/sink))
         result (run! wf {:data 5})]
     (testing "run completes"
@@ -847,10 +877,15 @@
 ;; fan-in closes the group: one :merge event carrying all three parents,
 ;; exactly one downstream send-out, one sink recv.
 (deftest token-fan-in
-  (let [wf     (step/serial
-               (c/fan-out :split 3)
-               (c/fan-in :fi :split)
-               (step/sink))
+  (let [ports  [:a :b :c]
+        wf     (-> (step/merge-steps
+                    (c/fan-out :split ports)
+                    (c/fan-in :fi :split ports)
+                    (step/sink))
+                   (wire-ports :split :fi ports)
+                   (step/connect [:fi :out] [:sink :in])
+                   (step/input-at :split)
+                   (step/output-at :sink))
         result (run! wf {:data :x})]
     (testing "run completes"
       (is (= :completed (:state result))))
@@ -875,12 +910,20 @@
 ;; Nesting composes: the inner fan-in closes 3 times (once per outer child),
 ;; the outer fan-in closes exactly once and the sink gets a single message.
 (deftest nested-fan-out-fan-in-composes
-  (let [wf     (step/serial
-               (c/fan-out :outer 3)
-               (c/fan-out :inner 2)
-               (c/fan-in  :fi-inner :inner)
-               (c/fan-in  :fi-outer :outer)
-               (step/sink))
+  (let [outer-ports [:o0 :o1 :o2]
+        inner-ports [:i0 :i1]
+        wf     (-> (step/merge-steps
+                    (c/fan-out :outer outer-ports)
+                    (c/fan-out :inner inner-ports)
+                    (c/fan-in  :fi-inner :inner inner-ports)
+                    (c/fan-in  :fi-outer :outer [:in])
+                    (step/sink))
+                   (wire-all :outer outer-ports :inner)
+                   (wire-ports :inner :fi-inner inner-ports)
+                   (step/connect [:fi-inner :out] [:fi-outer :in])
+                   (step/connect [:fi-outer :out] [:sink :in])
+                   (step/input-at :outer)
+                   (step/output-at :sink))
         result (run! wf {:data :x})
         merges (events-of result :merge)]
     (testing "run completes"
@@ -1002,7 +1045,7 @@
                            a (-> (msg/child ctx :a-side) (msg/assoc-tokens {gid v1}))
                            b (-> (msg/child ctx :b-side) (msg/assoc-tokens {gid v2}))]
                        [s {:a [a] :b [b]}])))
-        wf (-> (step/merge-steps minter (c/fan-in :fi gid-key) (step/sink))
+        wf (-> (step/merge-steps minter (c/fan-in :fi gid-key [:in]) (step/sink))
                (step/connect [:minter :a] [:fi :in])
                (step/connect [:minter :b] [:fi :in])
                (step/connect [:fi :out] [:sink :in])
@@ -1345,9 +1388,10 @@
       (is (= [[1] [] [3] []] (:outputs result))))))
 
 ;; One input can produce many outputs — each attributed to its originating input.
-(deftest run-seq-fan-out-produces-multiple-outputs-per-input
-  (let [result (flow/run-seq (step/serial (step/step :dbl #(* 2 %))
-                                          (c/fan-out :three 3))
+(deftest run-seq-one-input-produces-multiple-outputs
+  (let [triple (step/step :triple {:ins {:in ""} :outs {:out ""}}
+                          (fn [_ctx _s d] {:out [d d d]}))
+        result (flow/run-seq (step/serial (step/step :dbl #(* 2 %)) triple)
                              [5 7])]
     (is (= :completed (:state result)))
     (testing "each input contributes three copies of its doubled value"
@@ -1421,7 +1465,8 @@
         u (pubsub/sub ps ["recv" "flow" "run-A" :>]
                       (fn [_ _ _] (swap! recv-count inc)))
         wf (step/serial
-           (c/fan-out :split 3)
+           (step/step :split {:ins {:in ""} :outs {:out ""}}
+                      (fn [_ctx _s d] {:out [d d d]}))
            (step/sink))
         result (run! wf {:pubsub ps :flow-id "run-A" :data :x})]
     (u)
@@ -1658,3 +1703,287 @@
         res   (flow/run-seq wf [1 2 3 4])]
     (is (= :completed (:state res)))
     (is (= [[4] [6] [8] [10]] (:outputs res)))))
+
+;; ============================================================================
+;; Act XVII — Agent workflow patterns
+;;
+;; Four canonical agent-workflow shapes expressed with `fan-out` + `fan-in`
+;; (LLM seams mocked with pure fns). Each test asserts final output, arrival
+;; multiplicity, and that the flow reaches :completed. Together they form
+;; the reference for how to compose these combinators into multi-specialist
+;; orchestrations without leaking conservation discipline into user code.
+;;
+;;   parallel-roles   — same question to N heterogeneous roles, each on its
+;;                      own port, fan-in rejoins by role.
+;;   ensemble         — same question to N homogeneous workers at different
+;;                      temperatures, fan-in drops port keys via `vals`,
+;;                      judge picks best.
+;;   subtask-parallel — dynamic selector splits the budget across a
+;;                      runtime-decided subset of a pre-declared worker
+;;                      pool; fan-in collects their answers.
+;;   debate           — two debaters; a swap step feeds each debater's
+;;                      answer to the opposing critic; fan-in closes the
+;;                      fan-out's zero-sum group after all four
+;;                      round-trips.
+;; ============================================================================
+
+;; fan-out dynamic selector — vector return form. Emits on the subset of
+;; ports named by the selector, broadcasting the input payload to each.
+(deftest fan-out-dynamic-selector-vector-return
+  (let [ports  [:a :b :c]
+        wf     (-> (step/merge-steps
+                    (c/fan-out :dyn ports (fn [d] (:pick d)))
+                    (step/sink))
+                   (wire-all :dyn ports :sink)
+                   (step/input-at :dyn)
+                   (step/output-at :sink))
+        result (run! wf {:data {:pick [:a :c] :payload :x}})]
+    (is (= :completed (:state result)))
+    (testing "only selected ports receive a message; the unused port sees none"
+      (is (= {:a 1 :c 1}
+             (frequencies (map :port
+                                (filterv #(and (= :dyn (:step-id %)) (:port %))
+                                         (events-of result :send-out)))))))))
+
+;; fan-out dynamic selector — map return form. Each selected port gets a
+;; distinct payload computed by the selector.
+(deftest fan-out-dynamic-selector-map-return
+  (let [ports  [:a :b :c]
+        wf     (-> (step/merge-steps
+                    (c/fan-out :dyn ports (fn [d] {:a (:x d) :b (:y d)}))
+                    (step/sink))
+                   (wire-all :dyn ports :sink)
+                   (step/input-at :dyn)
+                   (step/output-at :sink))
+        result (run! wf {:data {:x 1 :y 2}})
+        recvs  (filterv #(= :sink (:step-id %)) (events-of result :recv))]
+    (is (= :completed (:state result)))
+    (testing "each selected port delivered its distinct payload exactly once"
+      (is (= {1 1, 2 1} (frequencies (map :data recvs)))))))
+
+;; fan-in preserves port-of-origin in its output :data — a {port data} map
+;; keyed by the port each sibling arrived on.
+(deftest fan-in-preserves-port-of-origin
+  (let [ports  [:a :b :c]
+        wf     (-> (step/merge-steps
+                    (c/fan-out :split ports (fn [_] {:a 1 :b 2 :c 3}))
+                    (c/fan-in :gather :split ports)
+                    (step/sink))
+                   (wire-ports :split :gather ports)
+                   (step/connect [:gather :out] [:sink :in])
+                   (step/input-at :split)
+                   (step/output-at :sink))
+        result (run! wf {:data :go})
+        merged (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
+    (is (= :completed (:state result)))
+    (testing "fan-in output is a map keyed by the sibling's arrival port"
+      (is (= {:a 1 :b 2 :c 3} (:data merged))))))
+
+;; fan-in post-fn — `vals` drops the port keys, leaving just the payloads.
+(deftest fan-in-post-fn-drops-port-keys
+  (let [ports  [:a :b :c]
+        wf     (-> (step/merge-steps
+                    (c/fan-out :split ports (fn [_] {:a 1 :b 2 :c 3}))
+                    (c/fan-in :gather :split ports vals)
+                    (step/sink))
+                   (wire-ports :split :gather ports)
+                   (step/connect [:gather :out] [:sink :in])
+                   (step/input-at :split)
+                   (step/output-at :sink))
+        result (run! wf {:data :go})
+        merged (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
+    (is (= :completed (:state result)))
+    (testing "post-fn applied to the {port data} map"
+      (is (= #{1 2 3} (set (:data merged))))
+      (is (= 3 (count (:data merged)))))))
+
+;; Parallel-roles: one question fans out to four heterogeneous specialists,
+;; each running its own prompt fn. Fan-in rejoins a {role result} map.
+(deftest parallel-roles-agent-workflow
+  (let [prompt-fn   (fn [role q] (str (name role) ":" q))
+        roles       [:solver :facts :skeptic :second]
+        role-step   (fn [id] (step/step id (fn [{:keys [question]}] (prompt-fn id question))))
+        wf (-> (step/merge-steps
+                (c/fan-out :dispatch roles)
+                (role-step :solver)
+                (role-step :facts)
+                (role-step :skeptic)
+                (role-step :second)
+                (c/fan-in :agg :dispatch roles)
+                (step/sink))
+               (step/connect [:dispatch :solver]  [:solver  :in])
+               (step/connect [:dispatch :facts]   [:facts   :in])
+               (step/connect [:dispatch :skeptic] [:skeptic :in])
+               (step/connect [:dispatch :second]  [:second  :in])
+               (step/connect [:solver  :out] [:agg :solver])
+               (step/connect [:facts   :out] [:agg :facts])
+               (step/connect [:skeptic :out] [:agg :skeptic])
+               (step/connect [:second  :out] [:agg :second])
+               (step/connect [:agg :out] [:sink :in])
+               (step/input-at :dispatch)
+               (step/output-at :sink))
+        result (run! wf {:data {:question "is P true?"}})
+        final  (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
+    (is (= :completed (:state result)))
+    (testing "each role ran exactly once; agg recv'd 4 msgs but emitted 1 merged output"
+      (let [freqs (frequencies (map :step-id (events-of result :recv)))]
+        (is (= {:dispatch 1 :solver 1 :facts 1 :skeptic 1 :second 1 :sink 1}
+               (select-keys freqs [:dispatch :solver :facts :skeptic :second :sink])))
+        (is (= 4 (:agg freqs)))
+        (is (= 1 (count (filterv #(= :agg (:step-id %))
+                                 (events-of result :merge)))))))
+    (testing "aggregator output preserves role identity via port-of-origin"
+      (is (= {:solver  "solver:is P true?"
+              :facts   "facts:is P true?"
+              :skeptic "skeptic:is P true?"
+              :second  "second:is P true?"}
+             (:data final))))))
+
+;; Ensemble: one question to N homogeneous workers at varying temperatures,
+;; fan-in with `vals` strips port keys, judge picks the best candidate.
+(deftest ensemble-agent-workflow
+  (let [temps       {:w0 0.7 :w1 0.9 :w2 1.0 :w3 1.1}
+        ports       (vec (keys temps))
+        solve-fn    (fn [q temp] {:answer (str q) :temp temp :score (* 10 temp)})
+        worker      (fn [id] (step/step id (fn [q] (solve-fn q (get temps id)))))
+        judge       (step/step :pick (fn [cs] (apply max-key :score cs)))
+        wf (-> (step/merge-steps
+                (c/fan-out :ens ports)
+                (worker :w0) (worker :w1) (worker :w2) (worker :w3)
+                (c/fan-in :judge :ens ports vals)
+                judge
+                (step/sink))
+               (step/connect [:ens :w0] [:w0 :in])
+               (step/connect [:ens :w1] [:w1 :in])
+               (step/connect [:ens :w2] [:w2 :in])
+               (step/connect [:ens :w3] [:w3 :in])
+               (step/connect [:w0 :out] [:judge :w0])
+               (step/connect [:w1 :out] [:judge :w1])
+               (step/connect [:w2 :out] [:judge :w2])
+               (step/connect [:w3 :out] [:judge :w3])
+               (step/connect [:judge :out] [:pick :in])
+               (step/connect [:pick :out] [:sink :in])
+               (step/input-at :ens)
+               (step/output-at :sink))
+        result (run! wf {:data "explain X"})
+        final  (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
+    (is (= :completed (:state result)))
+    (testing "every worker ran exactly once; judge picked the highest-score candidate"
+      (is (= {:w0 1 :w1 1 :w2 1 :w3 1}
+             (select-keys (frequencies (map :step-id (events-of result :recv)))
+                          ports)))
+      (is (= 1.1 (:temp (:data final))))
+      (is (= 11.0 (:score (:data final)))))))
+
+;; Subtask-parallel: planner produces a runtime-variable number of subtasks,
+;; routed to a subset of a pre-declared worker pool via fan-out's 3-arity
+;; selector. Fan-in with `vals` collects the answers; combiner finalizes.
+(deftest subtask-parallel-agent-workflow
+  (let [K            3
+        worker-ports (mapv #(keyword (str "w" %)) (range K))
+        plan-fn      (fn [q _budget] [(str q "-a") (str q "-b")])
+        solve-fn     (fn [{:keys [task budget]}] {:task task :budget budget :answer (str "done:" task)})
+        combine-fn   (fn [answers] {:combined (mapv :answer answers) :n (count answers)})
+        planner      (c/fan-out :plan worker-ports
+                                (fn [{:keys [question budget]}]
+                                  (let [tasks (plan-fn question budget)
+                                        each  (quot budget (count tasks))]
+                                    (into {} (map-indexed
+                                              (fn [i t] [(nth worker-ports i)
+                                                         {:task t :budget each}])
+                                              tasks)))))
+        worker       (fn [id] (step/step id solve-fn))
+        combiner     (step/step :combine combine-fn)
+        wf (-> (step/merge-steps
+                planner
+                (worker :w0) (worker :w1) (worker :w2)
+                (c/fan-in :gather :plan worker-ports vals)
+                combiner
+                (step/sink))
+               (step/connect [:plan :w0] [:w0 :in])
+               (step/connect [:plan :w1] [:w1 :in])
+               (step/connect [:plan :w2] [:w2 :in])
+               (step/connect [:w0 :out] [:gather :w0])
+               (step/connect [:w1 :out] [:gather :w1])
+               (step/connect [:w2 :out] [:gather :w2])
+               (step/connect [:gather :out] [:combine :in])
+               (step/connect [:combine :out] [:sink :in])
+               (step/input-at :plan)
+               (step/output-at :sink))
+        result (run! wf {:data {:question "Q" :budget 100}})
+        final  (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
+    (is (= :completed (:state result)))
+    (testing "planner produced 2 subtasks; only :w0 and :w1 ran; gather emitted one merge"
+      (let [freqs (frequencies (map :step-id (events-of result :recv)))]
+        (is (= 1 (:plan freqs)))
+        (is (= 1 (:w0 freqs)))
+        (is (= 1 (:w1 freqs)))
+        (is (nil? (:w2 freqs)))
+        (is (= 2 (:gather freqs)))
+        (is (= 1 (:combine freqs)))
+        (is (= 1 (:sink freqs)))
+        (is (= 1 (count (filterv #(= :gather (:step-id %))
+                                 (events-of result :merge)))))))
+    (testing "combiner saw both answers in deterministic order"
+      (is (= 2 (:n (:data final))))
+      (is (= #{"done:Q-a" "done:Q-b"} (set (:combined (:data final))))))))
+
+;; Debate: two debaters answer independently (round 1); a swap step hands
+;; each debater's answer to the opposing critic (round 2); a final fan-in
+;; closes the original fan-out's zero-sum group with all four contributions
+;; carried through the merged lineage.
+(deftest debate-agent-workflow
+  (let [debater-fn (fn [side q] (str "d-" (name side) ":" q))
+        critic-fn  (fn [{:keys [own peer side]}]
+                     {:side side :own own :peer peer
+                      :verdict (str "c-" (name side) "|own=" own "|peer=" peer)})
+        dA         (step/step :dA (fn [q] (debater-fn :a q)))
+        dB         (step/step :dB (fn [q] (debater-fn :b q)))
+        swap-step  (step/step :swap
+                              {:ins {:a "" :b ""} :outs {:to-a "" :to-b ""}}
+                              (fn [ctx s _d]
+                                (let [p  (:in-port ctx)
+                                      s' (assoc-in s [:msgs p] (:msg ctx))]
+                                  (if (= #{:a :b} (set (keys (:msgs s'))))
+                                    (let [pa (get-in s' [:msgs :a])
+                                          pb (get-in s' [:msgs :b])
+                                          a1 (:data pa)
+                                          b1 (:data pb)]
+                                      [(dissoc s' :msgs)
+                                       {:to-a [(msg/merge ctx [pa pb] {:own a1 :peer b1 :side :a})]
+                                        :to-b [(msg/merge ctx [pa pb] {:own b1 :peer a1 :side :b})]}])
+                                    [s' msg/drain]))))
+        cA         (step/step :cA critic-fn)
+        cB         (step/step :cB critic-fn)
+        wf (-> (step/merge-steps
+                (c/fan-out :r1 [:a :b])
+                dA dB swap-step cA cB
+                (c/fan-in :agg :r1 [:a :b] vals)
+                (step/sink))
+               (step/connect [:r1 :a]   [:dA :in])
+               (step/connect [:r1 :b]   [:dB :in])
+               (step/connect [:dA :out] [:swap :a])
+               (step/connect [:dB :out] [:swap :b])
+               (step/connect [:swap :to-a] [:cA :in])
+               (step/connect [:swap :to-b] [:cB :in])
+               (step/connect [:cA :out] [:agg :a])
+               (step/connect [:cB :out] [:agg :b])
+               (step/connect [:agg :out] [:sink :in])
+               (step/input-at :r1)
+               (step/output-at :sink))
+        result (run! wf {:data "is P true?"})
+        final  (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]
+    (is (= :completed (:state result)))
+    (testing "each step received the expected count of messages"
+      ;; r1 1 input; dA/dB each get 1 round-1; swap gets 2 (one per port); each
+      ;; critic gets 1 round-2; agg gets 2 (one per critic); sink gets 1.
+      (is (= {:r1 1 :dA 1 :dB 1 :swap 2 :cA 1 :cB 1 :agg 2 :sink 1}
+             (frequencies (map :step-id (events-of result :recv))))))
+    (testing "swap emitted two merges (one per round-2 child); agg emitted one"
+      (is (= 2 (count (filterv #(= :swap (:step-id %)) (events-of result :merge)))))
+      (is (= 1 (count (filterv #(= :agg (:step-id %)) (events-of result :merge))))))
+    (testing "critics got peer-swapped inputs; aggregator saw both verdicts"
+      (let [verdicts (into #{} (map :verdict) (:data final))]
+        (is (= #{"c-a|own=d-a:is P true?|peer=d-b:is P true?"
+                 "c-b|own=d-b:is P true?|peer=d-a:is P true?"}
+               verdicts))))))

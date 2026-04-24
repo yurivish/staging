@@ -4,57 +4,98 @@
    These are the user's reliable surface for working with zero-sum
    groups. Everything else users want (router, retry, filter, batch...)
    composes from `step` + the message helpers; those recipes live in
-   datapotamus.md, not here."
+   datapotamus.md, not here.
+
+   A fan-out's id doubles as its group name. Downstream `fan-in`
+   references the fan-out by that id to close the group."
+  (:refer-clojure :exclude [merge])
   (:require [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.token :as tok]))
 
 (defn fan-out
-  "Emit `n` children, each tagged with a fresh zero-sum group. Downstream
-   `fan-in` on the same group-id closes the group when all n arrivals have
-   been seen (their XOR-sum for the group returns to 0)."
-  ([n]       (fan-out (gensym "fan-out-") n))
-  ([id n]    (fan-out id id n))
-  ([id group-id n]
-   (step/step id nil
+  "Emit one child per declared port, each tagged with a slice of a fresh
+   zero-sum group keyed on `[id parent-msg-id]`. Downstream `fan-in`
+   referencing `id` closes the group when all siblings arrive.
+
+   2-arity — static: broadcast the input payload identically to every
+   port in `ports`.
+     (fan-out :dispatch [:solver :facts :skeptic :second])
+
+   3-arity — dynamic: `selector-fn` is called on each input's data and
+   returns either
+     • a vector/seq of port keywords — broadcast input payload to those
+       ports (a subset of `ports`), or
+     • a map {port-kw payload} — distinct payloads per port.
+   The selector may only pick among `ports`, which is declared at
+   graph-construction time; core.async.flow requires fixed output ports."
+  ([id ports]
+   (fan-out id ports (fn [d] (zipmap ports (repeat d)))))
+  ([id ports selector-fn]
+   (step/step id
+              {:ins {:in ""} :outs (zipmap ports (repeat ""))}
               (fn [ctx _s d]
-                (let [gid    [group-id (:msg-id (:msg ctx))]
-                      values (tok/split-value 0 n)
-                      kids   (msg/children ctx (repeat n d))
-                      kids'  (mapv (fn [k v] (msg/assoc-tokens k {gid v}))
-                                   kids values)]
-                  {:out kids'})))))
+                (let [gid     [id (:msg-id (:msg ctx))]
+                      sel     (selector-fn d)
+                      by-port (if (map? sel) sel (zipmap sel (repeat d)))
+                      n       (count by-port)
+                      values  (tok/split-value 0 n)]
+                  (into {}
+                        (map (fn [[port payload] v]
+                               [port [(-> (msg/child ctx payload)
+                                          (msg/assoc-tokens {gid v}))]])
+                             by-port values)))))))
 
 (defn fan-in
-  "Accumulate inputs grouped by token-ids minted by `fan-out`. When a
-   group's XOR sum for its value reaches 0, emit one `merge` msg whose
-   parents are all the collected messages, carrying a vector of their
-   data. The group key is stripped from the final tokens.
+  "Accumulate inputs whose tokens carry a group minted by the fan-out
+   named `fan-out-id`. When a group's XOR sum reaches 0, emit one
+   `msg/merge` whose parents are all the collected messages and whose
+   data is a `{port data}` map — keyed by the input port each sibling
+   arrived on. Declare one input port per corresponding fan-out output
+   port so arrival port-of-origin is structurally preserved (mirrors
+   Go's FanIn). If a port receives multiple siblings the value under
+   that port key becomes a vector; single-arrival ports stay scalar.
 
-   State is keyed on group-id so multiple groups can be in flight
-   simultaneously. While accumulating (no group has closed this
-   invocation) returns `msg/drain` to suppress the default auto-signal;
-   the stashed parent refs carry tokens forward via the eventual merge."
-  ([group-id] (fan-in group-id group-id))
-  ([id group-id]
-   (step/step id nil
+   Optional `post-fn` runs on the `{port data}` map before emission —
+   use `vals` to drop port keys, or any custom combine. Defaults to
+   `identity`.
+
+   State is keyed on the per-invocation gid `[fan-out-id parent-msg-id]`
+   so multiple groups can be in flight simultaneously. While
+   accumulating (no group closed this invocation) returns `msg/drain`
+   to suppress the default auto-signal; the stashed parent refs carry
+   tokens forward via the eventual merge."
+  ([id fan-out-id ports]         (fan-in id fan-out-id ports identity))
+  ([id fan-out-id ports post-fn]
+   (step/step id
+              {:ins (zipmap ports (repeat "")) :outs {:out ""}}
               (fn [ctx s _d]
                 (let [m    (:msg ctx)
-                      gids (filterv (fn [k] (and (vector? k) (= group-id (first k))))
+                      port (:in-port ctx)
+                      gids (filterv (fn [k] (and (vector? k) (= fan-out-id (first k))))
                                     (keys (:tokens m)))
                       [s' output]
                       (reduce
                        (fn [[s' output] gid]
                          (let [v    (long (get (:tokens m) gid))
-                               grp  (get-in s' [:groups gid] {:value 0 :msgs []})
+                               grp  (get-in s' [:groups gid] {:value 0 :entries []})
                                grp' (-> grp
                                         (update :value (fn [x] (bit-xor (long x) v)))
-                                        (update :msgs conj m))]
+                                        (update :entries conj [port m]))]
                            (if (zero? (long (:value grp')))
-                             (let [merged (-> (msg/merge ctx
-                                                         (:msgs grp')
-                                                         (mapv :data (:msgs grp')))
-                                              (msg/dissoc-tokens [gid]))]
+                             (let [entries (:entries grp')
+                                   parents (mapv second entries)
+                                   by-port (reduce
+                                            (fn [acc [p mm]]
+                                              (update acc p
+                                                      (fn [x]
+                                                        (cond
+                                                          (nil? x)    (:data mm)
+                                                          (vector? x) (conj x (:data mm))
+                                                          :else       [x (:data mm)]))))
+                                            {} entries)
+                                   merged  (-> (msg/merge ctx parents (post-fn by-port))
+                                               (msg/dissoc-tokens [gid]))]
                                [(update s' :groups dissoc gid)
                                 (update output :out (fnil conj []) merged)])
                              [(assoc-in s' [:groups gid] grp') output])))
