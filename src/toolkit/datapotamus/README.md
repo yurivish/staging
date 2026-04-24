@@ -247,7 +247,7 @@ So far we've driven everything with `flow/run-seq`. That's the convenience layer
 (flow/run-seq step [a b c])
 ```
 
-`run!` starts the flow, injects one message, waits for quiescence, returns `{:state :events :counters :error}`. `run-seq` does the same but injects each element of the collection as its own message, and attributes outputs back to the inputs that caused them (via the lineage graph).
+`run!` starts the flow, injects one message, waits for quiescence, returns `{:state :counters :error}`. `run-seq` does the same but injects each element of the collection as its own message, and attributes outputs back to the inputs that caused them (via the lineage graph) — adding `:outputs` to the result.
 
 ### Manual
 
@@ -273,14 +273,13 @@ Layer observability on top of the manual tier:
 
 ```clojure
 (flow/counters         h)   ; {:sent :recv :completed}
-(flow/events           h)   ; snapshot of the event vector
 (flow/quiescent?       h)   ; counters balanced?
 (flow/await-quiescent! h)   ; block until they balance
 ```
 
 Quiescence is defined arithmetically: `sent = recv + completed`. No polling, no timeouts, just balance. Every injected envelope leaves the system either as a receipt or as a completion event — another conservation law, if you're keeping score.
 
-You can also subscribe to the raw pubsub for a live firehose of events. Subjects have the shape `[<kind> "flow" <fid> ("flow" <sub>)* ("step" <sid>)?]`. Glob patterns work: `[:* "flow" "ingest" :>]` gets everything in one flow; `["recv" "flow" :* :>]` gets every receive across all of them. `flow/start!` also accepts a `:subscribers` opt — a map of `glob-pattern → handler-fn` — so you can attach these subscriptions at startup instead of post-hoc.
+For a live event firehose, subscribe on the pubsub directly. Pass your own `pubsub/make` via `{:pubsub ps}` to `start!`, register handlers with `pubsub/sub`, and the flow will publish onto it as it runs. Subjects have the shape `[<kind> "flow" <fid> ("flow" <sub>)* ("step" <sid>)?]`. Glob patterns work: `[:* "flow" "ingest" :>]` gets everything in one flow; `["recv" "flow" :* :>]` gets every receive across all of them. The core never self-subscribes — it only publishes — so you own the subscriber lifecycle.
 
 *The trade-off.* Quiescence is a *structural* condition, not a semantic one. If your state machine produces a different number of outputs per input on average than it consumes, quiescence may never trigger. That's a feature for pipelines that emit retries or batched outputs — you don't want `await-quiescent!` to lie to you — but it means "wait until done" is sometimes not a meaningful question to ask.
 
@@ -363,7 +362,7 @@ flow.clj         the interpreter — the only file that imports core.async.flow
 combinators.clj  fan-out, fan-in, workers
 token.clj        the u64 XOR algebra
 trace.clj        event constructors and scoped pubsub
-                   (don't import this; read events from the handle)
+                   (don't import this; subscribe on the pubsub instead)
 ```
 
 Typical aliases:

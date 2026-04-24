@@ -10,12 +10,12 @@
    Phase-2 skeleton scope:
      - closed-loop and :count load modes (open-loop/rate in phase 3)
      - E2E latency only (per-stage latency needs nanoTime trace events)
-     - drains the flow's events atom periodically to bound memory
      - assumes the user step has a single `:out` endpoint (serial-able)"
   (:require [toolkit.datapotamus.combinators :as dc]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.step :as step]
-            [toolkit.hist :as hist])
+            [toolkit.hist :as hist]
+            [toolkit.pubsub :as pubsub])
   (:import [java.util.concurrent Semaphore]
            [java.util.concurrent.atomic AtomicBoolean AtomicLong AtomicReference]
            [toolkit.hist Dense]))
@@ -48,27 +48,6 @@
      (.incrementAndGet done-ctr)
      (when sem (.release sem))
      {})))
-
-;; ---- Event-atom drainer --------------------------------------------
-
-(defn- start-event-drainer
-  "The flow's main-sub appends every event to an atom; at benchmark
-   rates this dominates memory. Periodically reset it to `[]`. Returns
-   a no-arg stop fn."
-  [handle ^long period-ms]
-  (let [events-atom (:toolkit.datapotamus.flow/events handle)
-        running     (AtomicBoolean. true)
-        th          ^Thread (.start (Thread/ofPlatform)
-                              (reify Runnable
-                                (run [_]
-                                  (while (.get running)
-                                    (reset! events-atom [])
-                                    (try (Thread/sleep period-ms)
-                                         (catch InterruptedException _ nil))))))]
-    (fn []
-      (.set running false)
-      (.interrupt th)
-      (.join th 1000))))
 
 ;; ---- Closed-loop injector -----------------------------------------
 
@@ -119,11 +98,10 @@
      :warmup-s     — seconds of inject-then-discard (closed-loop only; default 2)
      :duration-s   — seconds of measurement (closed-loop only; default 10)
      :hist-max-ns  — upper bound of the latency histogram (default 10s)
-     :drain-ms     — events-atom drain period (default 50; tight to bound
-                     the GC burst caused by main-sub's event accumulation)
-     :subscribers  — {pattern handler} passed to flow/start! for custom
-                     pubsub subscribers. Handlers run synchronously on
-                     the publisher's thread; a slow handler stalls the
+     :subscribers  — {pattern handler} — the harness creates a pubsub,
+                     registers each pair on it, and passes the pubsub
+                     via :pubsub to flow/start!. Handlers run synchronously
+                     on the publisher's thread; a slow handler stalls the
                      emitting proc.
 
    Pipeline shape: (serial step ::sink). ::sink records E2E latency and
@@ -132,12 +110,11 @@
    Warmup vs measurement: the sink reads its current histogram from an
    AtomicReference; the harness swaps in a fresh one after warmup so
    measurement stats exclude JIT / steady-state buildup."
-  [{:keys [step input-fn load warmup-s duration-s hist-max-ns drain-ms subscribers]
+  [{:keys [step input-fn load warmup-s duration-s hist-max-ns subscribers]
     :or   {input-fn    (fn [] {:n 42})
            warmup-s    2
            duration-s  10
            hist-max-ns 10000000000
-           drain-ms    50
            subscribers {}}}]
   (when-not step (throw (ex-info "run-bench: :step required" {})))
   (when-not load (throw (ex-info "run-bench: :load required" {})))
@@ -152,8 +129,9 @@
         sink         (mk-sink hist-ref done-ctr
                               (when (= :closed kind) sem))
         pipeline     (step/serial step sink)
-        handle       (flow/start! pipeline {:subscribers subscribers})
-        stop-drainer (start-event-drainer handle drain-ms)
+        ps           (pubsub/make)
+        _            (doseq [[pat h] subscribers] (pubsub/sub ps pat h))
+        handle       (flow/start! pipeline {:pubsub ps})
         wall-start   (System/nanoTime)]
     (try
       (case kind
@@ -200,7 +178,6 @@
              :completed (.get done-ctr)
              :elapsed-ns (- (System/nanoTime) wall-start)})))
       (finally
-        (stop-drainer)
         (flow/stop! handle)))))
 
 ;; ---- Canonical workloads (seed; will grow in Phase 3) --------------

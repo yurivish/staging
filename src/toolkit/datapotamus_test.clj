@@ -21,6 +21,7 @@
      XIV  — Observing runs via scoped pubsub
      XV   — A worked example (podcast pipeline)
      XVI  — Parallel workers (workers combinator)"
+  (:refer-clojure :exclude [run!])
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [com.stuartsierra.dependency :as dep]
@@ -32,6 +33,41 @@
             [toolkit.pubsub :as pubsub]))
 
 ;; --- helpers ----------------------------------------------------------------
+
+;; These shadow run!, start!, stop!, events with
+;; equivalents that attach a pubsub subscriber and expose the event log
+;; as :events on the result (for run!/stop!) or via `events` (for
+;; long-running handles). Event collection is a test-only concern; prod
+;; callers subscribe on the pubsub directly.
+
+(defn- attach-event-collector [opts]
+  (let [ps    (or (:pubsub opts) (pubsub/make))
+        evs   (atom [])
+        unsub (pubsub/sub ps [:>] (fn [_ e _] (swap! evs conj e)))]
+    [(assoc opts :pubsub ps) evs unsub]))
+
+(defn- run!
+  ([stepmap] (run! stepmap {}))
+  ([stepmap opts]
+   (let [[opts' evs unsub] (attach-event-collector opts)
+         r (flow/run! stepmap opts')]
+     (unsub)
+     (assoc r :events @evs))))
+
+(defn- start!
+  ([stepmap] (start! stepmap {}))
+  ([stepmap opts]
+   (let [[opts' evs unsub] (attach-event-collector opts)
+         h (flow/start! stepmap opts')]
+     (assoc h ::events evs ::collector-unsub unsub))))
+
+(defn- events [h] @(::events h))
+
+(defn- stop! [h]
+  (let [r  (flow/stop! h)
+        es @(::events h)]
+    ((::collector-unsub h))
+    (assoc r :events es)))
 
 (defn- events-of
   "Filter `result`'s :events to those matching `kind` (and optionally `msg-kind`)."
@@ -80,7 +116,7 @@
 ;; Act II — Linear composition with `serial`
 ;;
 ;; `serial` glues steps end-to-end: the :out of one becomes the :in of the
-;; next. Sinks terminate a chain. `flow/run!` drives the graph for a single
+;; next. Sinks terminate a chain. `run!` drives the graph for a single
 ;; injected message and returns the collected trace events.
 ;; ============================================================================
 
@@ -89,7 +125,7 @@
   (let [a (step/step :inc inc)
         b (step/step :dbl #(* 2 %))
         composed (step/serial a b (step/sink))
-        result   (flow/run! composed {:data 5})]
+        result   (run! composed {:data 5})]
     (testing "run completes and sink received the expected data"
       (is (= :completed (:state result)))
       (is (= 12 (:data (first (filterv #(= :sink (:step-id %))
@@ -108,7 +144,7 @@
                 (step/step :inc  inc)
                 (step/step :dbl  #(* 2 %))
                 (step/sink))
-        result (flow/run! wf {:data 5})]
+        result (run! wf {:data 5})]
     (testing "run completes"
       (is (= :completed (:state result)))
       (is (nil? (:error result))))
@@ -137,7 +173,7 @@
                 (step/step :b nil (fn [_ctx s d] [s {:out [(* d 10)]}]))
                 (step/step :c nil (fn [_ctx s d] [s {:out [(dec d)]}]))
                 (step/sink))
-        result (flow/run! wf {:data 5})]
+        result (run! wf {:data 5})]
     (is (= :completed (:state result)))
     (is (= 59 (:data (first (filterv #(= :sink (:step-id %))
                                      (events-of result :recv))))))))
@@ -163,7 +199,7 @@
                   (step/step :a inc)
                   custom
                   (step/sink))
-        result   (flow/run! composed {:data 3})]
+        result   (run! composed {:data 3})]
     (testing "run completes; b received through :custom-in and emitted on :custom-out"
       (is (= :completed (:state result)))
       (is (= 40 (:data (first (filterv #(= :sink (:step-id %))
@@ -179,7 +215,7 @@
             (step/step :inc inc)
             (step/passthrough :pt)
             (step/sink))
-        result (flow/run! wf {:data 7})]
+        result (run! wf {:data 7})]
     (is (= :completed (:state result)))
     (is (= 8 (:data (first (filterv #(= :sink (:step-id %))
                                     (events-of result :recv))))))))
@@ -190,7 +226,7 @@
            (step/step :inc inc)
            (step/passthrough :pt)
            (step/sink))
-        result (flow/run! wf {:data 7})
+        result (run! wf {:data 7})
         pt-send (first (filterv #(and (= :pt (:step-id %)) (:port %))
                                 (events-of result :send-out)))
         sink-recv (first (filterv #(= :sink (:step-id %))
@@ -214,7 +250,7 @@
                     (step/sink))
                    (step/connect [:inc :out] [:sink :in])
                    (step/input-at :inc))
-        result (flow/run! wf {:data 3})]
+        result (run! wf {:data 3})]
     (is (= :completed (:state result)))
     (is (= 4 (:data (first (filterv #(= :sink (:step-id %))
                                     (events-of result :recv))))))))
@@ -242,7 +278,7 @@
                (step/connect [:agent :final]     [:sink :in])
                (step/input-at [:agent :user-in])
                (step/output-at :sink))
-        result (flow/run! wf {:data :question})]
+        result (run! wf {:data :question})]
     (is (= :completed (:state result)))
     (is (= 3 (count (filterv #(= :agent (:step-id %))
                              (events-of result :recv)))))
@@ -263,7 +299,7 @@
                    (step/connect [:route :odd]  [:odd-sink :in])
                    (step/connect [:route :even] [:even-sink :in])
                    (step/input-at :route))
-        result (flow/run! wf {:data [1 2 3 4 5]})]
+        result (run! wf {:data [1 2 3 4 5]})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "odds routed to :odd-sink (1, 3, 5), evens to :even-sink (2, 4)"
@@ -287,7 +323,7 @@
         sub2  (step/as-step :sub2 sub3)
         sub1  (step/as-step :sub1 sub2)
         outer (step/serial sub1 (step/sink))
-        result (flow/run! outer {:flow-id "F" :data 41})
+        result (run! outer {:flow-id "F" :data 41})
         leaf-recv (first (filterv #(= :leaf (:step-id %))
                                   (events-of result :recv)))]
     (testing "run completes; sink got (inc 41) = 42"
@@ -317,7 +353,7 @@
                   (step/as-step :sub inner)
                   (step/step :post identity)
                   (step/sink))
-        result   (flow/run! outer {:flow-id "f" :data 2})
+        result   (run! outer {:flow-id "f" :data 2})
         sink-recv (first (filterv #(= :sink (:step-id %))
                                   (events-of result :recv)))]
     (testing "run completes"
@@ -363,7 +399,7 @@
             (step/step :mid-b #(* 2 %))
             (step/step :mid-c inc)
             (step/sink))
-        result (flow/run! wf {:data :x})
+        result (run! wf {:data :x})
         events (:events result)
         by-kind (fn [sid]
                   (frequencies (map (juxt :kind :msg-kind)
@@ -408,10 +444,10 @@
                    (step/connect [:route :odd]  [:odd-sink :in])
                    (step/connect [:route :even] [:even-sink :in])
                    (step/input-at :route))
-        h      (flow/start! wf)
+        h      (start! wf)
         _      (flow/inject! h {:tokens {gid v}})
         _      (flow/await-quiescent! h)
-        result (flow/stop! h)
+        result (stop! h)
         events (:events result)]
     (testing "run completes"
       (is (= :completed (:state result))))
@@ -448,10 +484,10 @@
            (step/step :a inc)
            (step/step :b #(* 2 %))
            (step/sink))
-        h  (flow/start! wf)
+        h  (start! wf)
         _  (flow/inject! h {:tokens {"g" 777}})
         _  (flow/await-quiescent! h)
-        result (flow/stop! h)
+        result (stop! h)
         events (:events result)]
     (testing "run completes"
       (is (= :completed (:state result))))
@@ -473,10 +509,10 @@
            (step/step :b #(* 2 %))
            (step/step :c inc)
            (step/sink))
-        h (flow/start! wf)
+        h (start! wf)
         _ (flow/inject! h {})
         _ (flow/await-quiescent! h)
-        result (flow/stop! h)
+        result (stop! h)
         events (:events result)
         by-kind (fn [sid]
                   (frequencies (map (juxt :kind :msg-kind)
@@ -510,8 +546,8 @@
                 (step/sink))
                (step/connect [:merge :out] [:sink :in])
                (step/input-at :merge))
-        h (flow/start! wf)
-        events-after (fn [] (flow/events h))
+        h (start! wf)
+        events-after (fn [] (events h))
         by-kind (fn [sid]
                   (frequencies (map (juxt :kind :msg-kind)
                                     (filterv #(= sid (:step-id %)) (events-after)))))]
@@ -533,7 +569,7 @@
       (is (= 1 (get (by-kind :sink) [:recv :done] 0)))
       (is (= 1 (get (by-kind :sink) [:success :done] 0))))
     (testing "user handler was never invoked"
-      (is (empty? (events-of (flow/stop! h) :recv :data))))))
+      (is (empty? (events-of (stop! h) :recv :data))))))
 
 ;; ============================================================================
 ;; Act VI — Derivation helpers + ctx :in-port
@@ -553,7 +589,7 @@
                          (reset! seen in-port)
                          [s {:out [(msg/pass ctx)]}]))
             (step/sink))
-        _  (flow/run! wf {:data 1})]
+        _  (run! wf {:data 1})]
     (is (= :in @seen))))
 
 ;; Multi-input handler: ctx :in-port carries which port this invocation arrived on.
@@ -573,7 +609,7 @@
                    (step/connect [:tag :out]   [:sink :in])
                    (step/input-at :src-l)
                    (step/output-at :sink))
-        result (flow/run! wf {:data :from-left})
+        result (run! wf {:data :from-left})
         sink-recv (first (filterv #(= :sink (:step-id %))
                                   (events-of result :recv)))]
     (testing "run completes"
@@ -594,7 +630,7 @@
                (step/connect [:emit :a] [:sink-a :in])
                (step/connect [:emit :b] [:sink-b :in])
                (step/input-at :emit))
-        result (flow/run! wf {:data 7})]
+        result (run! wf {:data 7})]
     (is (= :completed (:state result)))
     (is (= "a-7" (:data (first (filterv #(= :sink-a (:step-id %))
                                         (events-of result :recv))))))
@@ -620,7 +656,7 @@
                (step/connect [:burst :out] [:observe :in])
                (step/connect [:observe :out] [:sink :in])
                (step/input-at :fo))
-        result (flow/run! wf {:data :x})
+        result (run! wf {:data :x})
         tokens @seen]
     (is (= :completed (:state result)))
     (is (= 3 (count tokens)) "three children reached observe")
@@ -641,7 +677,7 @@
                               combined (msg/merge ctx [b c] {:combined true})]
                           [s {:out [combined]}])))
            (step/sink))
-        result (flow/run! wf {:data {:stage :a}})]
+        result (run! wf {:data {:stage :a}})]
     (testing "sink receives the combined msg"
       (let [recvs (filterv #(= :sink (:step-id %)) (events-of result :recv))]
         (is (= :completed (:state result)))
@@ -682,7 +718,7 @@
                    (step/connect [:d :out]      [:sink :in])
                    (step/input-at  :split)
                    (step/output-at :sink))
-        result   (flow/run! wf {:data 5})
+        result   (run! wf {:data 5})
         sink-recv (first (filterv #(= :sink (:step-id %))
                                   (events-of result :recv)))
         d-merges  (filterv #(= :d (:step-id %)) (events-of result :merge))]
@@ -714,7 +750,7 @@
                                            :scope   (:prefix (:pubsub ctx))})
                          [s {:out [d]}]))
             (step/sink))
-        _  (flow/run! wf {:flow-id "F" :data :x})]
+        _  (run! wf {:flow-id "F" :data :x})]
     (is (= {:step-id :my-step
             :scope   [[:flow "F"] [:step :my-step]]}
            @captured))))
@@ -727,7 +763,7 @@
                (c/fan-out :split 3)
                (c/fan-in :fi :split)
                (step/sink))
-        result (flow/run! wf {:data :x})
+        result (run! wf {:data :x})
         {:keys [g kinds]} (events->dag (:events result))]
     (testing "graph is acyclic"
       (is (some? (dep/topo-sort g))))
@@ -744,7 +780,7 @@
   (let [wf     (step/serial
                (c/fan-out :split 3)
                (step/sink))
-        result (flow/run! wf {:data :x})]
+        result (run! wf {:data :x})]
     (testing "each step's :recv, :success, :send-out frequencies"
       (is (= {:split 1 :sink 3}
              (frequencies (map :step-id (events-of result :recv)))))
@@ -768,7 +804,7 @@
   (let [wf     (step/serial
                (c/fan-out :split 3)
                (step/sink))
-        result (flow/run! wf {:data :x})]
+        result (run! wf {:data :x})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "three children emitted from fan-out"
@@ -797,7 +833,7 @@
                (step/step :dbl #(* 2 %))
                (c/fan-out :triple 3)
                (step/sink))
-        result (flow/run! wf {:data 5})]
+        result (run! wf {:data 5})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "dbl ran once, triple ran once, sink received thrice"
@@ -815,7 +851,7 @@
                (c/fan-out :split 3)
                (c/fan-in :fi :split)
                (step/sink))
-        result (flow/run! wf {:data :x})]
+        result (run! wf {:data :x})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "exactly one merge event with three parents"
@@ -845,7 +881,7 @@
                (c/fan-in  :fi-inner :inner)
                (c/fan-in  :fi-outer :outer)
                (step/sink))
-        result (flow/run! wf {:data :x})
+        result (run! wf {:data :x})
         merges (events-of result :merge)]
     (testing "run completes"
       (is (= :completed (:state result))))
@@ -876,7 +912,7 @@
                            (fn [ctx s _d]
                              [s {:out [(-> (msg/child ctx :payload)
                                            (msg/assoc-tokens {"g" 77}))]}]))
-        result  (flow/run! (step/serial stamper (step/sink)) {:data :x})
+        result  (run! (step/serial stamper (step/sink)) {:data :x})
         sends   (filterv #(and (= :stamper (:step-id %)) (:port %))
                          (events-of result :send-out))]
     (is (= 1 (count sends)))
@@ -889,7 +925,7 @@
 (deftest empty-return-auto-propagates-signal
   (let [drop-all (step/step :filter {:ins {:in ""} :outs {:out ""}}
                             (fn [_ctx s _d] [s {}]))
-        result   (flow/run! (step/serial drop-all (step/sink))
+        result   (run! (step/serial drop-all (step/sink))
                             {:data :x :tokens {"g" 42}})]
     (testing "run completes"
       (is (= :completed (:state result))))
@@ -916,7 +952,7 @@
                    (step/connect [:multi :a] [:sa :in])
                    (step/connect [:multi :b] [:sb :in])
                    (step/input-at :multi))
-        result (flow/run! wf {:data :x :tokens {"g" 7}})
+        result (run! wf {:data :x :tokens {"g" 7}})
         sends  (filterv #(and (= :multi (:step-id %)) (:port %))
                         (events-of result :send-out))]
     (testing "one signal per declared output port"
@@ -931,7 +967,7 @@
 (deftest drain-suppresses-auto-signal
   (let [drainer (step/step :drain {:ins {:in ""} :outs {:out ""}}
                            (fn [_ctx s _d] [s msg/drain]))
-        result  (flow/run! (step/serial drainer (step/sink)) {:data :x :tokens {"g" 99}})]
+        result  (run! (step/serial drainer (step/sink)) {:data :x :tokens {"g" 99}})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "drainer emitted nothing on :out"
@@ -946,7 +982,7 @@
                             (fn [ctx s _d]
                               [s {:out [(-> (msg/pass ctx)
                                             (msg/dissoc-tokens ["a"]))]}]))
-        result   (flow/run! (step/serial stripper (step/sink))
+        result   (run! (step/serial stripper (step/sink))
                             {:data :payload :tokens {"a" 1 "b" 2}})
         sends    (filterv #(and (= :stripper (:step-id %)) (:port %))
                           (events-of result :send-out))]
@@ -972,7 +1008,7 @@
                (step/connect [:fi :out] [:sink :in])
                (step/input-at :minter)
                (step/output-at :sink))
-        result (flow/run! wf {:data :go})]
+        result (run! wf {:data :go})]
     (testing "run completes"
       (is (= :completed (:state result))))
     (testing "fan-in saw both siblings and fired one merge"
@@ -1000,12 +1036,12 @@
                                                    [pending (:msg ctx)]
                                                    [(:data pending) (:data (:msg ctx))])]}]))))
         wf     (step/serial pairer (step/sink))
-        h      (flow/start! wf)]
+        h      (start! wf)]
     (flow/inject! h {:data :a :tokens {"g" 7}})
     (flow/await-quiescent! h)
     (flow/inject! h {:data :b :tokens {"g" 11}})
     (flow/await-quiescent! h)
-    (let [result       (flow/stop! h)
+    (let [result       (stop! h)
           pairer-sends (filterv #(and (= :pairer (:step-id %)) (:port %))
                                 (events-of result :send-out))
           sink-recvs   (filterv #(= :sink (:step-id %)) (events-of result :recv))]
@@ -1041,13 +1077,13 @@
                               (update :left dec))
                           {:out [out]}]))))
         wf (step/serial dribbler (step/sink))
-        h  (flow/start! wf)]
+        h  (start! wf)]
     (flow/inject! h {:data {:kind :start} :tokens {"g" 42}})
     (flow/await-quiescent! h)
     (dotimes [_ K]
       (flow/inject! h {:data {:kind :tick}})
       (flow/await-quiescent! h))
-    (let [result          (flow/stop! h)
+    (let [result          (stop! h)
           dribbler-sends  (filterv #(and (= :dribbler (:step-id %)) (:port %))
                                    (events-of result :send-out))]
       (testing "dribbler emits exactly K messages across invocations"
@@ -1072,7 +1108,7 @@
   (let [wf     (step/serial
                (step/step :boom (fn [_] (throw (ex-info "oops" {}))))
                (step/sink))
-        result (flow/run! wf {:data 1})]
+        result (run! wf {:data 1})]
     (testing "run completes"
       (is (= :completed (:state result)))
       (is (nil? (:error result))))
@@ -1093,7 +1129,7 @@
                       (fn [_ctx s d]
                         [s {:nope [d]}]))
            (step/sink))
-        result (flow/run! wf {:data 1})
+        result (run! wf {:data 1})
         failures (filterv #(and (= :failure (:kind %))
                                 (= :bad (:step-id %)))
                           (:events result))]
@@ -1150,7 +1186,7 @@
 ;; inject! rejects an unknown step id up-front; the ex-data lists known sids.
 (deftest inject-rejects-unknown-step
   (let [wf (step/serial (step/step :a inc) (step/sink))
-        h  (flow/start! wf)]
+        h  (start! wf)]
     (try
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
                             #"unknown step :nonexistent"
@@ -1161,7 +1197,7 @@
           (catch clojure.lang.ExceptionInfo e
             (is (contains? (:known (ex-data e)) :a))
             (is (contains? (:known (ex-data e)) :sink)))))
-      (finally (flow/stop! h)))))
+      (finally (stop! h)))))
 
 ;; inject! rejects an unknown port on a known step; ex-data lists declared ports.
 (deftest inject-rejects-unknown-port
@@ -1169,7 +1205,7 @@
            (step/step :a {:ins {:real-in ""} :outs {:out ""}}
                       (fn [_ctx s d] [s {:out [d]}]))
            (step/sink))
-        h  (flow/start! wf)]
+        h  (start! wf)]
     (try
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
                             #"does not declare input port :typo"
@@ -1179,7 +1215,7 @@
           (flow/inject! h {:in :a :port :typo :data 1})
           (catch clojure.lang.ExceptionInfo e
             (is (= #{:real-in} (:declared (ex-data e)))))))
-      (finally (flow/stop! h)))))
+      (finally (stop! h)))))
 
 ;; ============================================================================
 ;; Act XII — Long-running handles
@@ -1194,7 +1230,7 @@
   (let [wf (step/serial
            (step/step :inc  inc)
            (step/sink))
-        h (flow/start! wf)]
+        h (start! wf)]
     (flow/inject! h {:data 1})
     (flow/await-quiescent! h)
     (is (= {:sent 2 :recv 2 :completed 2} (flow/counters h)))
@@ -1204,7 +1240,7 @@
     (flow/await-quiescent! h)
     (is (= {:sent 6 :recv 6 :completed 6} (flow/counters h)))
 
-    (let [result (flow/stop! h)]
+    (let [result (stop! h)]
       (is (= :completed (:state result)))
       (is (= [2 11 101]
              (mapv :data (filterv #(= :sink (:step-id %))
@@ -1220,14 +1256,14 @@
                         (reset! observed (realized? cancel))
                         [s {:out [(msg/pass ctx)]}]))
            (step/sink))
-        h    (flow/start! wf)
+        h    (start! wf)
         {:keys [::flow/cancel]} h]
     (flow/inject! h {:data :x})
     (flow/await-quiescent! h)
     (is (false? @observed) "cancel promise not delivered while running")
     (is (false? (realized? cancel)) "cancel promise unrealized during run")
 
-    (flow/stop! h)
+    (stop! h)
     (is (true? (realized? cancel)) "cancel promise delivered on stop!")
     (is (= :stopped @cancel))))
 
@@ -1242,11 +1278,11 @@
                           [(update s :counter inc) {:out [:ok]}])})
         wf   {:procs {:probe hmap} :conns [] :in :probe :out :probe}
         wf   (step/serial (step/as-step :probe wf) (step/sink))]
-    (flow/run! wf {:data :x})
+    (run! wf {:data :x})
     (is (= {:counter 42} @seen-state))))
 
 ;; Tier-3: a handler-map can supply :on-stop for resource cleanup.
-;; It fires exactly once per proc on `flow/stop!`. The command is delivered
+;; It fires exactly once per proc on `stop!`. The command is delivered
 ;; asynchronously via core.async.flow's control channel, so the test awaits
 ;; a latch promise the hook itself delivers.
 (deftest on-stop-fires-once-on-shutdown
@@ -1262,11 +1298,11 @@
                             {:procs {:probe hmap} :conns []
                              :in :probe :out :probe})
               (step/sink))
-        h    (flow/start! wf)]
+        h    (start! wf)]
     (flow/inject! h {:data :x})
     (flow/await-quiescent! h)
     (is (zero? @stopped) ":on-stop has not fired during the run")
-    (flow/stop! h)
+    (stop! h)
     (is (= true (deref fired 2000 :timeout)) ":on-stop delivered before timeout")
     (is (= 1 @stopped) ":on-stop fired exactly once at shutdown")))
 
@@ -1352,12 +1388,15 @@
                         (if (= x :bad)
                           (throw (ex-info "boom" {}))
                           x)))
-        result (flow/run-seq wf [:a :bad :c])]
+        ps     (pubsub/make)
+        evs    (atom [])
+        _      (pubsub/sub ps [:>] (fn [_ e _] (swap! evs conj e)))
+        result (flow/run-seq wf [:a :bad :c] {:pubsub ps})]
     (is (= :completed (:state result)))
     (testing "good inputs produce outputs, the failing input gets an empty slot"
       (is (= [[:a] [] [:c]] (:outputs result))))
     (testing "exactly one :failure event, attributed to :try"
-      (let [fs (events-of result :failure)]
+      (let [fs (filterv #(= :failure (:kind %)) @evs)]
         (is (= 1 (count fs)))
         (is (= :try (:step-id (first fs))))))))
 
@@ -1384,7 +1423,7 @@
         wf (step/serial
            (c/fan-out :split 3)
            (step/sink))
-        result (flow/run! wf {:pubsub ps :flow-id "run-A" :data :x})]
+        result (run! wf {:pubsub ps :flow-id "run-A" :data :x})]
     (u)
     (is (= :completed (:state result)))
     (is (= 4 @recv-count))))
@@ -1401,8 +1440,8 @@
                           (step/sink :sa))
         wf-B (step/serial (step/step :b  dec)
                           (step/sink :sb))
-        ra (flow/run! wf-A {:pubsub ps :flow-id "A" :data 1})
-        rb (flow/run! wf-B {:pubsub ps :flow-id "B" :data 2})]
+        ra (run! wf-A {:pubsub ps :flow-id "A" :data 1})
+        rb (run! wf-B {:pubsub ps :flow-id "B" :data 2})]
     (u)
     (is (= :completed (:state ra)))
     (is (= :completed (:state rb)))
@@ -1432,7 +1471,7 @@
         wf (step/serial probe (step/sink))
         u  (pubsub/sub ps [:>]
                        (fn [_ ev _] (swap! seen conj ev)))
-        _  (flow/run! wf {:pubsub ps :data :x})]
+        _  (run! wf {:pubsub ps :data :x})]
     (u)
     (let [probe-evs (filterv #(= :probe (:step-id %)) @seen)
           kinds (mapv :kind
@@ -1455,7 +1494,7 @@
                        (fn [_ ev _] (swap! outer-recvs conj ev)))
         u2 (pubsub/sub ps ["recv" "flow" "outer" "flow" "sub" "step" "inc"]
                        (fn [_ ev _] (swap! inner-recvs conj ev)))
-        result (flow/run! outer {:pubsub ps :flow-id "outer" :data 5})]
+        result (run! outer {:pubsub ps :flow-id "outer" :data 5})]
     (u1) (u2)
     (is (= :completed (:state result)))
     (is (= 1 (count @outer-recvs)))
@@ -1557,11 +1596,11 @@
            (step/step :inc inc)
            (c/workers :pool 3 (step/step :noop identity))
            (step/sink))
-        h  (flow/start! wf)]
+        h  (start! wf)]
     (try
       (flow/inject! h {:data 1 :tokens {"g" 7}})
       (flow/await-quiescent! h)
-      (let [result    (flow/stop! h)
+      (let [result    (stop! h)
             sink-recv (first (filter #(and (= :sink (:step-id %))
                                            (= :recv (:kind %))
                                            (= :data (:msg-kind %)))
@@ -1569,7 +1608,7 @@
         (is (some? sink-recv))
         (is (= {"g" 7} (:tokens sink-recv))))
       (finally
-        (when-not (realized? (::flow/cancel h)) (flow/stop! h))))))
+        (when-not (realized? (::flow/cancel h)) (stop! h))))))
 
 ;; Signal semantics: one injected signal produces one downstream signal,
 ;; not K. The router's custom :on-signal routes (not broadcasts), so exactly
@@ -1579,11 +1618,11 @@
   (let [wf (step/serial
            (c/workers :pool 4 (step/passthrough :w))
            (step/sink))
-        h  (flow/start! wf)]
+        h  (start! wf)]
     (try
       (flow/inject! h {:tokens {"g" 9}})
       (flow/await-quiescent! h)
-      (let [result (flow/stop! h)
+      (let [result (stop! h)
             sigs   (filterv #(and (= :sink (:step-id %))
                                   (= :recv (:kind %))
                                   (= :signal (:msg-kind %)))
@@ -1591,7 +1630,7 @@
         (is (= 1 (count sigs)))
         (is (= {"g" 9} (:tokens (first sigs)))))
       (finally
-        (when-not (realized? (::flow/cancel h)) (flow/stop! h))))))
+        (when-not (realized? (::flow/cancel h)) (stop! h))))))
 
 ;; Done cascade fires exactly once downstream. The join's K distinct input
 ;; ports ensure on-all-closed fires once, not K times.
@@ -1599,10 +1638,10 @@
   (let [wf (step/serial
            (c/workers :pool 3 (step/passthrough :w))
            (step/sink))
-        h  (flow/start! wf)]
+        h  (start! wf)]
     (flow/inject! h {})
     (flow/await-quiescent! h)
-    (let [result (flow/stop! h)
+    (let [result (stop! h)
           dones  (filterv #(and (= :sink (:step-id %))
                                 (= :recv (:kind %))
                                 (= :done (:msg-kind %)))

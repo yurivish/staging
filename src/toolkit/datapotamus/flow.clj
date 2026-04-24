@@ -157,11 +157,18 @@
             for resource cleanup; otherwise returns state unchanged.
    Arity 3: process a message — delegates to run-step.
 
-   All pubsub publishing happens here; the handler-map is pure."
-  [hmap trace-sid step-sp cancel-p]
+   Publishing, counter updates, and quiescence signalling all happen here
+   on the publish path — no self-subscription."
+  [hmap trace-sid step-sp cancel-p counters done-p]
   (let [ports (:ports hmap)
         ins   (:ins ports)
-        outs  (:outs ports)]
+        outs  (:outs ports)
+        bump! (fn [ev]
+                (let [c' (swap! counters trace/update-counters ev)]
+                  (when (trace/balanced? c') (deliver @done-p :quiescent))))
+        emit! (fn [ev]
+                (trace/sp-pub step-sp ev)
+                (bump! ev))]
     (fn
       ([]      {:params {} :ins ins :outs outs})
       ([_]     ((:on-init hmap)))
@@ -175,10 +182,9 @@
        ;; Publish :recv on arrival, before the handler runs. Emitting it
        ;; alongside :success (as we used to) made every pair atomic in the
        ;; event log, so live consumers couldn't derive in-flight counts.
-       (trace/sp-pub step-sp
-                     (trace/recv-event trace-sid (msg/envelope-kind m) m in-port))
+       (emit! (trace/recv-event trace-sid (msg/envelope-kind m) m in-port))
        (let [[s' port-map events] (run-step hmap m in-port s trace-sid step-sp cancel-p)]
-         (doseq [e events] (trace/sp-pub step-sp e))
+         (doseq [e events] (emit! e))
          [s' port-map])))))
 
 ;; ============================================================================
@@ -198,9 +204,9 @@
 
 (declare instrument-flow)
 
-(defn- inline-subflow [sid subflow outer-sp cancel-p]
+(defn- inline-subflow [sid subflow outer-sp cancel-p counters done-p]
   (let [inner-sp      (update outer-sp :prefix conj [:flow (name sid)])
-        inner-inst    (instrument-flow subflow inner-sp cancel-p)
+        inner-inst    (instrument-flow subflow inner-sp cancel-p counters done-p)
         renamed-procs (into {}
                             (for [[k v] (:procs inner-inst)]
                               [(prefix-sid sid k) v]))
@@ -227,13 +233,13 @@
 (defn- instrument-flow
   "Recursively inline subflows and wrap handler-maps with proc-fn. Returns a
    flat step map with concrete proc-fns under :procs."
-  [stepmap outer-sp cancel-p]
+  [stepmap outer-sp cancel-p counters done-p]
   (let [{:keys [procs inner-conns aliases]}
         (reduce (fn [acc [sid p]]
                   (cond
                     (step/step? p)
                     (let [{:keys [procs conns in out]}
-                          (inline-subflow sid p outer-sp cancel-p)]
+                          (inline-subflow sid p outer-sp cancel-p counters done-p)]
                       (-> acc
                           (update :procs clojure.core/merge procs)
                           (update :inner-conns into conns)
@@ -241,7 +247,7 @@
 
                     (step/handler-map? p)
                     (let [step-sp (update outer-sp :prefix conj [:step sid])
-                          wrapped (proc-fn p sid step-sp cancel-p)]
+                          wrapped (proc-fn p sid step-sp cancel-p counters done-p)]
                       (assoc-in acc [:procs sid] wrapped))
 
                     :else
@@ -306,23 +312,15 @@
   ([stepmap opts]
    (let [fid          (or (:flow-id opts) (str (random-uuid)))
          raw-ps       (or (:pubsub opts) (pubsub/make))
-         subscribers  (:subscribers opts {})
          outer-sp     {:raw raw-ps :prefix [[:flow fid]]}
          cancel-p     (promise)
-         instrumented (instrument-flow stepmap outer-sp cancel-p)
-         port-index   (port-index-of instrumented)
-         _            (validate-wired-outs! instrumented port-index)
          scope        [[:flow fid]]
-         events-atom  (atom [])
          counters     (atom {:sent 0 :recv 0 :completed 0})
          done-p       (atom (promise))
-         main-sub     (pubsub/sub raw-ps (trace/scope->glob scope)
-                                  (fn [_ ev _]
-                                    (swap! events-atom conj ev)
-                                    (let [c' (swap! counters trace/update-counters ev)]
-                                      (when (trace/balanced? c')
-                                        (deliver @done-p :quiescent)))))
-         user-unsubs  (mapv (fn [[pat h]] (pubsub/sub raw-ps pat h)) subscribers)
+         error        (atom nil)
+         instrumented (instrument-flow stepmap outer-sp cancel-p counters done-p)
+         port-index   (port-index-of instrumented)
+         _            (validate-wired-outs! instrumented port-index)
          g            (build-graph instrumented)
          {:keys [error-chan]} (flow/start g)
          err-done     (a/io-thread
@@ -330,6 +328,7 @@
                          (when-let [m (a/<!! error-chan)]
                            (let [ex  (:clojure.core.async.flow/ex m)
                                  err {:message (ex-message ex) :data (ex-data ex)}]
+                             (reset! error err)
                              (pubsub/pub raw-ps
                                          (trace/run-subject-for scope :flow-error)
                                          {:kind      :flow-error
@@ -346,19 +345,17 @@
                  {:kind :run-started :flow-path [fid] :scope scope
                   :at   (System/currentTimeMillis)})
      (flow/resume g)
-     {::step        instrumented
-      ::graph       g
-      ::pubsub      raw-ps
-      ::scope       scope
-      ::fid         fid
-      ::cancel      cancel-p
-      ::events      events-atom
-      ::counters    counters
-      ::done-p      done-p
-      ::main-sub    main-sub
-      ::user-unsubs user-unsubs
-      ::err-done    err-done
-      ::port-index  port-index})))
+     {::step       instrumented
+      ::graph      g
+      ::pubsub     raw-ps
+      ::scope      scope
+      ::fid        fid
+      ::cancel     cancel-p
+      ::counters   counters
+      ::done-p     done-p
+      ::error      error
+      ::err-done   err-done
+      ::port-index port-index})))
 
 (defn inject!
   "Route a work item into the running step. Returns the handle.
@@ -415,7 +412,6 @@
     handle))
 
 (defn counters   [handle] @(::counters handle))
-(defn events     [handle] @(::events handle))
 (defn quiescent? [handle] (trace/balanced? (counters handle)))
 
 (defn await-quiescent!
@@ -428,24 +424,21 @@
        @p))))
 
 (defn stop!
-  "Tear down the graph. Returns {:state :events :counters :error}."
+  "Tear down the graph. Returns {:state :counters :error}."
   [handle]
-  (let [{::keys [graph main-sub user-unsubs cancel err-done events counters]} handle]
+  (let [{::keys [graph cancel err-done counters error]} handle]
     (when-not (realized? cancel) (deliver cancel :stopped))
     (flow/stop graph)
     (a/<!! err-done)
-    (main-sub)
-    (doseq [u user-unsubs] (u))
-    (let [err (some #(when (= :flow-error (:kind %)) %) @events)]
+    (let [err @error]
       {:state    (if err :failed :completed)
-       :events   @events
        :counters @counters
-       :error    (:error err)})))
+       :error    err})))
 
 (defn run!
   "Start, inject one message, wait for quiescence, stop."
   [stepmap opts]
-  (let [handle (start! stepmap (select-keys opts [:pubsub :flow-id :subscribers]))]
+  (let [handle (start! stepmap (select-keys opts [:pubsub :flow-id]))]
     (inject! handle (select-keys opts [:in :port :data :tokens]))
     (let [signal (await-quiescent! handle)]
       (-> (stop! handle)
@@ -482,16 +475,23 @@
   ([stepmap coll] (run-seq stepmap coll {}))
   ([stepmap coll opts]
    (if (empty? coll)
-     {:state :completed :outputs [] :events [] :counters {:sent 0 :recv 0 :completed 0}}
+     {:state :completed :outputs [] :counters {:sent 0 :recv 0 :completed 0}}
      (let [collected (atom [])
+           ps        (or (:pubsub opts) (pubsub/make))
+           provenance (atom [])
+           prov-unsub (pubsub/sub ps [:>]
+                                  (fn [_ ev _]
+                                    (when (#{:inject :split :merge :send-out} (:kind ev))
+                                      (swap! provenance conj ev))))
            wf        (step/serial stepmap (collector-step ::collector collected))
-           handle    (start! wf (select-keys opts [:pubsub :flow-id :subscribers]))]
+           handle    (start! wf (assoc (select-keys opts [:flow-id]) :pubsub ps))]
        (doseq [d coll] (inject! handle {:data d}))
        (let [signal    (await-quiescent! handle)
              result    (-> (stop! handle)
                            (assoc :state (if (= :quiescent signal) :completed :failed))
                            (cond-> (vector? signal) (assoc :error (second signal))))
-             evs         (:events result)
+             _           (prov-unsub)
+             evs         @provenance
              inject-ids  (mapv :msg-id (filter #(= :inject (:kind %)) evs))
              inject->idx (zipmap inject-ids (range))
              attribution (inject-attribution evs inject->idx)

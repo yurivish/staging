@@ -33,7 +33,8 @@
             [toolkit.datapotamus.combinators :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
-            [toolkit.datapotamus.step :as step])
+            [toolkit.datapotamus.step :as step]
+            [toolkit.pubsub :as pubsub])
   (:import (java.util.concurrent Executors TimeUnit)))
 
 (def base "https://hacker-news.firebaseio.com/v0")
@@ -141,11 +142,13 @@
   ([] (run-once! "./out.json" {}))
   ([out-path] (run-once! out-path {}))
   ([out-path {:keys [trace? pubsub]}]
-   (let [rows (atom [])
-         opts (cond-> {:data :tick}
-                trace? (assoc :subscribers {[:>] print-event})
-                pubsub (assoc :pubsub pubsub))
-         res  (flow/run! (build-flow rows) opts)]
+   (let [rows   (atom [])
+         ps     (or pubsub (when trace? (pubsub/make)))
+         unsub  (when trace? (pubsub/sub ps [:>] print-event))
+         opts   (cond-> {:data :tick}
+                  ps (assoc :pubsub ps))
+         res    (flow/run! (build-flow rows) opts)]
+     (when unsub (unsub))
      (when (= :completed (:state res))
        (spit out-path (with-out-str (json/pprint @rows))))
      {:state (:state res) :count (count @rows) :error (:error res)})))
