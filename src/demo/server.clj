@@ -1,5 +1,6 @@
 (ns demo.server
   (:require
+   [toolkit.os-guard]
    [clojure.core.async :refer [io-thread]]
    [clojure.data.json :as json]
    [com.stuartsierra.component :as component]

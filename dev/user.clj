@@ -1,5 +1,6 @@
 (ns user
-  (:require [clojure.tools.namespace.repl :as repl]
+  (:require [toolkit.os-guard]
+            [clojure.tools.namespace.repl :as repl]
             [com.stuartsierra.component :as component]
             [toolkit.dev :as dev]
             [toolkit.hotreload :as hr]

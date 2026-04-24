@@ -14,7 +14,8 @@
    relative stddev (%), and ops/sec. Scaling is visible by reading down
    the n= column: flat rows confirm sub-linear behavior, steep rows flag
    a hotspot to investigate."
-  (:require [criterium.core :as crit]))
+  (:require [toolkit.os-guard]
+            [criterium.core :as crit]))
 
 (set! *warn-on-reflection* true)
 
