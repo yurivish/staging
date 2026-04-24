@@ -29,15 +29,6 @@
 ;; run-step — pure dispatch
 ;; ============================================================================
 
-(defn- mk-ctx [step-sp trace-sid cancel-p in-port m ins outs]
-  {:pubsub  step-sp
-   :step-id trace-sid
-   :cancel  cancel-p
-   :in-port in-port
-   :msg     m
-   :ins     ins
-   :outs    outs})
-
 (defn- validate-ports! [trace-sid port-map outs]
   (let [unknown (seq (remove #(contains? outs %) (keys port-map)))]
     (when unknown
@@ -49,8 +40,7 @@
                        :declared (vec (keys outs))})))))
 
 (defn- send-out-events [trace-sid port-map]
-  (mapv (fn [[port mm]]
-          (trace/send-out-event trace-sid (msg/envelope-kind mm) port mm))
+  (mapv (fn [[port mm]] (trace/send-out-event trace-sid port mm))
         (for [[port msgs] port-map, mm msgs] [port mm])))
 
 (defn- normalize-return
@@ -91,7 +81,7 @@
           _                    (validate-ports! trace-sid port-map outs)
           events (vec (concat synth-evs
                               (send-out-events trace-sid port-map)
-                              [(trace/success-event trace-sid kind m)]))]
+                              [(trace/success-event trace-sid m)]))]
       [s' port-map events])
     (catch Throwable ex
       [s {} [(trace/failure-event trace-sid m ex)]])))
@@ -113,7 +103,7 @@
                                            synth-pm (keys outs))
               events (vec (concat synth-evs
                                   (send-out-events trace-sid port-map)
-                                  [(trace/success-event trace-sid :done m)]))]
+                                  [(trace/success-event trace-sid m)]))]
           [(assoc s' ::closed-ins closed) port-map events])
         (catch Throwable ex
           [(assoc s ::closed-ins closed)
@@ -121,7 +111,7 @@
            [(trace/failure-event trace-sid m ex)]]))
       [(assoc s ::closed-ins closed)
        {}
-       [(trace/success-event trace-sid :done m)]])))
+       [(trace/success-event trace-sid m)]])))
 
 (defn run-step
   "Pure dispatch. Returns [new-state port-map events].
@@ -129,7 +119,8 @@
   [hmap m in-port s trace-sid step-sp cancel-p]
   (let [ins  (-> hmap :ports :ins)
         outs (-> hmap :ports :outs)
-        ctx  (mk-ctx step-sp trace-sid cancel-p in-port m ins outs)]
+        ctx  {:pubsub step-sp :step-id trace-sid :cancel cancel-p
+              :in-port in-port :msg m :ins ins :outs outs}]
     (case (msg/envelope-kind m)
       :done   (run-done               hmap m ctx s trace-sid ins outs)
       :signal (run-data-or-signal     hmap m s ctx trace-sid outs :signal)
@@ -138,16 +129,6 @@
 ;; ============================================================================
 ;; proc-fn — the core.async.flow 4-arity adapter
 ;; ============================================================================
-
-(defn- lifecycle-ctx
-  "Ctx for non-message hooks (:on-stop). No :msg or :in-port — those are
-   message-specific."
-  [step-sp trace-sid cancel-p ins outs]
-  {:pubsub  step-sp
-   :step-id trace-sid
-   :cancel  cancel-p
-   :ins     ins
-   :outs    outs})
 
 (defn- proc-fn
   "Adapt a handler-map to a core.async.flow proc-fn (four arities).
@@ -173,7 +154,8 @@
       ([_]     ((:on-init hmap)))
       ([s transition]
        (if (= transition :clojure.core.async.flow/stop)
-         (let [ctx (lifecycle-ctx step-sp trace-sid cancel-p ins outs)]
+         (let [ctx {:pubsub step-sp :step-id trace-sid :cancel cancel-p
+                    :ins ins :outs outs}]
            (try ((:on-stop hmap) ctx s) (catch Throwable _ nil))
            s)
          s))
@@ -181,7 +163,7 @@
        ;; Publish :recv on arrival, before the handler runs. Emitting it
        ;; alongside :success (as we used to) made every pair atomic in the
        ;; event log, so live consumers couldn't derive in-flight counts.
-       (emit! (trace/recv-event trace-sid (msg/envelope-kind m) m in-port))
+       (emit! (trace/recv-event trace-sid m in-port))
        (let [[s' port-map events] (run-step hmap m in-port s trace-sid step-sp cancel-p)]
          (doseq [e events] (emit! e))
          [s' port-map])))))
@@ -413,22 +395,15 @@
         has-data?           (contains? opts :data)
         has-tokens?         (contains? opts :tokens)
         item                (cond
-                              has-data?
-                              (cond-> (msg/new-msg (:data opts))
-                                has-tokens? (assoc :tokens (:tokens opts)))
-
-                              has-tokens?
-                              {:msg-id (random-uuid) :data-id (random-uuid)
-                               :tokens (:tokens opts) :parent-msg-ids []}
-
-                              :else
-                              (msg/new-done))
-        msg-kind            (cond has-data? :data has-tokens? :signal :else :done)]
+                              has-data?   (cond-> (msg/new-msg (:data opts))
+                                            has-tokens? (assoc :tokens (:tokens opts)))
+                              has-tokens? (msg/new-signal (:tokens opts))
+                              :else       (msg/new-done))]
     (swap! done-p (fn [p] (if (realized? p) (promise) p)))
     (ctrs/record-inject! counters)
     (pubsub/pub pubsub (trace/run-subject-for scope :inject)
                 (assoc (trace/msg-envelope item)
-                       :kind :inject :msg-kind msg-kind
+                       :kind :inject
                        :flow-path [fid] :scope scope
                        :in flow-in :port port
                        :at (trace/now)))

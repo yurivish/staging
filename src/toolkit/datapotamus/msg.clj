@@ -1,15 +1,16 @@
 (ns toolkit.datapotamus.msg
   "Message envelopes + the free algebra for building them + pure synthesis.
 
-   A **message envelope** is a plain map. Three shapes distinguished by
-   key absence:
+   A **message envelope** is a plain map with a `:msg-kind` stamp:
 
-     data:    has :data, has :tokens
-     signal:  no  :data, has :tokens
-     done:    no  :data, no  :tokens
+     :data    has :data, has :tokens
+     :signal  no  :data, has :tokens
+     :done    no  :data, no  :tokens
 
-   `nil` is a valid data value; envelope kind is structural, not a
-   sentinel. Token conservation laws are XOR-based (see `token.clj`).
+   The absence of :data / :tokens is preserved for structural clarity,
+   but `:msg-kind` is the canonical source — dispatch reads the stamp
+   rather than re-deriving the shape. `nil` is a valid `:data` value.
+   Token conservation laws are XOR-based (see `token.clj`).
 
    Handlers return outputs in a per-port map. Each output is either a
    msg built by the free-algebra constructors below (`child`,
@@ -35,33 +36,24 @@
 (defn new-msg
   "Root data msg: no parent, empty tokens."
   [data]
-  {:msg-id (random-uuid) :data-id (random-uuid) :data data
-   :tokens {} :parent-msg-ids []})
+  {:msg-id (random-uuid) :data-id (random-uuid) :msg-kind :data
+   :data data :tokens {} :parent-msg-ids []})
+
+(defn new-signal
+  "Root signal msg: no parent, supplied tokens."
+  [tokens]
+  {:msg-id (random-uuid) :data-id (random-uuid) :msg-kind :signal
+   :tokens tokens :parent-msg-ids []})
 
 (defn new-done
   "Done marker: no :data, no :tokens."
   []
-  {:msg-id (random-uuid) :parent-msg-ids []})
+  {:msg-id (random-uuid) :msg-kind :done :parent-msg-ids []})
 
-(defn signal?
-  "True iff `m` is a signal envelope (tokens + lineage, no :data)."
-  [m]
-  (and (map? m) (not (contains? m :data)) (contains? m :tokens)))
-
-(defn done?
-  "True iff `m` is a done marker (no :data, no :tokens)."
-  [m]
-  (and (map? m) (not (contains? m :data)) (not (contains? m :tokens))))
-
-(defn data?
-  "True iff `m` is a data envelope."
-  [m]
-  (and (map? m) (contains? m :data)))
-
-(defn envelope-kind
-  "One of :data, :signal, :done."
-  [m]
-  (cond (done? m) :done (signal? m) :signal :else :data))
+(defn envelope-kind [m] (:msg-kind m))
+(defn data?         [m] (= (:msg-kind m) :data))
+(defn signal?       [m] (= (:msg-kind m) :signal))
+(defn done?         [m] (= (:msg-kind m) :done))
 
 ;; ============================================================================
 ;; Free-algebra constructors over input messages
@@ -73,16 +65,17 @@
   (and (map? x) (contains? x ::parents)))
 
 (defn- derive-skeleton
-  [parent-msg-ids]
+  [kind parent-msg-ids]
   {:msg-id         (random-uuid)
    :data-id        (random-uuid)
+   :msg-kind       kind
    :parent-msg-ids (vec parent-msg-ids)})
 
 (defn child
   "1-to-1 derive. 2-arity uses `(:msg ctx)` as parent; 3-arity takes explicit."
   ([ctx data]              (child ctx (:msg ctx) data))
   ([_ctx parent data]
-   (-> (derive-skeleton [(:msg-id parent)])
+   (-> (derive-skeleton :data [(:msg-id parent)])
        (assoc :data data ::parents [parent]))))
 
 (defn children
@@ -94,7 +87,7 @@
   "Preserve parent's :data and :data-id in a new child envelope."
   [ctx]
   (let [parent (:msg ctx)]
-    (-> (derive-skeleton [(:msg-id parent)])
+    (-> (derive-skeleton :data [(:msg-id parent)])
         (assoc :data-id (:data-id parent)
                :data    (:data parent)
                ::parents [parent]))))
@@ -103,13 +96,13 @@
   "Signal child of `(:msg ctx)` — carries lineage but no :data."
   [ctx]
   (let [parent (:msg ctx)]
-    (-> (derive-skeleton [(:msg-id parent)])
+    (-> (derive-skeleton :signal [(:msg-id parent)])
         (assoc ::parents [parent]))))
 
 (defn merge
   "N-parent derive. Synthesis XOR-merges all parents' tokens."
   [_ctx parents data]
-  (-> (derive-skeleton (mapv :msg-id parents))
+  (-> (derive-skeleton :data (mapv :msg-id parents))
       (assoc :data data ::parents (vec parents))))
 
 ;; --- Escape hatch ------------------------------------------------------------
@@ -174,19 +167,6 @@
         (dissoc ::parents ::assoc-tokens ::dissoc-tokens)
         (assoc :tokens t2))))
 
-(defn- split-event [step-id m]
-  {:kind           :split
-   :step-id        step-id
-   :msg-id         (:msg-id m)
-   :data-id        (:data-id m)
-   :parent-msg-ids (:parent-msg-ids m)})
-
-(defn- merge-event [step-id m]
-  {:kind           :merge
-   :step-id        step-id
-   :msg-id         (:msg-id m)
-   :parent-msg-ids (:parent-msg-ids m)})
-
 (defn- flatten-outputs
   "Map {port [m ...]} → seq [[port m] ...]. Within-port order preserved;
    across-port order is arbitrary (map iteration)."
@@ -227,10 +207,14 @@
                                 (get-in leaf-slices [(:msg-id leaf) (:msg-id m)]))))]
     (reduce
      (fn [[pm evs] [port pending]]
-       (let [t        (tokens-of pending)
-             m        (materialize pending t)
-             mk-event (if (> (count (::parents pending)) 1) merge-event split-event)
-             ev       (assoc (mk-event step-id pending) :tokens t)]
+       (let [t  (tokens-of pending)
+             m  (materialize pending t)
+             ev {:kind           (if (> (count (::parents pending)) 1) :merge :split)
+                 :step-id        step-id
+                 :msg-id         (:msg-id pending)
+                 :data-id        (:data-id pending)
+                 :parent-msg-ids (:parent-msg-ids pending)
+                 :tokens         t}]
          [(update pm port (fnil conj []) m) (conj evs ev)]))
      [{} []]
      pairs)))

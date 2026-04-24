@@ -30,7 +30,7 @@
   "On-wire envelope fields of `m` as a flat map. Absent keys are skipped so
    envelope shapes stay distinct (done has no tokens; signal has no data)."
   [m]
-  (cond-> {:msg-id (:msg-id m)}
+  (cond-> {:msg-id (:msg-id m) :msg-kind (:msg-kind m)}
     (contains? m :data-id)        (assoc :data-id (:data-id m))
     (contains? m :data)           (assoc :data (:data m))
     (contains? m :tokens)         (assoc :tokens (:tokens m))
@@ -41,25 +41,22 @@
 ;; ============================================================================
 
 (defn recv-event
-  "Built for any msg-kind. For :done, pass `in-port`."
-  ([step-id msg-kind m] (recv-event step-id msg-kind m nil))
-  ([step-id msg-kind m in-port]
-   (cond-> (assoc (msg-envelope m)
-                  :kind :recv :msg-kind msg-kind :step-id step-id)
-     (= :done msg-kind) (assoc :in-port in-port))))
+  "For :done messages, pass `in-port`."
+  ([step-id m] (recv-event step-id m nil))
+  ([step-id m in-port]
+   (cond-> (assoc (msg-envelope m) :kind :recv :step-id step-id)
+     (= :done (:msg-kind m)) (assoc :in-port in-port))))
 
-(defn success-event [step-id msg-kind m]
-  (assoc (msg-envelope m)
-         :kind :success :msg-kind msg-kind :step-id step-id))
+(defn success-event [step-id m]
+  (assoc (msg-envelope m) :kind :success :step-id step-id))
 
 (defn failure-event [step-id m ^Throwable ex]
   (assoc (msg-envelope m)
-         :kind :failure :msg-kind :data :step-id step-id
+         :kind :failure :step-id step-id
          :error {:message (ex-message ex) :data (ex-data ex)}))
 
-(defn send-out-event [step-id msg-kind port child]
-  (assoc (msg-envelope child)
-         :kind :send-out :msg-kind msg-kind :port port :step-id step-id))
+(defn send-out-event [step-id port child]
+  (assoc (msg-envelope child) :kind :send-out :port port :step-id step-id))
 
 ;; ============================================================================
 ;; Scope helpers
