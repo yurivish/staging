@@ -1432,12 +1432,12 @@
       (flow/inject! h {:data 1 :tokens {"g" 7}})
       (flow/await-quiescent! h)
       (let [result    (flow/stop! h)
-            join-send (first (filter #(and (= :pool.join (:step-id %))
-                                           (= :send-out (:kind %))
+            sink-recv (first (filter #(and (= :sink (:step-id %))
+                                           (= :recv (:kind %))
                                            (= :data (:msg-kind %)))
                                      (:events result)))]
-        (is (some? join-send))
-        (is (= {"g" 7} (:tokens join-send))))
+        (is (some? sink-recv))
+        (is (= {"g" 7} (:tokens sink-recv))))
       (finally
         (when-not (realized? (::flow/cancel h)) (flow/stop! h))))))
 

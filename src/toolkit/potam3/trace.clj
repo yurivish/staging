@@ -25,7 +25,7 @@
   ([step-id msg-kind m in-port]
    (cond-> {:kind :recv :msg-kind msg-kind :step-id step-id
             :msg-id (:msg-id m)}
-     (= :data   msg-kind) (assoc :data-id (:data-id m) :data (:data m))
+     (= :data   msg-kind) (assoc :data-id (:data-id m) :data (:data m) :tokens (:tokens m))
      (= :signal msg-kind) (assoc :data-id (:data-id m) :tokens (:tokens m))
      (= :done   msg-kind) (assoc :in-port in-port))))
 
