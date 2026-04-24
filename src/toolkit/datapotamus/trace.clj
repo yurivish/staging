@@ -17,7 +17,10 @@
    <segment>`."
   (:require [toolkit.pubsub :as pubsub]))
 
-(defn- now [] (System/currentTimeMillis))
+(defn now
+  "Monotonic nanosecond clock for event stamps. Use only for measuring
+   durations between `:at` values — not for wall-clock display."
+  [] (System/nanoTime))
 
 ;; ============================================================================
 ;; Envelope extraction — one place
@@ -57,23 +60,6 @@
 (defn send-out-event [step-id msg-kind port child]
   (assoc (msg-envelope child)
          :kind :send-out :msg-kind msg-kind :port port :step-id step-id))
-
-;; ============================================================================
-;; Counters
-;; ============================================================================
-
-(defn update-counters [counters ev]
-  (case (:kind ev)
-    :recv     (update counters :recv inc)
-    :success  (update counters :completed inc)
-    :failure  (update counters :completed inc)
-    :send-out (if (:port ev) (update counters :sent inc) counters)
-    counters))
-
-(defn balanced?
-  "True iff all work so far has resolved: send count == recv count == completed."
-  [{:keys [sent recv completed]}]
-  (and (pos? sent) (= sent recv) (= recv completed)))
 
 ;; ============================================================================
 ;; Scope helpers

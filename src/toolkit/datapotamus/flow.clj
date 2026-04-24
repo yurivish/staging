@@ -17,6 +17,7 @@
   (:require [clojure.core.async :as a]
             [clojure.core.async.flow :as flow]
             [clojure.set :as set]
+            [toolkit.datapotamus.counters :as ctrs]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
@@ -163,12 +164,10 @@
   (let [ports (:ports hmap)
         ins   (:ins ports)
         outs  (:outs ports)
-        bump! (fn [ev]
-                (let [c' (swap! counters trace/update-counters ev)]
-                  (when (trace/balanced? c') (deliver @done-p :quiescent))))
         emit! (fn [ev]
                 (trace/sp-pub step-sp ev)
-                (bump! ev))]
+                (ctrs/record-event! counters ev)
+                (when (ctrs/balanced? counters) (deliver @done-p :quiescent)))]
     (fn
       ([]      {:params {} :ins ins :outs outs})
       ([_]     ((:on-init hmap)))
@@ -315,7 +314,7 @@
          outer-sp     {:raw raw-ps :prefix [[:flow fid]]}
          cancel-p     (promise)
          scope        [[:flow fid]]
-         counters     (atom {:sent 0 :recv 0 :completed 0})
+         counters     (ctrs/make)
          done-p       (atom (promise))
          error        (atom nil)
          instrumented (instrument-flow stepmap outer-sp cancel-p counters done-p)
@@ -338,12 +337,12 @@
                                           :error     err
                                           :scope     scope
                                           :flow-path [fid]
-                                          :at        (System/currentTimeMillis)})
+                                          :at        (trace/now)})
                              (deliver @done-p [:failed err]))
                            (recur))))]
      (pubsub/pub raw-ps (trace/run-subject-for scope :run-started)
                  {:kind :run-started :flow-path [fid] :scope scope
-                  :at   (System/currentTimeMillis)})
+                  :at   (trace/now)})
      (flow/resume g)
      {::step       instrumented
       ::graph      g
@@ -401,18 +400,18 @@
                               (msg/new-done))
         msg-kind            (cond has-data? :data has-tokens? :signal :else :done)]
     (swap! done-p (fn [p] (if (realized? p) (promise) p)))
-    (swap! counters update :sent inc)
+    (ctrs/record-inject! counters)
     (pubsub/pub pubsub (trace/run-subject-for scope :inject)
                 (assoc (trace/msg-envelope item)
                        :kind :inject :msg-kind msg-kind
                        :flow-path [fid] :scope scope
                        :in flow-in :port port
-                       :at (System/currentTimeMillis)))
+                       :at (trace/now)))
     @(flow/inject graph [flow-in port] [item])
     handle))
 
-(defn counters   [handle] @(::counters handle))
-(defn quiescent? [handle] (trace/balanced? (counters handle)))
+(defn counters   [handle] (ctrs/snapshot (::counters handle)))
+(defn quiescent? [handle] (ctrs/balanced? (::counters handle)))
 
 (defn await-quiescent!
   "Block until quiescence or error. Returns :quiescent, [:failed err], or :timeout."
@@ -432,7 +431,7 @@
     (a/<!! err-done)
     (let [err @error]
       {:state    (if err :failed :completed)
-       :counters @counters
+       :counters (ctrs/snapshot counters)
        :error    err})))
 
 (defn run!
