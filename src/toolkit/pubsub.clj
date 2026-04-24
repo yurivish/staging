@@ -1,8 +1,9 @@
 (ns toolkit.pubsub
-  "Subject-based pub/sub over `toolkit.sublist`. Subscribers register
-   against subject patterns with `*` (single-token) and `>` (tail)
-   wildcards; publishers send to literal subjects. Queue groups are
-   supported — one subscriber per group receives each message.
+  "Subject-based pub/sub over `toolkit.sublist`. Subjects and patterns
+   are vectors of tokens — strings for literals, `:*` (single-token) and
+   `:>` (tail) for wildcards. Publishers send to literal vectors.
+   Queue groups are supported — one subscriber per group receives each
+   message.
 
    Handlers are 3-ary: `(handler subject msg match-result)`. The
    `match-result` is the full sublist match (every `:plain` and every
@@ -17,7 +18,6 @@
    Subscribing the same handler twice yields two independent subscriptions
    — each delivers, each has its own unsub."
   (:require [clojure.core.async :as async]
-            [clojure.string :as str]
             [toolkit.sublist :as sl]))
 
 (defn make
@@ -27,7 +27,8 @@
 
 (defn sub
   "Subscribes `handler` (a fn of [subject msg match-result]) to
-   `subject-pattern`. Returns a zero-arg unsub fn. Opts:
+   `subject-pattern` (a vector of tokens, optionally containing `:*` /
+   `:>` wildcards). Returns a zero-arg unsub fn. Opts:
    `{:queue name :id any}` — `:queue` joins a queue group (one-per-group
    delivery); `:id` is an optional caller-facing label, orthogonal to
    identity (each sub call is independent regardless of `:id`)."
@@ -63,9 +64,10 @@
         (.flush pw)))))
 
 (defn pub
-  "Publishes `msg` to every subscriber matching `subject`. Runs all
-   handlers synchronously on the caller's thread. Queue-group subs
-   deliver to exactly one member per group (random choice).
+  "Publishes `msg` to every subscriber matching `subject` (a literal
+   vector). Runs all handlers synchronously on the caller's thread.
+   Queue-group subs deliver to exactly one member per group (random
+   choice).
 
    Each handler is invoked as `(handler subject msg match-result)` where
    `match-result` is the full sublist match — every `:plain` and every
@@ -93,11 +95,3 @@
 
 (def valid-subject? sl/valid-subject?)
 (def valid-pattern? sl/valid-pattern?)
-
-(defn valid-pub-token?
-  "Returns true iff `token` is a valid literal subject token: non-empty,
-   no `.`, no wildcards. For validating individual subject segments."
-  [token]
-  (and (string? token)
-       (not (str/includes? token "."))
-       (sl/valid-subject? token)))

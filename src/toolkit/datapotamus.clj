@@ -16,7 +16,7 @@
    Factories are 1-arg fns that take a ctx and return a 4-arity
    core.async.flow process-fn. ctx carries:
 
-     :pubsub   — ScopedPubsub prefixed with this step's scope
+     :pubsub   — scoped pubsub ({:raw :prefix}) for this step's trace emission
      :step-id  — this step's id, as it appears in trace events
      :cancel   — promise, delivered on stop!; poll with `realized?`
 
@@ -134,7 +134,6 @@
   (:require [clojure.core.async :as a]
             [clojure.core.async.flow :as flow]
             [clojure.set :as set]
-            [clojure.string :as str]
             [toolkit.datapotamus.token :as tok]
             [toolkit.pubsub :as pubsub]))
 
@@ -372,42 +371,40 @@
   (and (pos? sent) (= sent recv) (= recv completed)))
 
 ;; --- scope + subject --------------------------------------------------------
+;;
+;; Subjects are vectors (per toolkit.pubsub/sublist). A scope is a vector
+;; of `[key id]` tuples, e.g. `[[:flow fid] [:step sid]]`, flattened to
+;; string tokens. A subject prepends the event kind, keeping kind-first
+;; ordering so `[kind flow <fid> :>]` cleanly filters by kind.
 
-(defn- scope->segments [scope]
-  (mapcat (fn [[k id]]
-            [(name k) (if (keyword? id) (name id) (str id))])
-          scope))
+(defn- scope->tokens [scope]
+  (vec (mapcat (fn [[k id]]
+                 [(name k) (if (keyword? id) (name id) (str id))])
+               scope)))
 
 (defn- subject-for [scope kind]
-  (->> (cons (name kind) (scope->segments scope))
-       (str/join ".")))
+  (into [(name kind)] (scope->tokens scope)))
 
 (defn- run-subject-for [scope kind]
-  (->> (cons (name kind) (concat (scope->segments scope) ["run"]))
-       (str/join ".")))
+  (-> (subject-for scope kind) (conj "run")))
 
 (defn- flow-path-of [scope]
   (mapv (fn [[_ id]] (if (keyword? id) (name id) id))
         (filter (fn [[k _]] (= k :flow)) scope)))
 
 (defn- scope->glob [scope]
-  (str "*." (str/join "." (scope->segments scope)) ".>"))
+  (-> [:*] (into (scope->tokens scope)) (conj :>)))
 
 ;; --- scoped pubsub ----------------------------------------------------------
+;;
+;; A scoped pubsub is a plain map `{:raw raw-ps :prefix [[:flow fid] ...]}`.
+;; `sp-pub` stamps the prefix into the subject and event metadata. To
+;; extend a scope with a child segment, `update :prefix conj <segment>`.
 
-(defrecord ScopedPubsub [raw prefix])
-
-(defn- scoped-pubsub [raw prefix]
-  (->ScopedPubsub raw (vec prefix)))
-
-(defn- sp-pub [^ScopedPubsub sp ev]
-  (let [prefix (.prefix sp)]
-    (pubsub/pub (.raw sp)
-                (subject-for prefix (:kind ev))
-                (assoc ev :scope prefix :flow-path (flow-path-of prefix)))))
-
-(defn- sp-extend [^ScopedPubsub sp segment]
-  (->ScopedPubsub (.raw sp) (conj (.prefix sp) segment)))
+(defn- sp-pub [{:keys [raw prefix]} ev]
+  (pubsub/pub raw
+              (subject-for prefix (:kind ev))
+              (assoc ev :scope prefix :flow-path (flow-path-of prefix))))
 
 ;; ============================================================================
 ;; Part 3 — Synthesis
@@ -836,7 +833,7 @@
 
 (defn- inline-subflow
   [sid subflow outer-sp cancel-p]
-  (let [inner-sp      (sp-extend outer-sp [:flow (name sid)])
+  (let [inner-sp      (update outer-sp :prefix conj [:flow (name sid)])
         inner-inst    (instrument-flow subflow inner-sp cancel-p)
         renamed-procs (into {}
                             (for [[k v] (:procs inner-inst)]
@@ -871,7 +868,7 @@
                           (update :procs clojure.core/merge procs)
                           (update :inner-conns into conns)
                           (assoc-in [:aliases sid] {:in in :out out})))
-                    (let [step-sp (sp-extend outer-sp [:step sid])
+                    (let [step-sp (update outer-sp :prefix conj [:step sid])
                           wrapped (instrument-step sid p step-sp cancel-p)]
                       (assoc-in acc [:procs sid] wrapped))))
                 {:procs {} :inner-conns [] :aliases {}}
@@ -921,7 +918,7 @@
    (let [fid          (or (:flow-id opts) (str (random-uuid)))
          raw-ps       (or (:pubsub opts) (pubsub/make))
          subscribers  (:subscribers opts {})
-         outer-sp     (scoped-pubsub raw-ps [[:flow fid]])
+         outer-sp     {:raw raw-ps :prefix [[:flow fid]]}
          cancel-p     (promise)
          instrumented (instrument-flow step outer-sp cancel-p)
          port-index   (into {}

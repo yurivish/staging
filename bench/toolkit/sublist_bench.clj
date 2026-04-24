@@ -1,12 +1,11 @@
 (ns toolkit.sublist-bench
   "sublist (subscription routing trie) benchmark scenarios.
 
-   Dataset: ~75% literal patterns, ~20% single-`*`, ~5% trailing-`>`,
+   Dataset: ~75% literal patterns, ~20% single-`:*`, ~5% trailing-`:>`,
    with ~25% placed in queue groups (8 rotating queue names). The
-   first-token pool (16 buckets) ensures `<first>.>` reverse-match
+   first-token pool (16 buckets) ensures `[<first> :>]` reverse-match
    queries hit a meaningful fraction at each scale."
-  (:require [clojure.string :as str]
-            [toolkit.bench :as b]
+  (:require [toolkit.bench :as b]
             [toolkit.sublist :as sl])
   (:import [java.util Random]))
 
@@ -27,21 +26,19 @@
              (apply str (repeat (inc (rem i 3))
                                 (char (+ (int \a) i)))))))
 
-(defn- rand-subject ^String [^Random r]
+(defn- rand-subject [^Random r]
   (let [first-tok (nth first-tokens (.nextInt r 16))
-        n-more    (inc (.nextInt r 4))
-        toks      (into [first-tok] (repeatedly n-more #(rand-token r 4)))]
-    (str/join "." toks)))
+        n-more    (inc (.nextInt r 4))]
+    (into [first-tok] (repeatedly n-more #(rand-token r 4)))))
 
-(defn- rand-pattern ^String [^Random r]
-  (let [toks (vec (str/split (rand-subject r) #"\."))
+(defn- rand-pattern [^Random r]
+  (let [toks (rand-subject r)
         n    (count toks)
         roll (.nextInt r 20)]
     (cond
-      (< roll 15) (str/join "." toks)                          ; literal
-      (< roll 19) (let [mid (quot n 2)]
-                    (str/join "." (assoc toks mid "*")))        ; middle *
-      :else       (str/join "." (conj (pop toks) ">")))))       ; trailing >
+      (< roll 15) toks                           ; literal
+      (< roll 19) (assoc toks (quot n 2) :*)     ; middle *
+      :else       (conj (pop toks) :>))))        ; trailing >
 
 (def ^:private all-patterns
   (delay
@@ -58,13 +55,11 @@
           (sl/insert! sl-ref p i))))
     sl-ref))
 
-(defn- literal-from-pattern ^String [^String p]
-  (->> (str/split p #"\." -1)
-       (mapv (fn [t] (if (or (= t "*") (= t ">")) "x" t)))
-       (str/join ".")))
+(defn- literal-from-pattern [p]
+  (mapv (fn [t] (if (or (identical? t :*) (identical? t :>)) "x" t)) p))
 
-(defn- miss-subject ^String [^Random r]
-  (str "ZZZZ." (rand-subject r)))
+(defn- miss-subject [^Random r]
+  (into ["ZZZZ"] (rand-subject r)))
 
 ;; Query inputs are pinned across sizes so only the tree varies. The
 ;; hit index is well below the smallest sweep size; miss/fanout use
@@ -73,9 +68,8 @@
 (def ^:private fixed-miss (miss-subject (Random. 7)))
 (def ^:private fixed-fanout
   (let [r (Random. 9)]
-    (str (nth first-tokens 0) "."
-         (rand-token r 4) "." (rand-token r 4))))
-(def ^:private fixed-rev-pat (str (nth first-tokens 0) ".>"))
+    [(nth first-tokens 0) (rand-token r 4) (rand-token r 4)]))
+(def ^:private fixed-rev-pat [(nth first-tokens 0) :>])
 
 (defn- fixture [n]
   (let [patterns (subvec @all-patterns 0 n)

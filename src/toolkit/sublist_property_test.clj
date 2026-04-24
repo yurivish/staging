@@ -15,20 +15,20 @@
 ;; --- generators ---
 
 (def gen-literal
-  ;; 1-4 ascii letters. Disallows the wildcard chars and `.`.
+  ;; 1-4 ascii letters.
   (gen/fmap str/join (gen/vector gen/char-alpha 1 4)))
 
 (def gen-pattern-token
-  (gen/frequency [[4 gen-literal] [1 (gen/return "*")]]))
+  (gen/frequency [[4 gen-literal] [1 (gen/return :*)]]))
 
 (def gen-pattern
-  ;; 1-4 tokens; 1-in-4 chance of a trailing `>`.
+  ;; 1-4 tokens; 1-in-4 chance of a trailing `:>`.
   (gen/let [toks     (gen/vector gen-pattern-token 1 4)
-            trailing (gen/frequency [[3 (gen/return nil)] [1 (gen/return ">")]])]
-    (str/join "." (if trailing (conj toks trailing) toks))))
+            trailing (gen/frequency [[3 (gen/return nil)] [1 (gen/return :>)]])]
+    (if trailing (conj toks trailing) toks)))
 
 (def gen-subject
-  (gen/fmap #(str/join "." %) (gen/vector gen-literal 1 5)))
+  (gen/vector gen-literal 1 5))
 
 (def gen-queue
   (gen/frequency [[3 (gen/return nil)] [1 gen-literal]]))
@@ -42,23 +42,22 @@
 
 (defn match-tokens? [pat subj]
   (cond
-    (and (empty? pat) (empty? subj))  true
-    (= ">" (first pat))               (boolean (seq subj))
-    (or (empty? pat) (empty? subj))   false
-    (= "*" (first pat))               (recur (rest pat) (rest subj))
-    (= (first pat) (first subj))      (recur (rest pat) (rest subj))
-    :else                             false))
+    (and (empty? pat) (empty? subj))       true
+    (identical? :> (first pat))            (boolean (seq subj))
+    (or (empty? pat) (empty? subj))        false
+    (identical? :* (first pat))            (recur (rest pat) (rest subj))
+    (= (first pat) (first subj))           (recur (rest pat) (rest subj))
+    :else                                  false))
 
 (defn naive-match [subs subject]
-  (let [subj-toks (str/split subject #"\.")]
-    (reduce (fn [r [pat v q]]
-              (if (match-tokens? (str/split pat #"\.") subj-toks)
-                (if q
-                  (update-in r [:groups q] (fnil conj #{}) v)
-                  (update r :plain conj v))
-                r))
-            {:plain #{} :groups {}}
-            (distinct subs))))
+  (reduce (fn [r [pat v q]]
+            (if (match-tokens? pat subject)
+              (if q
+                (update-in r [:groups q] (fnil conj #{}) v)
+                (update r :plain conj v))
+              r))
+          {:plain #{} :groups {}}
+          (distinct subs)))
 
 ;; --- helpers ---
 
@@ -130,7 +129,7 @@
                 ;; When the first arg is a literal, `subject-matches-filter?`
                 ;; reduces to "does `pat` (as a pattern) match `lit`".
                 (= (sl/subject-matches-filter? lit pat)
-                   (match-tokens? (str/split pat #"\.") (str/split lit #"\.")))))
+                   (match-tokens? pat lit))))
 
 (defspec subjects-collide-literal-case 200
   (prop/for-all [lit gen-subject
@@ -143,7 +142,9 @@
 ;; --- intersect-stree ---
 
 (def gen-stree-entry
-  (gen/tuple gen-subject gen/small-integer))
+  ;; stree API is still dot-string-based; generate stree subjects as strings.
+  (gen/tuple (gen/fmap #(str/join "." %) gen-subject)
+             gen/small-integer))
 
 (def gen-stree-entries
   (gen/fmap distinct (gen/vector gen-stree-entry 0 15)))
@@ -159,7 +160,10 @@
                   (sl/intersect-stree st sl (fn [subj _] (swap! !got conj subj)))
                   (let [expected (into #{}
                                        (comp (map first)
-                                             (filter #(sl/has-interest? sl %)))
+                                             (filter (fn [dot-subj]
+                                                       (sl/has-interest?
+                                                         sl
+                                                         (str/split dot-subj #"\.")))))
                                        entries)]
                     (= expected @!got)))))
 
@@ -179,25 +183,24 @@
            (conj t x)))))
 
 (defn- build-patterns
-  "All pattern strings of lengths `lens` over `pat-alpha`, optionally
-   with a trailing `>` token. `pat-alpha` should be literals plus \"*\"."
+  "All pattern vectors of lengths `lens` over `pat-alpha`, optionally
+   with a trailing `:>` token. `pat-alpha` should be literals plus `:*`."
   [pat-alpha lens]
   (vec (for [n        lens
              toks     (token-tuples pat-alpha n)
-             trailing [nil ">"]]
-         (let [base (str/join "." toks)]
-           (if trailing (str base "." trailing) base)))))
+             trailing [nil :>]]
+         (if trailing (conj toks trailing) toks))))
 
 (defn- build-subjects
   [alpha lens]
   (vec (for [n    lens
              toks (token-tuples alpha n)]
-         (str/join "." toks))))
+         toks)))
 
 ;; Curated 8-pattern set spanning literal, pwc, fwc and mixed shapes —
 ;; small enough that 2^8 subsets × 6 subjects = 1536 cases is cheap.
 (def ^:private tiny-sub-patterns
-  ["a" "b" "*" ">" "a.b" "a.*" "*.b" "a.>"])
+  [["a"] ["b"] [:*] [:>] ["a" "b"] ["a" :*] [:* "b"] ["a" :>]])
 
 (def ^:private tiny-query-subjects
   (build-subjects ["a" "b"] [1 2]))
@@ -230,10 +233,10 @@
              @cases)))))
 
 ;; Pattern universe for pure-function property tests. With {a,b,*}
-;; token-alphabet over 1–3 token lengths plus optional trailing ">",
+;; token-alphabet over 1–3 token lengths plus optional trailing `:>`,
 ;; there are 4 + 12 + 36 = 52 patterns and 52^2 = 2704 ordered pairs.
 (def ^:private all-patterns
-  (build-patterns ["a" "b" "*"] [1 2 3]))
+  (build-patterns ["a" "b" :*] [1 2 3]))
 
 (def ^:private all-subjects
   (build-subjects ["a" "b"] [1 2 3]))
@@ -290,8 +293,7 @@
         (let [lit (nth all-subjects (ex/pick g (count all-subjects)))
               pat (nth all-patterns (ex/pick g (count all-patterns)))]
           (when (not= (sl/subject-matches-filter? lit pat)
-                      (match-tokens? (str/split pat #"\.")
-                                     (str/split lit #"\.")))
+                      (match-tokens? pat lit))
             (reset! fail {:lit lit :pat pat})))
         (recur)))
     (is (nil? @fail) (str "matches-filter≠oracle for literal: " @fail))))

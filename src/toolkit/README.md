@@ -46,16 +46,18 @@ Public:
 
 ### `toolkit.sublist`
 
-NATS-style subject routing trie. Subscribers register against subject
-patterns with `*` (single-token) and `>` (tail) wildcards; publishers look up
-matches by literal subject. Queue groups are supported — `pick-one` collapses
-a match result into a flat delivery set by load-balancing within each group.
+NATS-style subject routing trie. Subjects and patterns are vectors of
+tokens — strings for literals, `:*` (single-token) and `:>` (tail) for
+wildcards. Subscribers register against patterns; publishers look up
+matches by literal subject. Queue groups are supported — `pick-one`
+collapses a match result into a flat delivery set by load-balancing
+within each group.
 
 ```clojure
 (let [sl (sublist/make)]
-  (sublist/insert! sl "foo.*.baz" :a)
-  (sublist/insert! sl "foo.>"     :b)
-  (sublist/match sl "foo.bar.baz"))
+  (sublist/insert! sl ["foo" :* "baz"] :a)
+  (sublist/insert! sl ["foo" :>]       :b)
+  (sublist/match sl ["foo" "bar" "baz"]))
 ;; => {:plain #{:a :b} :groups {}}
 ```
 
@@ -79,9 +81,9 @@ synchronously on the publisher's thread; a thrown handler is logged to
 
 ```clojure
 (let [ps (pubsub/make)]
-  (pubsub/sub ps "foo.*" (fn [subj msg] (println subj "→" msg)))
-  (pubsub/pub ps "foo.bar" :hello))
-;; prints: foo.bar → :hello
+  (pubsub/sub ps ["foo" :*] (fn [subj msg _] (println subj "→" msg)))
+  (pubsub/pub ps ["foo" "bar"] :hello))
+;; prints: [foo bar] → :hello
 ```
 
 Public:

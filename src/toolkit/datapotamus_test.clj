@@ -1384,20 +1384,20 @@
 ;;
 ;; Every event is published on a subject of the form
 ;;
-;;     <kind>.flow.<flow-id>[.flow.<sub-id>]*[.step.<sid>]
+;;     [<kind> "flow" <flow-id> ("flow" <sub-id>)* ("step" <sid>)?]
 ;;
 ;; where <kind> is one of :recv / :success / :send-out / :failure / :split /
 ;; :merge / :seed / :run-started. Nesting via `as-step` inserts one extra
-;; `.flow.<sub-id>` segment per level. Subscribers use globs like
-;; `recv.flow.*.>` (all recvs across all flows) or
-;; `recv.flow.outer.flow.sub.step.inc` (a specific nested step).
+;; `"flow" <sub-id>` segment per level. Subscribers use glob patterns like
+;; `["recv" "flow" :* :>]` (all recvs across all flows) or
+;; `["recv" "flow" "outer" "flow" "sub" "step" "inc"]` (a specific nested step).
 ;; ============================================================================
 
 ;; A user subscriber sees every :recv event under a specific flow-id.
 (deftest watcher-custom-subscriber
   (let [ps (pubsub/make)
         recv-count (atom 0)
-        u (pubsub/sub ps "recv.flow.run-A.>"
+        u (pubsub/sub ps ["recv" "flow" "run-A" :>]
                       (fn [_ _ _] (swap! recv-count inc)))
         wf (dp/serial
              (dp/fan-out :split 3)
@@ -1412,7 +1412,7 @@
 (deftest multi-flow-shared-pubsub
   (let [ps (pubsub/make)
         tallies (atom {})
-        u (pubsub/sub ps "recv.flow.*.>"
+        u (pubsub/sub ps ["recv" "flow" :* :>]
                       (fn [_ ev _]
                         (swap! tallies update (first (:flow-path ev)) (fnil inc 0))))
         wf-A (dp/serial (dp/step :a  inc)
@@ -1437,9 +1437,9 @@
                (dp/sink))
         outer-recvs (atom [])
         inner-recvs (atom [])
-        u1 (pubsub/sub ps "recv.flow.outer.step.inc"
+        u1 (pubsub/sub ps ["recv" "flow" "outer" "step" "inc"]
                        (fn [_ ev _] (swap! outer-recvs conj ev)))
-        u2 (pubsub/sub ps "recv.flow.outer.flow.sub.step.inc"
+        u2 (pubsub/sub ps ["recv" "flow" "outer" "flow" "sub" "step" "inc"]
                        (fn [_ ev _] (swap! inner-recvs conj ev)))
         result (dp/run! outer {:pubsub ps :flow-id "outer" :data 5})]
     (u1) (u2)

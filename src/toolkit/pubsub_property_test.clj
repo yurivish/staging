@@ -4,8 +4,7 @@
    invoked forms a valid `pick-one` of what a naive matcher would return
    at that moment. Multiplicity-aware — `:fired` is a vector in call
    order so a duplicate-delivery bug can't hide behind set equality."
-  (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -84,17 +83,17 @@
                          #(char (+ (int \a) (frng/int-inclusive frng 25))))))
 
 (defn- frng-subject [frng]
-  (str/join "." (repeatedly (inc (frng/int-inclusive frng 4))
-                            #(frng-literal frng))))
+  (vec (repeatedly (inc (frng/int-inclusive frng 4))
+                   #(frng-literal frng))))
 
 (defn- frng-pattern [frng]
   (let [n         (inc (frng/int-inclusive frng 3))
         tok       #(if (zero? (frng/int-inclusive frng 4))
-                     "*"
+                     :*
                      (frng-literal frng))
         toks      (vec (repeatedly n tok))
         trailing? (zero? (frng/int-inclusive frng 3))]
-    (str/join "." (if trailing? (conj toks ">") toks))))
+    (if trailing? (conj toks :>) toks)))
 
 (defn- frng-queue [frng]
   (when (zero? (frng/int-inclusive frng 3))

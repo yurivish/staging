@@ -1,6 +1,11 @@
 (ns toolkit.sublist
-  "NATS-style subject routing trie with `*` (single-token) and `>` (tail)
+  "NATS-style subject routing trie with `:*` (single-token) and `:>` (tail)
    wildcards and queue groups.
+
+   Subjects and patterns are vectors of tokens. Literal tokens are
+   strings; wildcards are the keywords `:*` and `:>`. Because wildcards
+   are a disjoint type from literals, a string `\"*\"` is a perfectly
+   valid literal token — no escaping, no split/join.
 
    Subscriptions are value-deduped on (subject, value, queue) — inserting
    the same triple twice leaves one copy. A pubsub layer that wants Go-style
@@ -20,8 +25,7 @@
    identity and the cache alongside it. Root identity is the freshness
    token — a computed result installs only if the atom's root hasn't
    moved in the meantime."
-  (:require [clojure.string :as str]
-            [toolkit.stree :as stree])
+  (:require [toolkit.stree :as stree])
   (:import [clojure.lang ExceptionInfo]))
 
 (def ^:private empty-node
@@ -36,39 +40,41 @@
 (defn- bad [reason s & {:as extra}]
   (throw (ex-info (name reason) (merge {:reason reason :subject s} extra))))
 
-(defn- validate-pattern [s]
-  (when (or (nil? s) (= s ""))
-    (bad :empty-subject s))
-  (let [toks (str/split s #"\." -1)
-        n    (count toks)]
+(defn- validate-pattern [v]
+  (when-not (and (vector? v) (seq v))
+    (bad :empty-subject v))
+  (let [n (count v)]
     (dotimes [i n]
-      (let [t (nth toks i)]
+      (let [t (nth v i)]
         (cond
+          (identical? t :>)
+          (when (not= i (dec n))
+            (bad :fwc-not-final v :index i))
+
+          (identical? t :*)
+          nil
+
+          (not (string? t))
+          (bad :bad-token v :index i)
+
           (= t "")
-          (bad :empty-token s :index i)
+          (bad :empty-token v :index i)
 
           (re-find #"[\s\p{Cntrl}]" t)
-          (bad :whitespace-in-token s :index i)
+          (bad :whitespace-in-token v :index i))))
+    v))
 
-          (and (> (count t) 1)
-               (or (str/includes? t "*") (str/includes? t ">")))
-          (bad :bad-wildcard s :index i)
+(defn- validate-subject [v]
+  (let [v' (validate-pattern v)]
+    (when (some #(or (identical? % :*) (identical? % :>)) v')
+      (bad :wildcard-in-subject v))
+    v'))
 
-          (and (= t ">") (not= i (dec n)))
-          (bad :fwc-not-final s :index i))))
-    toks))
+(defn valid-pattern? [v]
+  (try (validate-pattern v) true (catch ExceptionInfo _ false)))
 
-(defn- validate-subject [s]
-  (let [toks (validate-pattern s)]
-    (when (some #{"*" ">"} toks)
-      (bad :wildcard-in-subject s))
-    toks))
-
-(defn valid-pattern? [s]
-  (try (validate-pattern s) true (catch ExceptionInfo _ false)))
-
-(defn valid-subject? [s]
-  (try (validate-subject s) true (catch ExceptionInfo _ false)))
+(defn valid-subject? [v]
+  (try (validate-subject v) true (catch ExceptionInfo _ false)))
 
 ;; --- insert ---
 
@@ -88,10 +94,10 @@
 
 (defn- ins [node [t & rst] v q]
   (cond
-    (nil? t)  (add-to-bucket node q v)
-    (= t "*") (update node :pwc #(ins (or % empty-node) rst v q))
-    (= t ">") (update node :fwc #(add-to-bucket (or % empty-fwc) q v))
-    :else     (update-in node [:children t] #(ins (or % empty-node) rst v q))))
+    (nil? t)          (add-to-bucket node q v)
+    (identical? t :*) (update node :pwc #(ins (or % empty-node) rst v q))
+    (identical? t :>) (update node :fwc #(add-to-bucket (or % empty-fwc) q v))
+    :else             (update-in node [:children t] #(ins (or % empty-node) rst v q))))
 
 ;; --- remove with pruning ---
 
@@ -132,7 +138,7 @@
     (nil? t)
     (disj-from-bucket node q v)
 
-    (= t "*")
+    (identical? t :*)
     (if-let [child (:pwc node)]
       (let [child' (rm child rst v q)]
         (cond
@@ -141,7 +147,7 @@
           :else                     (assoc node :pwc child')))
       node)
 
-    (= t ">")
+    (identical? t :>)
     (if-let [fwc (:fwc node)]
       (let [fwc' (disj-from-bucket fwc q v)]
         (cond
@@ -248,9 +254,9 @@
   (atom empty-state))
 
 (defn insert!
-  "Registers `value` under `subject`. `subject` is a pattern and may contain
-   `*` or `>` wildcards. An optional `{:queue name}` places the subscription
-   in a queue group."
+  "Registers `value` under `subject`. `subject` is a pattern vector and
+   may contain `:*` or `:>` wildcards. An optional `{:queue name}` places
+   the subscription in a queue group."
   ([sl subject value] (insert! sl subject value nil))
   ([sl subject value {:keys [queue]}]
    (let [tokens (validate-pattern subject)]
@@ -269,7 +275,7 @@
 
 (defn match
   "Looks up subscriptions matching `subject`, which must be a literal
-   (no `*` or `>`). Returns `{:plain #{...} :groups {queue [...]}}`.
+   vector (no `:*` or `:>`). Returns `{:plain #{...} :groups {queue [...]}}`.
 
    Results are memoized per subject inside the atom's state. A concurrent
    writer that moves the root between the snapshot and the post-compute
@@ -312,23 +318,22 @@
 (defn- analyze-tokens [toks]
   (reduce (fn [acc t]
             (cond
-              (or (= "" t) (> (count t) 1)) acc
-              (= t "*") (assoc acc :pwc? true)
-              (= t ">") (assoc acc :fwc? true)
+              (identical? t :*) (assoc acc :pwc? true)
+              (identical? t :>) (assoc acc :fwc? true)
               :else acc))
           {:pwc? false :fwc? false}
           toks))
 
 (defn- tokens-can-match? [t1 t2]
   (cond
-    (or (= "" t1) (= "" t2)) false
-    (or (= "*" t1) (= ">" t1) (= "*" t2) (= ">" t2)) true
+    (or (identical? t1 :*) (identical? t1 :>)
+        (identical? t2 :*) (identical? t2 :>)) true
     :else (= t1 t2)))
 
 (defn- subset-match-tokenized?
-  "Tokens-vs-tokens subset match. Both may contain wildcards. So `foo.*`
-   is a subset of `[>, *.*, foo.*]`, but not of `foo.bar`. Port of Go's
-   isSubsetMatchTokenized."
+  "Tokens-vs-tokens subset match. Both may contain wildcards. So `[foo :*]`
+   is a subset of `[[:>] [:* :*] [foo :*]]`, but not of `[foo bar]`. Port
+   of Go's isSubsetMatchTokenized."
   [tokens test-toks]
   (let [n-tok  (count tokens)
         n-test (count test-toks)]
@@ -338,20 +343,15 @@
         (let [t2 (nth test-toks i)]
           (cond
             (>= i n-tok) false  ; `tokens` exhausted — no match regardless of t2
-            (= "" t2)    false
-            (= ">" t2)   true
+            (identical? t2 :>) true
             :else
             (let [t1 (nth tokens i)]
               (cond
-                (= "" t1)  false
-                (= ">" t1) false
-                (= "*" t1)
-                (if (= "*" t2) (recur (inc i)) false)
-                (and (not= "*" t2) (not= t1 t2)) false
+                (identical? t1 :>) false
+                (identical? t1 :*)
+                (if (identical? t2 :*) (recur (inc i)) false)
+                (and (not (identical? t2 :*)) (not= t1 t2)) false
                 :else (recur (inc i))))))))))
-
-(defn- tokenize [s]
-  (str/split s #"\." -1))
 
 (defn subject-matches-filter?
   "Returns true iff `subject` is a subset match of `filter` — i.e. every
@@ -359,7 +359,7 @@
    would receive. Both may contain wildcards. Port of Go's
    SubjectMatchesFilter."
   [subject filter]
-  (subset-match-tokenized? (tokenize subject) (tokenize filter)))
+  (subset-match-tokenized? (validate-pattern subject) (validate-pattern filter)))
 
 (defn subjects-collide?
   "Returns true iff `subj1` and `subj2` — both possibly wildcard patterns
@@ -368,8 +368,8 @@
   [subj1 subj2]
   (if (= subj1 subj2)
     true
-    (let [toks1 (tokenize subj1)
-          toks2 (tokenize subj2)
+    (let [toks1 (validate-pattern subj1)
+          toks2 (validate-pattern subj2)
           {pwc1? :pwc? fwc1? :fwc?} (analyze-tokens toks1)
           {pwc2? :pwc? fwc2? :fwc?} (analyze-tokens toks2)
           lit1? (not (or pwc1? fwc1?))
@@ -415,7 +415,7 @@
 (defn- collect-descendants
   "Adds every sub strictly below `node`: its fwc bucket, pwc subtree,
    and children subtrees. Excludes `node`'s own psubs/qsubs. Used by the
-   `>` query token, which requires 1+ more tokens beyond the current
+   `:>` query token, which requires 1+ more tokens beyond the current
    position."
   [!plain !groups node]
   (when node
@@ -427,18 +427,18 @@
 (defn- walk-reverse-match
   "Walks the trie collecting subs whose subject-pattern is a subset of
    the remaining query tokens. Subset semantics: literal query only
-   accepts literal subs at that position; `*` query accepts literals and
-   `*` subs but not `>` subs; `>` query accepts any non-empty tail."
+   accepts literal subs at that position; `:*` query accepts literals and
+   `:*` subs but not `:>` subs; `:>` query accepts any non-empty tail."
   [!plain !groups node [t & rst]]
   (when node
     (cond
       (nil? t)
       (collect-node! !plain !groups node)
 
-      (= t ">")
+      (identical? t :>)
       (collect-descendants !plain !groups node)
 
-      (= t "*")
+      (identical? t :*)
       (do
         (doseq [c (vals (:children node))]
           (walk-reverse-match !plain !groups c rst))
@@ -449,7 +449,7 @@
       (walk-reverse-match !plain !groups (get-in node [:children t]) rst))))
 
 (defn reverse-match
-  "Given `subject-pattern` (which may contain `*` / `>`), returns the
+  "Given `subject-pattern` (which may contain `:*` / `:>`), returns the
    subs whose stored subject is a subset of `subject-pattern` — every
    literal matched by the stored subject is also matched by the query.
    For a sublist of literal subjects (the typical use case) this is
@@ -470,6 +470,11 @@
 ;; reference; we deliberately skip two of its structural prune rules
 ;; because both can miss entries on overlapping sub/sibling patterns
 ;; (see the plan for concrete counter-examples).
+
+;; The stree API is string-based, so this bridge builds dot-joined
+;; strings from the sublist's string children tokens. Wildcard keywords
+;; never appear in `:children` (they go into `:pwc`/`:fwc`), so the
+;; string construction is unambiguous.
 
 (defn- sl-node-interest? [n]
   (or (seq (:psubs n)) (seq (:qsubs n))))
@@ -503,7 +508,10 @@
    subscription in the sublist `sl`, invokes `(cb subject value)` exactly
    once. Overlapping sublist subs do not cause double-fires — a visited-
    subject set enforces uniqueness. `cb`'s return value is ignored (no
-   early termination)."
+   early termination).
+
+   `subject` handed to `cb` is a dot-joined string, matching the stree's
+   subject format."
   [st sl cb]
   (when (and st sl cb)
     (let [seen    (volatile! #{})
