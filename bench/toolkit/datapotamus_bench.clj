@@ -1,4 +1,4 @@
-(ns toolkit.datapotamus.harness
+(ns toolkit.datapotamus-bench
   "Benchmark harness for Datapotamus pipelines.
 
    Wraps any user `step` with a timing sink, drives it with a load
