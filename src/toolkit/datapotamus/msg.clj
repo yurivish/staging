@@ -50,6 +50,19 @@
   []
   {:msg-id (random-uuid) :msg-kind :done :parent-msg-ids []})
 
+(defn from-opts
+  "Build a root envelope from {:data ... :tokens ...} opts.
+   Presence rules:
+     :data given        → data envelope (with :tokens if also given)
+     only :tokens given → signal envelope
+     neither            → done marker"
+  [{:keys [data tokens] :as opts}]
+  (case [(contains? opts :data) (contains? opts :tokens)]
+    [true  true]  (assoc (new-msg data) :tokens tokens)
+    [true  false] (new-msg data)
+    [false true]  (new-signal tokens)
+    [false false] (new-done)))
+
 (defn envelope-kind [m] (:msg-kind m))
 (defn data?         [m] (= (:msg-kind m) :data))
 (defn signal?       [m] (= (:msg-kind m) :signal))

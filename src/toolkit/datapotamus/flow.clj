@@ -141,7 +141,7 @@
 
    Publishing, counter updates, and quiescence signalling all happen here
    on the publish path — no self-subscription."
-  [hmap trace-sid step-sp cancel-p counters done-p]
+  [hmap trace-sid step-sp {:keys [cancel-p counters done-p]}]
   (let [ports (:ports hmap)
         ins   (:ins ports)
         outs  (:outs ports)
@@ -189,9 +189,16 @@
 
 (declare instrument-flow)
 
-(defn- inline-subflow [outer-sid subflow outer-sp cancel-p counters done-p]
+(defn- inline-subflow [outer-sid subflow outer-sp rt]
   (let [inner-sp (trace/push-scope outer-sp [:scope (name outer-sid)])
-        inner    (instrument-flow subflow inner-sp cancel-p counters done-p)]
+        inner    (instrument-flow subflow inner-sp rt)]
+    (when-not (and (:in inner) (:out inner))
+      (throw (ex-info (str "Subflow " outer-sid " is missing :in or :out boundary"
+                           " — `beside` produces no boundaries; use `serial`,"
+                           " `input-at`/`output-at`, or set them explicitly.")
+                      {:subflow-sid outer-sid
+                       :has-in?  (some? (:in inner))
+                       :has-out? (some? (:out inner))})))
     {:procs (update-keys (:procs inner) #(into [outer-sid] %))
      :conns (mapv (fn [[from to opts]]
                     (cond-> [(prefix-endpoint outer-sid from)
@@ -199,7 +206,7 @@
                       opts (conj opts)))
                   (:conns inner))
      :in    (prefix-endpoint outer-sid (:in inner))
-     :out   (prefix-endpoint outer-sid (or (:out inner) (:in inner)))}))
+     :out   (prefix-endpoint outer-sid (:out inner))}))
 
 (defn- resolve-ref
   "Look up a normalized [path port] endpoint against the alias map keyed by
@@ -214,13 +221,13 @@
   "Recursively inline subflows and wrap handler-maps with proc-fn. Returns a
    flat step map with concrete proc-fns under :procs (keyed by path vectors)
    and conns / :in / :out as [path port] pairs."
-  [stepmap outer-sp cancel-p counters done-p]
+  [stepmap outer-sp rt]
   (let [{:keys [procs inner-conns aliases]}
         (reduce (fn [acc [sid p]]
                   (cond
                     (step/step? p)
                     (let [{:keys [procs conns in out]}
-                          (inline-subflow sid p outer-sp cancel-p counters done-p)]
+                          (inline-subflow sid p outer-sp rt)]
                       (-> acc
                           (update :procs into procs)
                           (update :inner-conns into conns)
@@ -228,7 +235,7 @@
 
                     (step/handler-map? p)
                     (let [step-sp (trace/push-scope outer-sp [:step sid])
-                          wrapped (proc-fn p sid step-sp cancel-p counters done-p)]
+                          wrapped (proc-fn p sid step-sp rt)]
                       (assoc-in acc [:procs [sid]] wrapped))
 
                     :else
@@ -310,6 +317,35 @@
 ;; Lifecycle
 ;; ============================================================================
 
+(defn- start-error-pump!
+  "Drain the flow's error-chan: stamp each error onto the `error` atom and
+   publish a :flow-error event. On the first error, also halt the flow —
+   deliver the cancel promise and call flow/stop so done-p truthfully means
+   done. error-chan closes on stop, so the loop exits naturally afterward.
+   Returns the io-thread channel; closes when the pump exits."
+  [error-chan graph {:keys [raw-ps scope fid error cancel-p done-p]}]
+  (a/io-thread
+   (loop [first? true]
+     (when-let [m (a/<!! error-chan)]
+       (let [ex  (:clojure.core.async.flow/ex m)
+             err {:message (ex-message ex) :data (ex-data ex)}]
+         (reset! error err)
+         (pubsub/pub raw-ps
+                     (trace/run-subject-for scope :flow-error)
+                     {:kind       :flow-error
+                      :pid        (:clojure.core.async.flow/pid m)
+                      :cid        (:clojure.core.async.flow/cid m)
+                      :msg-id     (get-in m [:clojure.core.async.flow/msg :msg-id])
+                      :error      err
+                      :scope      scope
+                      :scope-path [fid]
+                      :at         (trace/now)})
+         (when first?
+           (deliver @done-p [:failed err])
+           (when-not (realized? cancel-p) (deliver cancel-p :failed))
+           (flow/stop graph)))
+       (recur false)))))
+
 (defn start!
   "Instantiate a step and start it running. Returns a handle."
   ([stepmap] (start! stepmap {}))
@@ -322,29 +358,15 @@
          counters     (ctrs/make)
          done-p       (atom (promise))
          error        (atom nil)
-         instrumented (instrument-flow stepmap outer-sp cancel-p counters done-p)
+         rt           {:cancel-p cancel-p :counters counters :done-p done-p}
+         instrumented (instrument-flow stepmap outer-sp rt)
          port-index   (port-index-of instrumented)
          _            (validate-wired-outs! instrumented port-index)
          g            (build-graph instrumented)
          {:keys [error-chan]} (flow/start g)
-         err-done     (a/io-thread
-                       (loop []
-                         (when-let [m (a/<!! error-chan)]
-                           (let [ex  (:clojure.core.async.flow/ex m)
-                                 err {:message (ex-message ex) :data (ex-data ex)}]
-                             (reset! error err)
-                             (pubsub/pub raw-ps
-                                         (trace/run-subject-for scope :flow-error)
-                                         {:kind      :flow-error
-                                          :pid       (:clojure.core.async.flow/pid m)
-                                          :cid       (:clojure.core.async.flow/cid m)
-                                          :msg-id    (get-in m [:clojure.core.async.flow/msg :msg-id])
-                                          :error      err
-                                          :scope      scope
-                                          :scope-path [fid]
-                                          :at         (trace/now)})
-                             (deliver @done-p [:failed err]))
-                           (recur))))]
+         err-done     (start-error-pump! error-chan g
+                                         {:raw-ps raw-ps :scope scope :fid fid
+                                          :error error :cancel-p cancel-p :done-p done-p})]
      (pubsub/pub raw-ps (trace/run-subject-for scope :run-started)
                  {:kind :run-started :scope-path [fid] :scope scope
                   :at   (trace/now)})
@@ -390,13 +412,7 @@
                                            " does not declare input port " port
                                            " (declared: " (:ins step-ports) ")")
                                       {:step flow-in :port port :declared (:ins step-ports)})))
-        has-data?           (contains? opts :data)
-        has-tokens?         (contains? opts :tokens)
-        item                (cond
-                              has-data?   (cond-> (msg/new-msg (:data opts))
-                                            has-tokens? (assoc :tokens (:tokens opts)))
-                              has-tokens? (msg/new-signal (:tokens opts))
-                              :else       (msg/new-done))]
+        item                (msg/from-opts opts)]
     (swap! done-p (fn [p] (if (realized? p) (promise) p)))
     (ctrs/record-inject! counters)
     (pubsub/pub pubsub (trace/run-subject-for scope :inject)
