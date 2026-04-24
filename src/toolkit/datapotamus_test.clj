@@ -1831,7 +1831,7 @@
         worker   (fn [id] (step/step id (fn [q] (solve-fn q (get temps id)))))
         judge    (step/step :pick (fn [cs] (apply max-key :score cs)))
         wf (step/serial
-            (c/parallel :ens
+            (c/parallel :ensemble
                         {:w0 (worker :w0) :w1 (worker :w1)
                          :w2 (worker :w2) :w3 (worker :w3)}
                         :post vals)

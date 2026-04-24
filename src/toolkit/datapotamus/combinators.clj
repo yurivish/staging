@@ -127,29 +127,61 @@
                   (if (seq output) [s' output] [s' msg/drain]))))))
 
 (defn parallel
-  "Scatter-gather bracket: broadcast one input to each port, run the step
-   under that port, collect outputs into a `{port data}` map on the far
-   side. The whole bracket is a single wrapped step with one `:in` and
-   one `:out`, self-scoped under `id`.
+  "Run a set of steps simultaneously on the same input and collect their
+   outputs into a single map keyed by port. One message in, one message
+   out — the fan-out, fan-in, and all the wiring between them are
+   hidden inside.
 
-   `port->step` is a map whose keys become the parallel ports and whose
-   values are the inner step run on each port.
+   `port->step` is a map whose keys become the parallel port names and
+   whose values are the step that runs under each port.
 
-   Keyword options (defaults shown):
-     :select identity  — selector fn passed to fan-out's 3-arity form;
-                         `data → [port] | {port payload}`. When provided,
-                         the runtime subset / distinct-payload form is used.
-     :post   identity  — reshape fn run on the `{port data}` map before
-                         fan-in emits (e.g. `vals` to drop port keys).
+   What happens, step by step, when a message hits the bracket:
+     1. The input is copied once per port.
+     2. Each copy is routed to its port's step.
+     3. The bracket waits for every port to finish.
+     4. Their outputs are collected into a `{port data}` map.
+     5. That map is emitted as one output message.
 
-   The user never writes the fan-out's ports, the fan-in's ports, or the
-   N × 2 inter-connections — they're derived from `port->step`'s keys.
+   Options (defaults in parentheses):
+     :select  (every port runs with an unchanged copy of the input)
+       A fn `data → [port] | {port payload}`. Picks which ports run
+       this round, and optionally gives each port its own payload.
+       Ports not returned stay idle for this message.
+     :post    (identity — the `{port data}` map is emitted as-is)
+       A fn that reshapes the collected outputs before emission.
+       `vals` is the usual choice when downstream only wants the
+       outputs and not the port-of-origin labels.
 
-   Example:
+   The whole bracket is packaged as a single nested step under `id`.
+   That means (a) the inner port steps can have any ids they like with
+   no risk of colliding with ids outside the bracket, and (b) trace
+   events from inside carry a `[:scope id]` segment, so a pubsub
+   subscriber can filter on \"everything that happened in this bracket\"
+   and nothing else.
+
+   Examples
+
+     ;; Ask a solver and a skeptic the same question; emit a single
+     ;; map keyed by role so downstream can tell them apart.
+     ;;   =>  {:solver \"...solver's answer...\"
+     ;;        :skeptic \"...skeptic's answer...\"}
      (c/parallel :roles {:solver  solver-step
                          :skeptic skeptic-step})
-     (c/parallel :ens   {:w0 w0 :w1 w1 :w2 w2} :post vals)
-     (c/parallel :plan  workers-map :select plan-fn :post vals)"
+
+     ;; Run three workers on the same question (say, each worker
+     ;; closes over a different sampling temperature) and emit the
+     ;; answers as a flat list. :post vals drops the :w0/:w1/:w2 port
+     ;; keys because the judge downstream only cares what the
+     ;; candidates look like, not which worker produced which.
+     ;;   =>  (cand-w0 cand-w1 cand-w2)
+     (c/parallel :ensemble {:w0 w0 :w1 w1 :w2 w2} :post vals)
+
+     ;; A planner decides at runtime which workers to dispatch to and
+     ;; what each one gets. plan-fn is called on the input and must
+     ;; return a {port payload} map; ports not listed stay idle this
+     ;; round. Output is a flat list (port keys dropped).
+     ;;   =>  (answer-for-subtask-0 answer-for-subtask-1 ...)
+     (c/parallel :plan worker-pool-map :select plan-fn :post vals)"
   [id port->step & {:keys [select post] :or {post identity}}]
   (let [ports    (vec (keys port->step))
         fo-id    id
