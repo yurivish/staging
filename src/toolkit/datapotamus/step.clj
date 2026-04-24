@@ -4,9 +4,12 @@
    A **step** is a wiring container:
 
      {:procs {sid handler-map-or-step}   ; nested steps compose recursively
-      :conns [[[from-sid port] [to-sid port]] ...]
+      :conns [[[from-sid port] [to-sid port] opts?] ...]
       :in    sid-or-[sid port]
       :out   sid-or-[sid port]}
+
+   An optional third element on a conn is an opts map forwarded to the
+   consumer's input channel — `{:buf-or-n N :xform xf}` — see `connect`.
 
    Most users build steps with `step/step` (1-proc) and compose them with
    `serial`, `merge-steps`, `connect`, `input-at`, `output-at`, and
@@ -184,10 +187,16 @@
           steps))
 
 (defn connect
-  "Add one [from → to] conn to a step."
-  [s from to]
-  (update s :conns conj
-          [(endpoint from :out) (endpoint to :in)]))
+  "Add one [from → to] conn to a step.
+
+   Optional `opts` (e.g. `{:buf-or-n 100 :xform xf}`) attaches core.async
+   channel options to the consumer's input — typically to widen the
+   buffer on a hot edge where the producer outpaces the consumer."
+  ([s from to] (connect s from to nil))
+  ([s from to opts]
+   (update s :conns conj
+           (cond-> [(endpoint from :out) (endpoint to :in)]
+             opts (conj opts)))))
 
 (defn serial
   "Chain steps sequentially, auto-wiring each :out to next :in."

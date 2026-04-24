@@ -166,8 +166,8 @@
         outs  (:outs ports)
         emit! (fn [ev]
                 (trace/sp-pub step-sp ev)
-                (ctrs/record-event! counters ev)
-                (when (ctrs/balanced? counters) (deliver @done-p :quiescent)))]
+                (when (ctrs/record-event! counters ev)
+                  (deliver @done-p :quiescent)))]
     (fn
       ([]      {:params {} :ins ins :outs outs})
       ([_]     ((:on-init hmap)))
@@ -204,14 +204,15 @@
 (declare instrument-flow)
 
 (defn- inline-subflow [sid subflow outer-sp cancel-p counters done-p]
-  (let [inner-sp      (update outer-sp :prefix conj [:flow (name sid)])
+  (let [inner-sp      (trace/push-scope outer-sp [:flow (name sid)])
         inner-inst    (instrument-flow subflow inner-sp cancel-p counters done-p)
         renamed-procs (into {}
                             (for [[k v] (:procs inner-inst)]
                               [(prefix-sid sid k) v]))
-        renamed-conns (mapv (fn [[from to]]
-                              [(prefix-endpoint sid from)
-                               (prefix-endpoint sid to)])
+        renamed-conns (mapv (fn [[from to opts]]
+                              (cond-> [(prefix-endpoint sid from)
+                                       (prefix-endpoint sid to)]
+                                opts (conj opts)))
                             (:conns inner-inst))
         in-ref        (prefix-ref sid (:in inner-inst))
         out-ref       (prefix-ref sid (or (:out inner-inst) (:in inner-inst)))]
@@ -245,7 +246,7 @@
                           (assoc-in [:aliases sid] {:in in :out out})))
 
                     (step/handler-map? p)
-                    (let [step-sp (update outer-sp :prefix conj [:step sid])
+                    (let [step-sp (trace/push-scope outer-sp [:step sid])
                           wrapped (proc-fn p sid step-sp cancel-p counters done-p)]
                       (assoc-in acc [:procs sid] wrapped))
 
@@ -254,9 +255,10 @@
                                     {:sid sid :value p}))))
                 {:procs {} :inner-conns [] :aliases {}}
                 (:procs stepmap))
-        resolved-conns (mapv (fn [[from to]]
-                               [(resolve-endpoint aliases :out from)
-                                (resolve-endpoint aliases :in to)])
+        resolved-conns (mapv (fn [[from to opts]]
+                               (cond-> [(resolve-endpoint aliases :out from)
+                                        (resolve-endpoint aliases :in to)]
+                                 opts (conj opts)))
                              (:conns stepmap))
         in-resolved  (when-let [r (:in  stepmap)] (resolve-flow-ref r aliases :in))
         out-resolved (when-let [r (:out stepmap)] (resolve-flow-ref r aliases :out))]
@@ -270,12 +272,35 @@
 ;; Graph build + validation
 ;; ============================================================================
 
+(defn- collect-chan-opts
+  "Fold per-conn opts into `{sid {port opts}}`. A conn attaches its opts
+   to the consumer's input port, so multiple conns targeting the same
+   `[to in]` must agree (or only one supplies opts) — otherwise the
+   underlying channel's buffer is ambiguous."
+  [conns]
+  (reduce (fn [acc [_ [to in] opts]]
+            (if (nil? opts)
+              acc
+              (let [existing (get-in acc [to in])]
+                (cond
+                  (nil? existing)    (assoc-in acc [to in] opts)
+                  (= existing opts)  acc
+                  :else              (throw (ex-info
+                                             (str "Conflicting chan-opts for " [to in]
+                                                  ": " existing " vs " opts)
+                                             {:to to :in in
+                                              :existing existing :new opts}))))))
+          {} conns))
+
 (defn- build-graph [instrumented]
-  (flow/create-flow
-   {:procs (into {}
-                 (map (fn [[sid pfn]] [sid {:proc (flow/process pfn)}]))
-                 (:procs instrumented))
-    :conns (:conns instrumented)}))
+  (let [chan-opts (collect-chan-opts (:conns instrumented))]
+    (flow/create-flow
+     {:procs (into {}
+                   (map (fn [[sid pfn]]
+                          [sid (cond-> {:proc (flow/process pfn)}
+                                 (chan-opts sid) (assoc :chan-opts (chan-opts sid)))]))
+                   (:procs instrumented))
+      :conns (mapv (fn [[from to]] [from to]) (:conns instrumented))})))
 
 (defn- port-index-of [instrumented]
   (into {}

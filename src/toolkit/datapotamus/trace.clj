@@ -90,10 +90,24 @@
 ;; Scoped pubsub — publishing helper
 ;; ============================================================================
 
+(defn push-scope
+  "Extend a scoped pubsub with a new scope segment, precomputing the
+   flattened tokens and flow-path so `sp-pub` doesn't allocate them on
+   every event. A step-sp built once at `start!` gets reused for every
+   publish from that proc, so the precompute pays for itself immediately
+   and is freed naturally when the flow's handle is gc'd."
+  [sp segment]
+  (let [prefix' (conj (:prefix sp) segment)]
+    (assoc sp
+           :prefix    prefix'
+           :tokens    (scope->tokens prefix')
+           :flow-path (flow-path-of prefix'))))
+
 (defn sp-pub
-  "Publish event `ev` with subject derived from the scope. Stamps :at,
-   :scope, :flow-path at publish time."
-  [{:keys [raw prefix]} ev]
+  "Publish event `ev` on the scoped pubsub. Stamps :at, :scope,
+   :flow-path at publish time. Reads the precomputed :tokens and
+   :flow-path built by `push-scope`."
+  [{:keys [raw prefix tokens flow-path]} ev]
   (pubsub/pub raw
-              (subject-for prefix (:kind ev))
-              (assoc ev :scope prefix :flow-path (flow-path-of prefix) :at (now))))
+              (into [(name (:kind ev))] tokens)
+              (assoc ev :scope prefix :flow-path flow-path :at (now))))

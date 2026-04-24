@@ -16,7 +16,8 @@
             [toolkit.datapotamus.step :as step]
             [toolkit.hist :as hist]
             [toolkit.pubsub :as pubsub])
-  (:import [java.util.concurrent Semaphore]
+  (:import [java.lang.management ManagementFactory]
+           [java.util.concurrent Semaphore]
            [java.util.concurrent.atomic AtomicBoolean AtomicLong AtomicReference]
            [toolkit.hist Dense]))
 
@@ -231,29 +232,85 @@
                      (fmt-ns (or (:p99 s) 0)) (fmt-ns (or (:p999 s) 0))
                      (fmt-ns (or (:max s) 0))))))
 
+;; ---- Multi-sample aggregation -------------------------------------
+
+(def ^:private default-samples 5)
+
+(def ^:private max-gc-attempts 100)
+
+(defn- heap-used ^long []
+  (let [rt (Runtime/getRuntime)]
+    (- (.totalMemory rt) (.freeMemory rt))))
+
+(defn- settle!
+  "Force finalizers and GC until heap stabilizes, so each sample starts
+   from a comparable heap state. Ported from criterium.core/force-gc."
+  []
+  (loop [memory-used (heap-used)
+         attempts    0]
+    (System/runFinalization)
+    (System/gc)
+    (let [new-memory-used (heap-used)
+          pending         (.. (ManagementFactory/getMemoryMXBean)
+                              getObjectPendingFinalizationCount)]
+      (when (and (or (pos? pending) (> memory-used new-memory-used))
+                 (< attempts max-gc-attempts))
+        (recur new-memory-used (inc attempts))))))
+
+(defn- median [xs]
+  (let [v (vec (sort xs))
+        n (count v)]
+    (if (zero? n)
+      0
+      (if (odd? n)
+        (nth v (quot n 2))
+        (/ (+ (nth v (dec (quot n 2))) (nth v (quot n 2))) 2.0)))))
+
+(defn- summarize-samples
+  "Fold a seq of run-bench results into median + range on throughput and
+   p50 latency."
+  [results]
+  (let [thps (mapv #(double (or (get-in % [:summary :throughput-msgs-per-s]) 0.0)) results)
+        p50s (mapv #(double (or (get-in % [:summary :p50]) 0.0)) results)]
+    {:n          (count results)
+     :thp-med    (median thps)
+     :thp-min    (apply min thps)
+     :thp-max    (apply max thps)
+     :p50-med    (median p50s)
+     :p50-min    (apply min p50s)
+     :p50-max    (apply max p50s)}))
+
+(defn- print-aggregate [label {:keys [n thp-med thp-min thp-max p50-med p50-min p50-max]}]
+  (println (format "  %-24s  thp med=%s  range=[%s .. %s]  (n=%d)"
+                   label (fmt-rate thp-med) (fmt-rate thp-min) (fmt-rate thp-max) n))
+  (println (format "%26sp50 med=%s  range=[%s .. %s]"
+                   "" (fmt-ns p50-med) (fmt-ns p50-min) (fmt-ns p50-max))))
+
 ;; ---- Sweep runner --------------------------------------------------
 
 (defn sweep
-  "Run a sequence of `[label opts]` pairs through run-bench. Prints each
-   result as it finishes (so a crash mid-sweep preserves earlier data).
-   Returns a vector of {:label :result :error} maps."
-  [scenarios]
-  (mapv (fn [[label opts]]
-          (try
-            (let [r (run-bench opts)]
-              (print-result label r)
-              {:label label :result r})
-            (catch Throwable t
-              (println (format "  %-24s  ERROR: %s" label (ex-message t)))
-              {:label label :error (ex-message t)})))
-        scenarios))
+  "Run each `[label opts]` scenario `samples` times (default 5) and print
+   median + range on throughput and p50 latency. Returns a vector of
+   {:label :results :summary :error} maps."
+  ([scenarios] (sweep scenarios default-samples))
+  ([scenarios samples]
+   (mapv (fn [[label opts]]
+           (try
+             (let [rs   (vec (repeatedly samples #(do (settle!) (run-bench opts))))
+                   agg  (summarize-samples rs)]
+               (print-aggregate label agg)
+               {:label label :results rs :summary agg})
+             (catch Throwable t
+               (println (format "  %-24s  ERROR: %s" label (ex-message t)))
+               {:label label :error (ex-message t)})))
+         scenarios)))
 
 ;; ---- Scenario entry -----------------------------------------------
 
 (def ^:private smoke-sweep
   "A small cross-section of topologies × concurrencies. 3s measurement
    per config (enough to stabilize p99 for these shapes)."
-  (let [base {:warmup-s 1 :duration-s 3}]
+  (let [base {:warmup-s 1 :duration-s 2}]
     [["noop        C=1 "  (merge base {:step (noop-step)         :load {:kind :closed :concurrency 1}})]
      ["noop        C=4 "  (merge base {:step (noop-step)         :load {:kind :closed :concurrency 4}})]
      ["noop        C=16"  (merge base {:step (noop-step)         :load {:kind :closed :concurrency 16}})]
@@ -263,29 +320,34 @@
 
 (defn littles-law-sweep
   "Closed-loop concurrency sweep on a fixed topology. Little's law:
-   throughput × mean-latency ≈ concurrency. A stable ratio across C
-   indicates the measurement stack is consistent; drift indicates
-   either saturation or measurement bias. Prints per-row + a
-   Little's-law column."
-  ([] (littles-law-sweep (chain-n-step 3) "chain-3"))
-  ([step label]
+   throughput × mean-latency ≈ concurrency. Each C is sampled `samples`
+   times (default 5); reports median throughput, median p50, and the
+   throughput range across samples."
+  ([] (littles-law-sweep (chain-n-step 3) "chain-3" default-samples))
+  ([step label] (littles-law-sweep step label default-samples))
+  ([step label samples]
    (println)
-   (println (format "=== toolkit.datapotamus — Little's law sweep on %s ===" label))
+   (println (format "=== toolkit.datapotamus — Little's law sweep on %s (n=%d per C) ==="
+                    label samples))
    (println "  concurrency × throughput × mean-latency should ≈ concurrency")
    (doseq [c [1 2 4 8 16 32]]
-     (let [r (run-bench {:step step
-                         :load {:kind :closed :concurrency c}
-                         :warmup-s 1 :duration-s 3})
-           s (:summary r)
-           thp (double (or (:throughput-msgs-per-s s) 0.0))
-           mean-s (/ (double (or (:mean s) 0)) 1e9)
-           little (* thp mean-s)]
-       (println (format "  C=%-3d  thp=%s  p50=%s  mean=%s  L=%.2f (target %d)"
+     (let [rs     (vec (repeatedly samples
+                         #(do (settle!)
+                              (run-bench {:step step
+                                          :load {:kind :closed :concurrency c}
+                                          :warmup-s 1 :duration-s 2}))))
+           thps   (mapv #(double (or (get-in % [:summary :throughput-msgs-per-s]) 0.0)) rs)
+           means  (mapv #(double (or (get-in % [:summary :mean]) 0.0)) rs)
+           p50s   (mapv #(double (or (get-in % [:summary :p50]) 0.0)) rs)
+           ls     (mapv (fn [thp mean-ns] (* thp (/ mean-ns 1e9))) thps means)]
+       (println (format "  C=%-3d  thp med=%s  range=[%s .. %s]  p50 med=%s  L med=%.2f  (target %d)"
                         c
-                        (fmt-rate thp)
-                        (fmt-ns (or (:p50 s) 0))
-                        (fmt-ns (or (:mean s) 0))
-                        little c))))))
+                        (fmt-rate (median thps))
+                        (fmt-rate (apply min thps))
+                        (fmt-rate (apply max thps))
+                        (fmt-ns (median p50s))
+                        (median ls)
+                        c))))))
 
 (defn slow-subscriber-experiment
   "Plan H.9 — demonstrates that a slow pubsub subscriber stalls the

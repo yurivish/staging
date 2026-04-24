@@ -13,15 +13,21 @@
   (->Counters (LongAdder.) (LongAdder.) (LongAdder.)))
 
 (defn record-event!
-  "Apply an event's counter delta in place. Called on the proc-fn publish
-   path for every emitted event."
+  "Apply an event's counter delta in place. Returns `true` iff this event
+   advanced `completed` and the flow is now balanced (potentially
+   quiescent). Only completion-advancing events can close the gap, so
+   every other kind returns `false` without reading the counters."
   [^Counters c ev]
   (case (:kind ev)
-    :recv     (.increment (.-recv c))
-    :success  (.increment (.-completed c))
-    :failure  (.increment (.-completed c))
-    :send-out (when (:port ev) (.increment (.-sent c)))
-    nil))
+    :recv     (do (.increment (.-recv c)) false)
+    :send-out (do (when (:port ev) (.increment (.-sent c))) false)
+    (:success :failure)
+    (do (.increment (.-completed c))
+        (let [s  (.sum (.-sent c))
+              r  (.sum (.-recv c))
+              co (.sum (.-completed c))]
+          (and (pos? s) (= s r) (= r co))))
+    false))
 
 (defn record-inject!
   "Count a message injected into the flow from outside. The inject path
