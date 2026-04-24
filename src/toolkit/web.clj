@@ -3,14 +3,16 @@
 
   Exposes secure session cookies, DataStar-aware CSRF (token read from signals,
   not an X-CSRF-Token header), a `{:star/type :html :args hiccup}` response
-  convention that `wrap-html` renders to a string, and a signals pre-parser
+  convention that `wrap-html` renders to a string, a signals pre-parser
   that caches `d/read-signals` on `:body-params` so CSRF and handlers share one
-  parse of the single-use Ring body.
+  parse of the single-use Ring body, and a `static-handler` that picks the
+  right backing (disk in dev, classpath in prod) with the right cache headers.
 
   Most apps want `default-middleware`; assemble from the individual pieces if
   you need non-standard ordering."
   (:require
    [hiccup2.core :as h]
+   [reitit.ring :as reitit-ring]
    [ring.middleware.anti-forgery :as anti-forgery]
    [ring.middleware.keyword-params :as kparams]
    [ring.middleware.params :as params]
@@ -62,6 +64,42 @@
     (handler (if-let [signals (d/read-signals req)]
                (assoc req :body-params signals)
                req))))
+
+(defn wrap-no-cache
+  "Stamp `Cache-Control: no-cache, must-revalidate` on every response so
+  browsers revalidate on reload. Wrap your dev static handler with this —
+  without it, CSS/JS edits cache heuristically and demand a hard-reload.
+  Skip in prod, where long-lived caching of content-hashed assets is right."
+  [handler]
+  (fn [req]
+    (when-let [resp (handler req)]
+      (assoc-in resp [:headers "Cache-Control"] "no-cache, must-revalidate"))))
+
+;; ----- Static assets
+
+(defn static-handler
+  "Static-asset handler that does the right thing in dev vs prod:
+    dev  — serves files from `:dev-root` on disk, wrapped in `wrap-no-cache`
+           so the browser re-fetches on every reload.
+    prod — serves classpath resources under `:prod-root` with default cache
+           headers (long-lived caching is appropriate for packaged assets).
+
+  Opts:
+    :path      URL prefix                   (default \"/static\")
+    :dev-root  filesystem root in dev       (default \"resources/public\")
+    :prod-root classpath root in prod       (default \"public\")
+    :dev?      mode flag                    (required)
+
+  Pass the returned handler as the second arg to `reitit.ring/ring-handler`
+  (the default handler) or mount it as a route — either works."
+  [{:keys [path dev-root prod-root dev?]
+    :or   {path      "/static"
+           dev-root  "resources/public"
+           prod-root "public"}}]
+  (if dev?
+    (wrap-no-cache
+     (reitit-ring/create-file-handler {:path path :root dev-root}))
+    (reitit-ring/create-resource-handler {:path path :root prod-root})))
 
 ;; ----- The whole stack
 

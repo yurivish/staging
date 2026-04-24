@@ -1,0 +1,167 @@
+/* datapotamus viz — minimal v1 styling */
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: #0f1115;
+  color: #e7e9ee;
+  margin: 0;
+  padding: 24px;
+  line-height: 1.35;
+}
+
+.viz-h1 {
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #7a8191;
+  margin: 0 0 12px 0;
+}
+
+.viz-toolbar {
+  margin: 0 0 20px 0;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.viz-btn {
+  background: #1f2530;
+  color: #e7e9ee;
+  border: 1px solid #2a3344;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background-color 120ms ease-out;
+}
+
+.viz-btn:hover { background: #262f3d; }
+.viz-btn:active { background: #1a212b; }
+
+.viz-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.viz-empty {
+  color: #7a8191;
+  font-size: 13px;
+  padding: 24px 0;
+}
+
+/* One section per flow */
+.viz-flow {
+  border: 1px solid #1f242d;
+  border-radius: 8px;
+  padding: 14px 16px;
+  background: #14171d;
+}
+
+.viz-flow[data-status="running"]   { border-color: #2a4a6b; }
+.viz-flow[data-status="completed"] { border-color: #2a3344; opacity: 0.92; }
+.viz-flow[data-status="failed"]    { border-color: #5b3030; }
+
+.viz-flow__header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 12px 0;
+  font-size: 12px;
+  color: #a0a7b5;
+  font-variant-numeric: tabular-nums;
+}
+
+.viz-flow__title {
+  font-size: 14px;
+  font-weight: 500;
+  color: #c9ced9;
+  margin-right: 4px;
+}
+
+.viz-flow__id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: #6b7281;
+}
+
+.viz-flow__status {
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: #202634;
+  color: #9aa3b1;
+}
+
+.viz-flow[data-status="running"]   .viz-flow__status { background: #1b3a58; color: #7fb8ef; }
+.viz-flow[data-status="completed"] .viz-flow__status { background: #1f3a2a; color: #7fcc94; }
+.viz-flow[data-status="failed"]    .viz-flow__status { background: #3a2020; color: #e08a8a; }
+
+.viz-flow__elapsed {
+  margin-left: auto;
+  color: #6b7281;
+  font-size: 11px;
+}
+
+.viz-flow__cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.viz-card {
+  flex: 0 0 auto;
+  width: 170px;
+  padding: 12px 14px;
+  background: #1a1d24;
+  border: 1px solid #262a34;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.viz-card[data-kind="container"] {
+  background: #1d2430;
+  border-color: #2a3344;
+}
+
+.viz-card__name {
+  font-size: 12px;
+  font-weight: 500;
+  color: #c9ced9;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.viz-card__inflight {
+  font-size: 30px;
+  font-weight: 300;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: #e7e9ee;
+}
+
+.viz-card__queue {
+  font-size: 11px;
+  color: #d4a14a;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+.viz-card__queue[data-empty="true"] {
+  color: #7a8191;
+}
+
+.viz-card__meta {
+  font-size: 11px;
+  color: #7a8191;
+  font-variant-numeric: tabular-nums;
+}

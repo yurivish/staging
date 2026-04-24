@@ -1,4 +1,4 @@
-(ns toolkit.potam3.trace
+(ns toolkit.datapotamus.trace
   "Trace events + scoped pubsub + counters.
 
    Events are plain maps keyed on two axes: :kind (lifecycle role —

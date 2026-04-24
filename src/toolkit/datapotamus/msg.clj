@@ -1,5 +1,5 @@
-(ns toolkit.potam3.msg
-  "Message envelopes + the free algebra of drafts + pure synthesis.
+(ns toolkit.datapotamus.msg
+  "Message envelopes + the free algebra for building them + pure synthesis.
 
    A **message envelope** is a plain map. Three shapes distinguished by
    key absence:
@@ -12,21 +12,21 @@
    sentinel. Token conservation laws are XOR-based (see `token.clj`).
 
    Handlers return outputs in a per-port map. Each output is either a
-   **draft** (built by the free-algebra constructors below — `child`,
-   `children`, `pass`, `signal`, `merge`) or a plain value that gets
-   auto-wrapped as a `child` of the input message. Drafts carry an
-   in-memory `::parents` ref to their direct parents (real messages or
-   other drafts), forming a DAG whose leaves are the handler's input
-   messages.
+   msg built by the free-algebra constructors below (`child`,
+   `children`, `pass`, `signal`, `merge`) or a bare data value that gets
+   auto-wrapped as a `child` of the input message. Pending msgs carry
+   an in-memory `::parents` ref to their direct parents (concrete
+   messages or other pending msgs), forming a DAG whose leaves are the
+   handler's input messages.
 
    `synthesize` is a single pure fold over that DAG. For each leaf,
-   it counts how many drafts reference it, XOR-splits the leaf's
-   tokens K-ways, and XOR-merges the slices into each referring
-   draft. Then it applies any stamped `::assoc-tokens` / `::dissoc-tokens`
-   metadata and strips the ref graph. Output is concrete messages
-   partitioned by port, plus a list of :split/:merge trace events."
+   it counts how many pending msgs reference it, XOR-splits the leaf's
+   tokens K-ways, and XOR-merges the slices into each referrer. Then
+   it applies any stamped `::assoc-tokens` / `::dissoc-tokens` metadata
+   and strips the ref graph. Output is concrete messages partitioned
+   by port, plus a list of :split/:merge trace events."
   (:refer-clojure :exclude [merge])
-  (:require [toolkit.potam3.token :as tok]))
+  (:require [toolkit.datapotamus.token :as tok]))
 
 ;; ============================================================================
 ;; Envelope constructors + predicates
@@ -64,11 +64,11 @@
   (cond (done? m) :done (signal? m) :signal :else :data))
 
 ;; ============================================================================
-;; Drafts — the free algebra over input messages
+;; Free-algebra constructors over input messages
 ;; ============================================================================
 
-(defn draft?
-  "True iff `x` is a draft (not yet materialized)."
+(defn pending?
+  "True iff `x` is a pending msg (pre-synthesis, carries `::parents`)."
   [x]
   (and (map? x) (contains? x ::parents)))
 
@@ -118,102 +118,120 @@
 ;; global conservation holds.
 
 (defn assoc-tokens
-  "XOR-merge `token-map` into the draft's final tokens during synthesis."
-  [draft token-map]
-  (update draft ::assoc-tokens #(tok/merge-tokens (or % {}) token-map)))
+  "XOR-merge `token-map` into the msg's final tokens during synthesis."
+  [m token-map]
+  (update m ::assoc-tokens #(tok/merge-tokens (or % {}) token-map)))
 
 (defn dissoc-tokens
-  "Remove `group-keys` from the draft's final tokens during synthesis."
-  [draft group-keys]
-  (update draft ::dissoc-tokens (fnil into #{}) group-keys))
+  "Remove `group-keys` from the msg's final tokens during synthesis."
+  [m group-keys]
+  (update m ::dissoc-tokens (fnil into #{}) group-keys))
+
+(def drain
+  "Sentinel return value from a handler, in place of the port-map. Tells
+   the interpreter: do NOT auto-propagate a signal for this invocation,
+   even though no outputs were produced. Two use cases:
+
+     * Batching / deferred propagation — you've stashed the input msg in
+       state and will emit a merge of several inputs in a later handler
+       call. The tokens ride along on the stashed ref; auto-signalling
+       now would double-count them once the merge fires.
+
+     * Genuine terminal drop — you really want the input's tokens to die
+       here (rare).
+
+   Return either `drain` or `[state' drain]`. Any other empty port-map
+   (including `{}` and `{:port []}`) triggers the default auto-signal on
+   every declared output port."
+  ::drain)
 
 ;; ============================================================================
-;; Synthesis — one pure fold from drafts to concrete messages
+;; Synthesis — one pure fold from pending msgs to concrete messages
 ;; ============================================================================
 
 (defn- leaves-of
-  "The set of ultimate (non-draft) ancestors reachable from `d`."
-  [d]
-  (if (draft? d)
-    (into #{} (mapcat leaves-of) (::parents d))
-    #{d}))
+  "The set of ultimate (non-pending) ancestors reachable from `m`."
+  [m]
+  (if (pending? m)
+    (into #{} (mapcat leaves-of) (::parents m))
+    #{m}))
 
-(defn- coerce-plain
-  "Replace plain output values with `child` drafts of `parent-msg`."
+(defn- coerce-data
+  "Replace bare data values with `child` msgs of `parent-msg`."
   [outputs parent-msg]
   (mapv (fn [[port v]]
-          (if (draft? v) [port v] [port (child nil parent-msg v)]))
+          (if (pending? v) [port v] [port (child nil parent-msg v)]))
         outputs))
 
 (defn- materialize
   "Strip refs + stamped meta; assoc final :tokens."
-  [draft tokens]
-  (let [added   (::assoc-tokens draft)
-        dropped (::dissoc-tokens draft)
+  [m tokens]
+  (let [added   (::assoc-tokens m)
+        dropped (::dissoc-tokens m)
         t1      (if added   (tok/merge-tokens tokens added) tokens)
         t2      (if (seq dropped) (apply dissoc t1 dropped) t1)]
-    (-> draft
+    (-> m
         (dissoc ::parents ::assoc-tokens ::dissoc-tokens)
         (assoc :tokens t2))))
 
-(defn- split-event [step-id draft]
+(defn- split-event [step-id m]
   {:kind           :split
    :step-id        step-id
-   :msg-id         (:msg-id draft)
-   :data-id        (:data-id draft)
-   :parent-msg-ids (:parent-msg-ids draft)})
+   :msg-id         (:msg-id m)
+   :data-id        (:data-id m)
+   :parent-msg-ids (:parent-msg-ids m)})
 
-(defn- merge-event [step-id draft]
+(defn- merge-event [step-id m]
   {:kind           :merge
    :step-id        step-id
-   :msg-id         (:msg-id draft)
-   :parent-msg-ids (:parent-msg-ids draft)})
+   :msg-id         (:msg-id m)
+   :parent-msg-ids (:parent-msg-ids m)})
 
 (defn- flatten-outputs
-  "Map {port [d ...]} → seq [[port d] ...]. Within-port order preserved;
+  "Map {port [m ...]} → seq [[port m] ...]. Within-port order preserved;
    across-port order is arbitrary (map iteration)."
   [outputs]
-  (vec (for [[port ds] outputs, d ds] [port d])))
+  (vec (for [[port ms] outputs, m ms] [port m])))
 
 (defn synthesize
   "Post-handler fold. Pure.
 
-   `outputs`    : {port [draft-or-plain ...]}
-   `input-msg`  : the message that triggered the handler (parent for plain values)
+   `outputs`    : {port [msg-or-data ...]}
+   `input-msg`  : the message that triggered the handler (parent for data values)
    `step-id`    : trace subject for generated events
 
    Returns [msgs-per-port events]
      msgs-per-port : {port [concrete-msg ...]}
      events        : [split-or-merge-event ...]"
   [outputs input-msg step-id]
-  (let [pairs       (coerce-plain (flatten-outputs outputs) input-msg)
+  (let [pairs       (coerce-data (flatten-outputs outputs) input-msg)
         leaf-sets   (into {}
-                          (map (fn [[_ d]] [(:msg-id d) (leaves-of d)]))
+                          (map (fn [[_ m]] [(:msg-id m) (leaves-of m)]))
                           pairs)
         all-leaves  (into #{} (mapcat val) leaf-sets)
-        ;; leaf-id → vector of draft-ids that reach it
-        referrers   (reduce (fn [acc [draft-id leaves]]
+        ;; leaf-id → vector of msg-ids that reach it
+        referrers   (reduce (fn [acc [mid leaves]]
                               (reduce (fn [a l]
-                                        (update a (:msg-id l) (fnil conj []) draft-id))
+                                        (update a (:msg-id l) (fnil conj []) mid))
                                       acc leaves))
                             {} leaf-sets)
-        ;; leaf-id → {draft-id → slice}
+        ;; leaf-id → {msg-id → slice}
         leaf-slices (into {}
                           (for [leaf all-leaves
-                                :let [ds     (referrers (:msg-id leaf))
+                                :let [mids   (referrers (:msg-id leaf))
                                       slices (tok/split-tokens (:tokens leaf {})
-                                                               (count ds))]]
-                            [(:msg-id leaf) (zipmap ds slices)]))
-        tokens-of   (fn [draft]
+                                                               (count mids))]]
+                            [(:msg-id leaf) (zipmap mids slices)]))
+        tokens-of   (fn [m]
                       (reduce tok/merge-tokens {}
-                              (for [leaf (leaf-sets (:msg-id draft))]
-                                (get-in leaf-slices [(:msg-id leaf) (:msg-id draft)]))))]
+                              (for [leaf (leaf-sets (:msg-id m))]
+                                (get-in leaf-slices [(:msg-id leaf) (:msg-id m)]))))]
     (reduce
-     (fn [[pm evs] [port d]]
-       (let [t        (tokens-of d)
-             m        (materialize d t)
-             mk-event (if (> (count (::parents d)) 1) merge-event split-event)
-             ev       (assoc (mk-event step-id d) :tokens t)]
+     (fn [[pm evs] [port pending]]
+       (let [t        (tokens-of pending)
+             m        (materialize pending t)
+             mk-event (if (> (count (::parents pending)) 1) merge-event split-event)
+             ev       (assoc (mk-event step-id pending) :tokens t)]
          [(update pm port (fnil conj []) m) (conj evs ev)]))
      [{} []]
      pairs)))

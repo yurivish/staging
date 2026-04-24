@@ -4,12 +4,16 @@
    [clojure.data.json :as json]
    [com.stuartsierra.component :as component]
    [hiccup2.core :as h]
+   [hn.core :as hn]
    [ring.middleware.session.memory :as session-mem]
    [ring.util.http-response :as r]
    [org.httpkit.server :as hk]
    [reitit.ring :as ring]
+   [toolkit.datapotamus.flow :as flow]
+   [toolkit.datapotamus.viz :as viz]
    [toolkit.datastar.core :as d]
    [toolkit.hotreload :as hotreload]
+   [toolkit.pubsub :as pubsub]
    [toolkit.sqlite :as sqlite]
    [toolkit.web :as web])
   #_(:import
@@ -92,10 +96,61 @@
          (d/sse-close! sse)))
       :on-close (fn [_sse _status] (println "CLOSE"))})))
 
+;; ----- Viz (datapotamus flow visualizer) ------------------------------------
+
+(defn viz-page [app]
+  (web/html
+   [:html
+    [:head
+     [:meta {:charset "UTF-8"}]
+     [:title "datapotamus viz"]
+     [:link {:rel "stylesheet" :href "/static/viz.css"}]
+     [:script {:type :module :defer true :src (str static-path "/datastar-pro.js")}]]
+    [:body {:data-init    "@get('/viz/stream')"
+            :data-signals (json/write-str {:csrf (web/csrf-token)})}
+     [:h1.viz-h1 "datapotamus"]
+     [:div.viz-toolbar
+      [:button.viz-btn {:data-on:click "@get('/viz/start')"} "Start flow"]]
+     (viz/all-flows @(:viz-store app))
+     (when (:dev? app) hotreload/snippet)]]))
+
+(defn viz-handler [app]
+  (fn [_req] (viz-page app)))
+
+(defn viz-stream-handler [app]
+  (viz/viz-stream-handler (:viz-store app) (:viz-ticker app)))
+
+(defn viz-start-handler [app]
+  (fn [_req]
+    (let [fid      (str (random-uuid))
+          flow-def (hn/build-flow (atom []))]
+      (viz/register-flow! (:viz-store app) fid (viz/from-step flow-def) "hn")
+      ;; Arm one render tick immediately so the new section appears.
+      ((:tick! (:viz-ticker app)))
+      (Thread/startVirtualThread
+       (fn []
+         (try
+           (let [h (flow/start! flow-def {:flow-id fid
+                                          :pubsub  (:viz-pubsub app)})]
+             ;; Hand the live flow graph to viz — it spawns a ping loop
+             ;; that adds queue depth to the cards alongside in-flight.
+             (viz/attach-handle! (:viz-store app) fid
+                                 (:toolkit.datapotamus.flow/graph h)
+                                 (:viz-ticker app))
+             (flow/inject! h {:data :tick})
+             (let [sig (flow/await-quiescent! h)]
+               (flow/stop! h)
+               (viz/mark-complete! (:viz-store app) fid
+                                   (if (= :quiescent sig) :completed :failed))
+               ((:tick! (:viz-ticker app)))))
+           (catch Throwable t
+             (.printStackTrace t)
+             (viz/mark-complete! (:viz-store app) fid :failed)
+             ((:tick! (:viz-ticker app)))))))
+      (r/no-content))))
+
 (defn static-handler [dev?]
-  (if dev?
-    (ring/create-file-handler     {:path static-path :root "resources/public"})
-    (ring/create-resource-handler {:path static-path :root "public"})))
+  (web/static-handler {:path static-path :dev? dev?}))
 
 (defn routes [app]
   (let [dev? (:dev? app)]
@@ -105,6 +160,9 @@
        ["/stream" (stream-handler)]
        ["/loading" (loading-handler)]
        ["/inc" (inc-handler app)]
+       ["/viz"        (viz-handler app)]
+       ["/viz/stream" (viz-stream-handler app)]
+       ["/viz/start"  (viz-start-handler app)]
        (when dev? [hotreload/path hotreload/handler])])
      (static-handler dev?)
      {:middleware (web/default-middleware
@@ -113,21 +171,34 @@
                     :session-store (session-mem/memory-store (:sessions app))})})))
 
 ;; App state component
-(defrecord App [counter bg-color sessions sqlite dev?]
+(defrecord App [counter bg-color sessions sqlite dev?
+                viz-pubsub viz-store viz-ticker viz-unsub]
   component/Lifecycle
   (start [this]
-    (assoc this
-           :counter  (atom 0)
-           :bg-color (atom "hsl(210, 70%, 85%)")
-           ;; In-memory session store; survives requests, not restarts. Swap for a
-           ;; TTL-capable store in prod (ring-ttl-session, or an lmdb-backed one).
-           :sessions (atom {})))
+    (let [ps (pubsub/make)
+          st (viz/make-store)
+          tk (viz/make-ticker 200)]
+      (assoc this
+             :counter    (atom 0)
+             :bg-color   (atom "hsl(210, 70%, 85%)")
+             ;; In-memory session store; survives requests, not restarts. Swap for a
+             ;; TTL-capable store in prod (ring-ttl-session, or an lmdb-backed one).
+             :sessions   (atom {})
+             :viz-pubsub ps
+             :viz-store  st
+             :viz-ticker tk
+             :viz-unsub  (viz/attach! ps st tk))))
 
   (stop [this]
+    (when viz-unsub (viz-unsub))
     (assoc this
            :counter nil
            :bg-color nil
-           :sessions nil)))
+           :sessions nil
+           :viz-pubsub nil
+           :viz-store nil
+           :viz-ticker nil
+           :viz-unsub nil)))
 
 ;; Web server component
 (defrecord Server [port app stop-fn]

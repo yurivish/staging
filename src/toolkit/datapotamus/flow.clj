@@ -1,4 +1,4 @@
-(ns toolkit.potam3.flow
+(ns toolkit.datapotamus.flow
   "The interpreter.
 
    Takes a step (pure data) and animates it on core.async.flow channels.
@@ -17,9 +17,9 @@
   (:require [clojure.core.async :as a]
             [clojure.core.async.flow :as flow]
             [clojure.set :as set]
-            [toolkit.potam3.msg :as msg]
-            [toolkit.potam3.step :as step]
-            [toolkit.potam3.trace :as trace]
+            [toolkit.datapotamus.msg :as msg]
+            [toolkit.datapotamus.step :as step]
+            [toolkit.datapotamus.trace :as trace]
             [toolkit.pubsub :as pubsub]))
 
 (set! *warn-on-reflection* true)
@@ -58,25 +58,42 @@
   [s ret]
   (if (vector? ret) [(first ret) (second ret)] [s ret]))
 
+(defn- auto-signal-outputs
+  "When a handler returns an empty port-map, synthesize a signal on every
+   declared output port. Preserves the input's tokens for downstream
+   closure (filters, dedups, and skips are the motivating cases)."
+  [ctx outs]
+  (into {} (map (fn [p] [p [(msg/signal ctx)]])) (keys outs)))
+
 (defn- run-data-or-signal
   "Data and signal share a code path. Both call the handler-map,
-   synthesize, validate, and collect events."
+   synthesize, validate, and collect events.
+
+   Empty port-map from the handler ⇒ auto-signal on every output port
+   (preserves tokens). Return `msg/drain` instead to suppress that —
+   e.g., when deferring propagation to a later invocation via stashed
+   parent refs and an eventual `msg/merge`."
   [hmap m s ctx trace-sid outs kind]
   (try
     (let [ret                  (case kind
                                  :signal ((:on-signal hmap) ctx s)
                                  :data   ((:on-data   hmap) ctx s (:data m)))
-          [s' drafts]          (normalize-return s ret)
-          [port-map synth-evs] (msg/synthesize drafts m trace-sid)
+          [s' msgs]            (normalize-return s ret)
+          msgs'                (cond
+                                 (identical? msgs msg/drain) {}
+                                 (and (= kind :data)
+                                      (map? msgs)
+                                      (every? empty? (vals msgs)))
+                                 (auto-signal-outputs ctx outs)
+                                 :else msgs)
+          [port-map synth-evs] (msg/synthesize msgs' m trace-sid)
           _                    (validate-ports! trace-sid port-map outs)
-          events (vec (concat [(trace/recv-event trace-sid kind m)]
-                              synth-evs
+          events (vec (concat synth-evs
                               (send-out-events trace-sid port-map)
                               [(trace/success-event trace-sid kind m)]))]
       [s' port-map events])
     (catch Throwable ex
-      [s {} [(trace/recv-event trace-sid kind m)
-             (trace/failure-event trace-sid m ex)]])))
+      [s {} [(trace/failure-event trace-sid m ex)]])))
 
 (defn- run-done
   "Done cascade: track closed-ins in framework state. When all inputs are
@@ -88,25 +105,22 @@
     (if (= closed all-ins)
       (try
         (let [ret                  ((:on-all-closed hmap) ctx s)
-              [s' drafts]          (normalize-return s ret)
-              [synth-pm synth-evs] (msg/synthesize drafts m trace-sid)
+              [s' msgs]            (normalize-return s ret)
+              [synth-pm synth-evs] (msg/synthesize msgs m trace-sid)
               port-map             (reduce (fn [pm p]
                                              (update pm p (fnil conj []) (msg/new-done)))
                                            synth-pm (keys outs))
-              events (vec (concat [(trace/recv-event trace-sid :done m (:in-port ctx))]
-                                  synth-evs
+              events (vec (concat synth-evs
                                   (send-out-events trace-sid port-map)
                                   [(trace/success-event trace-sid :done m)]))]
           [(assoc s' ::closed-ins closed) port-map events])
         (catch Throwable ex
           [(assoc s ::closed-ins closed)
            {}
-           [(trace/recv-event trace-sid :done m (:in-port ctx))
-            (trace/failure-event trace-sid m ex)]]))
+           [(trace/failure-event trace-sid m ex)]]))
       [(assoc s ::closed-ins closed)
        {}
-       [(trace/recv-event trace-sid :done m (:in-port ctx))
-        (trace/success-event trace-sid :done m)]])))
+       [(trace/success-event trace-sid :done m)]])))
 
 (defn run-step
   "Pure dispatch. Returns [new-state port-map events].
@@ -158,6 +172,11 @@
            s)
          s))
       ([s in-port m]
+       ;; Publish :recv on arrival, before the handler runs. Emitting it
+       ;; alongside :success (as we used to) made every pair atomic in the
+       ;; event log, so live consumers couldn't derive in-flight counts.
+       (trace/sp-pub step-sp
+                     (trace/recv-event trace-sid (msg/envelope-kind m) m in-port))
        (let [[s' port-map events] (run-step hmap m in-port s trace-sid step-sp cancel-p)]
          (doseq [e events] (trace/sp-pub step-sp e))
          [s' port-map])))))

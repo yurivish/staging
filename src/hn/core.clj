@@ -1,5 +1,5 @@
 (ns hn.core
-  "Hacker News front-page summarizer as a potam3 flow.
+  "Hacker News front-page summarizer as a datapotamus flow.
 
    One tick every 10 min fetches the top N stories, their top K comments,
    summarizes each comment with Claude Haiku, and writes a flat JSON array
@@ -9,20 +9,31 @@
    I/O runs in K distinct procs (one thread each), with per-worker trace
    scopes visible in the event stream.
 
-   REPL:
-     (run-once! \"out.json\")
-     (run-once! \"out.json\" {:trace? true})   ; print every event as it fires
-     (start-scheduler! \"out.json\")
-     (stop-scheduler!)"
+   One-shot from the shell (no REPL, exits on completion):
+
+     clojure -M -e \"(require 'hn.core) (hn.core/run-once! \\\"out.json\\\" {:trace? true})\"
+
+   REPL (for iteration; file watcher reloads on edit):
+
+     clojure -M:dev
+     user=> (require 'hn.core)
+     user=> (run-once! \"out.json\" {:trace? true})   ; print every event
+     user=> (start-scheduler! \"out.json\")
+     user=> (stop-scheduler!)
+
+   Gotcha — do NOT combine `-M:dev` with a shell `-e`: the :dev alias's
+   :main-opts (`-e '(user/start!)' -r`) get *prepended* by the CLI, so the
+   `-r` REPL main-opt wins and everything after it becomes inert
+   *command-line-args*. Your expression never evaluates."
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
             [toolkit.llm :as llm]
             [toolkit.llm.anthropic :as anthropic]
-            [toolkit.potam3.combinators :as c]
-            [toolkit.potam3.flow :as flow]
-            [toolkit.potam3.msg :as msg]
-            [toolkit.potam3.step :as step])
+            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.flow :as flow]
+            [toolkit.datapotamus.msg :as msg]
+            [toolkit.datapotamus.step :as step])
   (:import (java.util.concurrent Executors TimeUnit)))
 
 (def base "https://hacker-news.firebaseio.com/v0")
@@ -84,6 +95,16 @@
                                              :content [{:type :text
                                                         :text (:comment row)}]}]}))))))
 
+(defn- fake-summary []
+  (apply str (repeatedly (+ 20 (rand-int 40))
+                         #(rand-nth "abcdefghijklmnopqrstuvwxyz      "))))
+
+(def fake-summarize
+  (step/step :summarize
+             (fn [row]
+               (Thread/sleep (+ 300 (rand-int 700)))
+               (assoc row :summary (fake-summary)))))
+
 (defn- collect-into [a]
   (step/step :collect {:ins {:in ""} :outs {}}
              (fn [_ctx _s row]
@@ -99,7 +120,7 @@
    (c/workers :story-fetchers   fetch-workers fetch-story)
    split-comments
    (c/workers :comment-fetchers fetch-workers fetch-comment)
-   (c/workers :summarizers      llm-workers   summarize)
+   (c/workers :summarizers      llm-workers   fake-summarize)
    (collect-into out-atom)))
 
 (defn- preview [v]
@@ -117,14 +138,16 @@
                (contains? ev :tokens) (str "tokens=" (preview (:tokens ev))))))))
 
 (defn run-once!
+  ([] (run-once! "./out.json" {}))
   ([out-path] (run-once! out-path {}))
-  ([out-path {:keys [trace?]}]
+  ([out-path {:keys [trace? pubsub]}]
    (let [rows (atom [])
          opts (cond-> {:data :tick}
-                trace? (assoc :subscribers {[:>] print-event}))
+                trace? (assoc :subscribers {[:>] print-event})
+                pubsub (assoc :pubsub pubsub))
          res  (flow/run! (build-flow rows) opts)]
      (when (= :completed (:state res))
-       (spit out-path (json/write-str @rows)))
+       (spit out-path (with-out-str (json/pprint @rows))))
      {:state (:state res) :count (count @rows) :error (:error res)})))
 
 ;; --- Scheduler --------------------------------------------------------------

@@ -1,4 +1,4 @@
-(ns toolkit.potam3.step
+(ns toolkit.datapotamus.step
   "Steps + composition. Pure, no runtime.
 
    A **step** is a wiring container:
@@ -13,11 +13,19 @@
    `as-step`. The handler function you pass to `step/step` has signature
    `(fn [ctx state data] → return)` and returns one of:
 
-     • {port [draft-or-plain ...]}                 ; no state change
-     • [state' {port [draft-or-plain ...]}]        ; state updated
+     • {port [msg-or-data ...]}                 ; no state change
+     • [state' {port [msg-or-data ...]}]        ; state updated
+     • msg/drain | [state' msg/drain]           ; drop tokens too
 
-   Drafts come from `toolkit.potam3.msg`. Plain values auto-wrap as
-   `child` drafts of the input message during synthesis.
+   Msgs come from `toolkit.datapotamus.msg`. Bare data values auto-wrap as
+   `child` msgs of the input message during synthesis.
+
+   Two non-obvious rules — see `step` for details:
+     * An empty port-map auto-propagates a signal on every output port
+       (so the input's tokens flow onward); return `msg/drain` to
+       suppress that.
+     * Every child ever derived from a given parent input must be
+       emitted from a single handler invocation.
 
    Under the hood, each terminal entry in `:procs` is a **handler-map** —
    a plain map keyed by message-kind/lifecycle slot:
@@ -36,7 +44,7 @@
    pipelines — see `handler-map`.
 
    Nothing in this namespace touches pubsub or core.async."
-  (:require [toolkit.potam3.msg :as msg]))
+  (:require [toolkit.datapotamus.msg :as msg]))
 
 ;; ============================================================================
 ;; Handler-map defaults
@@ -47,7 +55,7 @@
 ;; the interpreter injects before every call.
 
 (defn- default-on-signal
-  "Broadcast one signal-draft to each output port."
+  "Broadcast one signal msg to each output port."
   [ctx _state]
   (into {} (map (fn [p] [p [(msg/signal ctx)]])) (keys (:outs ctx))))
 
@@ -108,8 +116,26 @@
      (step id ports handler)
        ports   = {:ins {port-kw doc} :outs {port-kw doc}}  ; nil ⇒ defaults
        handler = (fn [ctx state data] → return)
-       return  = {port [draft-or-plain ...]}        ; no state change
-               | [state' {port [draft-or-plain ...]}] ; state updated"
+       return  = {port [msg-or-data ...]}        ; no state change
+               | [state' {port [msg-or-data ...]}] ; state updated
+               | msg/drain | [state' msg/drain]    ; see below
+
+   Empty-port-map semantics. An empty return like `{}` or `[state' {}]`
+   does NOT drop the input's tokens — the interpreter synthesizes a
+   signal on every declared output port so downstream closure still
+   works. Return `msg/drain` (or `[state' msg/drain]`) to suppress that
+   and truly drop the tokens — the usual reason is that you've stashed
+   the input's msg in state and will emit a `msg/merge` from it later.
+
+   Single-invocation invariant for derived msgs. Every child message
+   ever derived from a given parent input must be emitted from a single
+   handler invocation. Synthesis K-way-splits a parent's tokens across
+   the descendants present in this invocation's output; if you stash a
+   parent and derive more children from it in a later call, the two
+   splits will conflict and conservation will silently break. If you
+   need deferred derivation, stash the parent ref, return `msg/drain`,
+   and emit a single `msg/merge` that lists all the eventual parents
+   in one later invocation (the pair-merger pattern)."
   ([id f]
    (step id nil (fn [_ctx _s d] {:out [(f d)]})))
   ([id ports handler]
