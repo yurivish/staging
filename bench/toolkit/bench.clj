@@ -5,6 +5,10 @@
      clojure -M:bench            — full suite
      clojure -M:bench stree      — stree scenarios only
      clojure -M:bench sublist    — sublist scenarios only
+     clojure -M:bench hist       — h2 histogram recording microbench
+     clojure -M:bench datapotamus  — datapotamus pipeline harness smoke test
+     clojure -M:bench littles      — Little's law sweep (closed-loop concurrency × chain-3)
+     clojure -M:bench slow-sub     — slow-subscriber throughput collapse (synchronous pubsub)
 
    Each scenario produces a table row per dataset size: mean time,
    relative stddev (%), and ops/sec. Scaling is visible by reading down
@@ -66,12 +70,20 @@
   "Entrypoint. First arg selects a suite; default runs both."
   [& args]
   (let [which (or (first args) "all")]
-    (when-not (#{"stree" "sublist" "all"} which)
+    (when-not (#{"stree" "sublist" "hist" "datapotamus" "littles" "slow-sub" "all"} which)
       (binding [*out* *err*]
-        (println "usage: clojure -M:bench [stree|sublist]"))
+        (println "usage: clojure -M:bench [stree|sublist|hist|datapotamus|littles|slow-sub]"))
       (System/exit 1))
     (when (#{"stree" "all"} which)
       ((requiring-resolve 'toolkit.stree-bench/run)))
     (when (#{"sublist" "all"} which)
       ((requiring-resolve 'toolkit.sublist-bench/run)))
+    (when (#{"hist" "all"} which)
+      ((requiring-resolve 'toolkit.hist-bench/run)))
+    (when (#{"datapotamus" "all"} which)
+      ((requiring-resolve 'toolkit.datapotamus.harness/run)))
+    (when (= "littles" which)
+      ((requiring-resolve 'toolkit.datapotamus.harness/littles-law-sweep)))
+    (when (= "slow-sub" which)
+      ((requiring-resolve 'toolkit.datapotamus.harness/slow-subscriber-experiment)))
     (shutdown-agents)))
