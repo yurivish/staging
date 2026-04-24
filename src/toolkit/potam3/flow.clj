@@ -59,13 +59,13 @@
   (if (vector? ret) [(first ret) (second ret)] [s ret]))
 
 (defn- run-data-or-signal
-  "Data and signal share a code path. Both call the leaf-proc handler,
+  "Data and signal share a code path. Both call the handler-map,
    synthesize, validate, and collect events."
-  [leaf m s ctx trace-sid outs kind]
+  [hmap m s ctx trace-sid outs kind]
   (try
     (let [ret                  (case kind
-                                 :signal ((:on-signal leaf) ctx s)
-                                 :data   ((:on-data   leaf) ctx s (:data m)))
+                                 :signal ((:on-signal hmap) ctx s)
+                                 :data   ((:on-data   hmap) ctx s (:data m)))
           [s' drafts]          (normalize-return s ret)
           [port-map synth-evs] (msg/synthesize drafts m trace-sid)
           _                    (validate-ports! trace-sid port-map outs)
@@ -82,12 +82,12 @@
   "Done cascade: track closed-ins in framework state. When all inputs are
    closed, call :on-all-closed (drain hook), then forward (new-done) on
    every output port."
-  [leaf m ctx s trace-sid ins outs]
+  [hmap m ctx s trace-sid ins outs]
   (let [closed  (conj (::closed-ins s #{}) (:in-port ctx))
         all-ins (set (keys ins))]
     (if (= closed all-ins)
       (try
-        (let [ret                  ((:on-all-closed leaf) ctx s)
+        (let [ret                  ((:on-all-closed hmap) ctx s)
               [s' drafts]          (normalize-return s ret)
               [synth-pm synth-evs] (msg/synthesize drafts m trace-sid)
               port-map             (reduce (fn [pm p]
@@ -111,32 +111,54 @@
 (defn run-step
   "Pure dispatch. Returns [new-state port-map events].
    Never throws (user exceptions become :failure events)."
-  [leaf m in-port s trace-sid step-sp cancel-p]
-  (let [ins  (-> leaf :ports :ins)
-        outs (-> leaf :ports :outs)
+  [hmap m in-port s trace-sid step-sp cancel-p]
+  (let [ins  (-> hmap :ports :ins)
+        outs (-> hmap :ports :outs)
         ctx  (mk-ctx step-sp trace-sid cancel-p in-port m ins outs)]
     (case (msg/envelope-kind m)
-      :done   (run-done               leaf m ctx s trace-sid ins outs)
-      :signal (run-data-or-signal     leaf m s ctx trace-sid outs :signal)
-      :data   (run-data-or-signal     leaf m s ctx trace-sid outs :data))))
+      :done   (run-done               hmap m ctx s trace-sid ins outs)
+      :signal (run-data-or-signal     hmap m s ctx trace-sid outs :signal)
+      :data   (run-data-or-signal     hmap m s ctx trace-sid outs :data))))
 
 ;; ============================================================================
 ;; proc-fn — the core.async.flow 4-arity adapter
 ;; ============================================================================
 
+(defn- lifecycle-ctx
+  "Ctx for non-message hooks (:on-stop). No :msg or :in-port — those are
+   message-specific."
+  [step-sp trace-sid cancel-p ins outs]
+  {:pubsub  step-sp
+   :step-id trace-sid
+   :cancel  cancel-p
+   :ins     ins
+   :outs    outs})
+
 (defn- proc-fn
-  "Adapt a leaf-proc map to a 4-arity core.async.flow proc-fn. All publishing
-   happens here; the leaf-proc map is pure."
-  [leaf trace-sid step-sp cancel-p]
-  (let [ports (:ports leaf)
+  "Adapt a handler-map to a core.async.flow proc-fn (four arities).
+
+   Arity 0: describe ports.
+   Arity 1: init — calls (:on-init hmap) to build initial state.
+   Arity 2: transition — on ::flow/stop, calls (:on-stop hmap ctx state)
+            for resource cleanup; otherwise returns state unchanged.
+   Arity 3: process a message — delegates to run-step.
+
+   All pubsub publishing happens here; the handler-map is pure."
+  [hmap trace-sid step-sp cancel-p]
+  (let [ports (:ports hmap)
         ins   (:ins ports)
         outs  (:outs ports)]
     (fn
       ([]      {:params {} :ins ins :outs outs})
-      ([_]     {})
-      ([s _]   s)
+      ([_]     ((:on-init hmap)))
+      ([s transition]
+       (if (= transition :clojure.core.async.flow/stop)
+         (let [ctx (lifecycle-ctx step-sp trace-sid cancel-p ins outs)]
+           (try ((:on-stop hmap) ctx s) (catch Throwable _ nil))
+           s)
+         s))
       ([s in-port m]
-       (let [[s' port-map events] (run-step leaf m in-port s trace-sid step-sp cancel-p)]
+       (let [[s' port-map events] (run-step hmap m in-port s trace-sid step-sp cancel-p)]
          (doseq [e events] (trace/sp-pub step-sp e))
          [s' port-map])))))
 
@@ -184,7 +206,7 @@
       ref)))
 
 (defn- instrument-flow
-  "Recursively inline subflows and wrap arrows with proc-fn. Returns a
+  "Recursively inline subflows and wrap handler-maps with proc-fn. Returns a
    flat step map with concrete proc-fns under :procs."
   [stepmap outer-sp cancel-p]
   (let [{:keys [procs inner-conns aliases]}
@@ -198,7 +220,7 @@
                           (update :inner-conns into conns)
                           (assoc-in [:aliases sid] {:in in :out out})))
 
-                    (step/leaf-proc? p)
+                    (step/handler-map? p)
                     (let [step-sp (update outer-sp :prefix conj [:step sid])
                           wrapped (proc-fn p sid step-sp cancel-p)]
                       (assoc-in acc [:procs sid] wrapped))
@@ -365,13 +387,11 @@
     (swap! done-p (fn [p] (if (realized? p) (promise) p)))
     (swap! counters update :sent inc)
     (pubsub/pub pubsub (trace/run-subject-for scope :inject)
-                (cond-> {:kind :inject :msg-kind msg-kind
-                         :flow-path [fid] :scope scope
-                         :msg-id (:msg-id item)
-                         :in flow-in :port port
-                         :at (System/currentTimeMillis)}
-                  has-data?   (assoc :data-id (:data-id item))
-                  has-tokens? (assoc :tokens  (:tokens item))))
+                (assoc (trace/msg-envelope item)
+                       :kind :inject :msg-kind msg-kind
+                       :flow-path [fid] :scope scope
+                       :in flow-in :port port
+                       :at (System/currentTimeMillis)))
     @(flow/inject graph [flow-in port] [item])
     handle))
 

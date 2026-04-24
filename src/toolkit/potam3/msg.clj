@@ -207,14 +207,13 @@
         tokens-of   (fn [draft]
                       (reduce tok/merge-tokens {}
                               (for [leaf (leaf-sets (:msg-id draft))]
-                                (get-in leaf-slices [(:msg-id leaf) (:msg-id draft)]))))
-        msgs-per-port (reduce
-                        (fn [acc [port d]]
-                          (update acc port (fnil conj []) (materialize d (tokens-of d))))
-                        {} pairs)
-        events        (mapv (fn [[_ d]]
-                              (if (> (count (::parents d)) 1)
-                                (merge-event step-id d)
-                                (split-event step-id d)))
-                            pairs)]
-    [msgs-per-port events]))
+                                (get-in leaf-slices [(:msg-id leaf) (:msg-id draft)]))))]
+    (reduce
+     (fn [[pm evs] [port d]]
+       (let [t        (tokens-of d)
+             m        (materialize d t)
+             mk-event (if (> (count (::parents d)) 1) merge-event split-event)
+             ev       (assoc (mk-event step-id d) :tokens t)]
+         [(update pm port (fnil conj []) m) (conj evs ev)]))
+     [{} []]
+     pairs)))

@@ -19,22 +19,32 @@
    Drafts come from `toolkit.potam3.msg`. Plain values auto-wrap as
    `child` drafts of the input message during synthesis.
 
-   Under the hood, each leaf entry in `:procs` is a map with three
-   callable slots — `:on-data`, `:on-signal`, `:on-all-closed` — plus
-   `:ports`. `step/step` fills in sensible defaults for signal/done
-   handling; construct the map by hand only when you need custom
-   behavior there (Tier-3).
+   Under the hood, each terminal entry in `:procs` is a **handler-map** —
+   a plain map keyed by message-kind/lifecycle slot:
+
+     {:on-data       (fn [ctx state data] → return)
+      :on-signal     (fn [ctx state]      → return)   ; default: broadcast
+      :on-all-closed (fn [ctx state]      → return)   ; default: emit nothing
+      :on-init       (fn []               → initial-state)   ; default: {}
+      :on-stop       (fn [ctx state]      → any)             ; default: nil
+      :ports         {:ins {...} :outs {...}}}
+
+   `step/step` fills in defaults for everything except `:on-data` and
+   builds a 1-proc step around it. Construct a handler-map by hand only
+   when you need custom signal / all-closed behavior, or want
+   resource-lifecycle hooks (`:on-init` / `:on-stop`) for long-running
+   pipelines — see `handler-map`.
 
    Nothing in this namespace touches pubsub or core.async."
   (:require [toolkit.potam3.msg :as msg]))
 
 ;; ============================================================================
-;; Default signal / all-closed handlers
+;; Handler-map defaults
 ;; ============================================================================
 ;;
-;; The interpreter uses these when a leaf proc map doesn't supply its own.
-;; They read the current port spec from ctx (:ins / :outs), which the
-;; interpreter injects before every call.
+;; The interpreter uses these when a handler-map doesn't supply its own.
+;; Signal / all-closed defaults read the current port spec from ctx, which
+;; the interpreter injects before every call.
 
 (defn- default-on-signal
   "Broadcast one signal-draft to each output port."
@@ -46,26 +56,40 @@
   [_ctx _state]
   {})
 
+(defn- default-on-init
+  "Fresh state — empty map."
+  []
+  {})
+
+(defn- default-on-stop
+  "No resources to release."
+  [_ctx _state]
+  nil)
+
 (defn- ensure-defaults [m]
   (cond-> m
     (nil? (:on-signal m))     (assoc :on-signal default-on-signal)
-    (nil? (:on-all-closed m)) (assoc :on-all-closed default-on-all-closed)))
+    (nil? (:on-all-closed m)) (assoc :on-all-closed default-on-all-closed)
+    (nil? (:on-init m))       (assoc :on-init default-on-init)
+    (nil? (:on-stop m))       (assoc :on-stop default-on-stop)))
 
 ;; ============================================================================
 ;; Predicates
 ;; ============================================================================
 
-(defn leaf-proc? [v] (and (map? v) (contains? v :on-data) (contains? v :ports)))
-(defn step?      [v] (and (map? v) (contains? v :procs)   (contains? v :conns)))
+(defn handler-map? [v] (and (map? v) (contains? v :on-data) (contains? v :ports)))
+(defn step?        [v] (and (map? v) (contains? v :procs)   (contains? v :conns)))
 
 ;; ============================================================================
-;; Leaf-proc + step constructors
+;; Handler-map + step constructors
 ;; ============================================================================
 
-(defn leaf-proc
-  "Build a leaf proc map from a partial spec, filling in defaults.
-   Tier-3 escape hatch: use this when you need a custom :on-signal or
-   :on-all-closed. For ordinary handlers, prefer `step`."
+(defn handler-map
+  "Build a handler-map from a partial spec, filling in defaults.
+
+   Tier-3 escape hatch: use this when you need a custom :on-signal,
+   :on-all-closed, :on-init, or :on-stop. For ordinary handlers prefer
+   `step`, which wraps a handler-map in a 1-proc step for you."
   [m]
   (ensure-defaults
    (cond-> m
@@ -89,20 +113,20 @@
   ([id f]
    (step id nil (fn [_ctx _s d] {:out [(f d)]})))
   ([id ports handler]
-   (mk-step id (leaf-proc (cond-> {:on-data handler}
-                            ports (assoc :ports ports))))))
+   (mk-step id (handler-map (cond-> {:on-data handler}
+                              ports (assoc :ports ports))))))
 
 (defn sink
   "Terminal step — consumes input, emits nothing."
   ([] (sink :sink))
   ([id]
-   (mk-step id (leaf-proc {:on-data (fn [_ctx _s _d] {})
-                           :ports   {:ins {:in ""} :outs {}}}))))
+   (mk-step id (handler-map {:on-data (fn [_ctx _s _d] {})
+                             :ports   {:ins {:in ""} :outs {}}}))))
 
 (defn passthrough
   "Forward data unchanged, preserving :data-id through lineage."
   [id]
-  (mk-step id (leaf-proc {:on-data (fn [ctx _s _d] {:out [(msg/pass ctx)]})})))
+  (mk-step id (handler-map {:on-data (fn [ctx _s _d] {:out [(msg/pass ctx)]})})))
 
 (defn as-step
   "Wrap any step into a single-entry step under `id`. Use to give a subflow

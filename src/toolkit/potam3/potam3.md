@@ -102,11 +102,11 @@ Built on `clojure.core.async.flow`. The library owns the step→graph translatio
 
 **Instrumentation (`datapotamus.clj:825-898`)** recursively inlines subflows by prefixing proc ids with their parent sid (`a.b.c`), resolves endpoint refs through an alias table, and wraps each factory with pubsub scope plus `wrap-proc`.
 
-**Lifecycle (`datapotamus.clj:900-1141`)**: `start!` → `flow/create-flow` + `flow/start`, attach error monitor + quiescence subscriber. `inject!` validates the step/port exists, seeds a message, publishes `:seed`. `await-quiescent!` blocks on a promise delivered when counters balance. `stop!` cancels, stops, reads final events. `run!` / `run-seq` are conveniences.
+**Lifecycle (`datapotamus.clj:900-1141`)**: `start!` → `flow/create-flow` + `flow/start`, attach error monitor + quiescence subscriber. `inject!` validates the step/port exists, routes an item, publishes `:inject`. `await-quiescent!` blocks on a promise delivered when counters balance. `stop!` cancels, stops, reads final events. `run!` / `run-seq` are conveniences for the one-shot / finite-collection special cases.
 
 ### Thread D — Observability *(cross-cutting)*
 
-- **Trace events** keyed on two orthogonal axes: `:kind` (lifecycle role: `:recv :success :failure :send-out :split :merge :seed :flow-error :run-started`) × `:msg-kind` (`:data :signal :done`). Subjects use `:kind` only.
+- **Trace events** keyed on two orthogonal axes: `:kind` (lifecycle role: `:recv :success :failure :send-out :split :merge :inject :flow-error :run-started`) × `:msg-kind` (`:data :signal :done`). Subjects use `:kind` only.
 - **Scoped pubsub** (`datapotamus.clj:405-417`): a `ScopedPubsub` wraps a raw pubsub and prepends a scope prefix (`[:flow fid] [:step sid] ...`) to every subject. Subflows extend the scope; parent subscribers see inner events via glob match.
 - **Counters** (`datapotamus.clj:368-381`): track `:recv`, `:sent`, `:completed`. Quiescence = all three nonzero and equal.
 

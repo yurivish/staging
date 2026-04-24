@@ -68,7 +68,7 @@
    the event stream. Backpressure arrives via channel buffers — a slow
    worker blocks the router only on its own port.
 
-   `inner` may be an arrow or a step (any shape; internal sids are
+   `inner` may be a handler-map or a step (any shape; internal sids are
    prefixed per-worker so state is isolated)."
   ([k inner]     (workers (gensym "workers-") k inner))
   ([id k inner]
@@ -82,11 +82,11 @@
                      (let [i (mod (long (:i s 0)) k)]
                        [(assoc s :i (unchecked-inc (long i)))
                         {(ws i) [(draft-fn ctx)]}]))
-         router    (step/leaf-proc
+         router    (step/handler-map
                     {:ports     {:ins {:in ""} :outs (zipmap ws (repeat ""))}
                      :on-data   (fn [ctx s _d] (route ctx s msg/pass))
                      :on-signal (fn [ctx s]    (route ctx s msg/signal))})
-         join      (step/leaf-proc
+         join      (step/handler-map
                     {:ports   {:ins (zipmap join-ins (repeat "")) :outs {:out ""}}
                      :on-data (fn [ctx _s _d] {:out [(msg/pass ctx)]})})
          procs     (clojure.core/merge

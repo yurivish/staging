@@ -2,9 +2,13 @@
   "Trace events + scoped pubsub + counters.
 
    Events are plain maps keyed on two axes: :kind (lifecycle role —
-   :recv :success :failure :send-out :split :merge :inject :flow-error
+   :recv :success :failure :send-out :split :merge :seed :flow-error
    :run-started) × :msg-kind (envelope type — :data :signal :done).
    Subjects use :kind only. Consumers filter on :msg-kind in the handler.
+
+   Every event that references a message carries that message's complete
+   envelope (via `msg-envelope`), plus kind-specific extras (e.g. :in-port
+   on a :done recv, :port on a :send-out, :error on a :failure).
 
    A scoped pubsub is a plain map `{:raw raw-ps :prefix [[:flow fid] ...]}`.
    `sp-pub` prepends the scope to the subject and stamps `:scope`,
@@ -16,6 +20,20 @@
 (defn- now [] (System/currentTimeMillis))
 
 ;; ============================================================================
+;; Envelope extraction — one place
+;; ============================================================================
+
+(defn msg-envelope
+  "On-wire envelope fields of `m` as a flat map. Absent keys are skipped so
+   envelope shapes stay distinct (done has no tokens; signal has no data)."
+  [m]
+  (cond-> {:msg-id (:msg-id m)}
+    (contains? m :data-id)        (assoc :data-id (:data-id m))
+    (contains? m :data)           (assoc :data (:data m))
+    (contains? m :tokens)         (assoc :tokens (:tokens m))
+    (contains? m :parent-msg-ids) (assoc :parent-msg-ids (vec (:parent-msg-ids m)))))
+
+;; ============================================================================
 ;; Event constructors — pure
 ;; ============================================================================
 
@@ -23,41 +41,22 @@
   "Built for any msg-kind. For :done, pass `in-port`."
   ([step-id msg-kind m] (recv-event step-id msg-kind m nil))
   ([step-id msg-kind m in-port]
-   (cond-> {:kind :recv :msg-kind msg-kind :step-id step-id
-            :msg-id (:msg-id m)}
-     (= :data   msg-kind) (assoc :data-id (:data-id m) :data (:data m) :tokens (:tokens m))
-     (= :signal msg-kind) (assoc :data-id (:data-id m) :tokens (:tokens m))
-     (= :done   msg-kind) (assoc :in-port in-port))))
+   (cond-> (assoc (msg-envelope m)
+                  :kind :recv :msg-kind msg-kind :step-id step-id)
+     (= :done msg-kind) (assoc :in-port in-port))))
 
 (defn success-event [step-id msg-kind m]
-  {:kind :success :msg-kind msg-kind :step-id step-id :msg-id (:msg-id m)})
+  (assoc (msg-envelope m)
+         :kind :success :msg-kind msg-kind :step-id step-id))
 
 (defn failure-event [step-id m ^Throwable ex]
-  {:kind :failure :msg-kind :data :step-id step-id :msg-id (:msg-id m)
-   :error {:message (ex-message ex) :data (ex-data ex)}})
+  (assoc (msg-envelope m)
+         :kind :failure :msg-kind :data :step-id step-id
+         :error {:message (ex-message ex) :data (ex-data ex)}))
 
 (defn send-out-event [step-id msg-kind port child]
-  (cond-> {:kind :send-out :msg-kind msg-kind :port port :step-id step-id
-           :msg-id (:msg-id child)}
-    (not= :done msg-kind)
-    (assoc :data-id (:data-id child)
-           :parent-msg-ids (vec (:parent-msg-ids child))
-           :tokens (:tokens child))
-
-    (= :data msg-kind)
-    (assoc :data (:data child))))
-
-(defn inject-event [step-id port msg-kind m]
-  (cond-> {:kind :inject :msg-kind msg-kind :step-id step-id :port port
-           :msg-id (:msg-id m)}
-    (= :data msg-kind)   (assoc :data (:data m) :tokens (:tokens m))
-    (= :signal msg-kind) (assoc :tokens (:tokens m))))
-
-(defn flow-error-event [err]
-  {:kind :flow-error :error {:message (ex-message err) :data (ex-data err)}})
-
-(defn run-started-event []
-  {:kind :run-started})
+  (assoc (msg-envelope child)
+         :kind :send-out :msg-kind msg-kind :port port :step-id step-id))
 
 ;; ============================================================================
 ;; Counters

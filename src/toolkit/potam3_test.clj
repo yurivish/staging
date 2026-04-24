@@ -1173,6 +1173,45 @@
     (is (true? (realized? cancel)) "cancel promise delivered on stop!")
     (is (= :stopped @cancel))))
 
+;; Tier-3: a handler-map can supply :on-init to seed non-trivial initial
+;; state — the first :on-data call sees whatever :on-init returned.
+(deftest on-init-seeds-initial-state
+  (let [seen-state (atom nil)
+        hmap (step/handler-map
+              {:on-init (fn [] {:counter 42})
+               :on-data (fn [_ctx s _d]
+                          (reset! seen-state s)
+                          [(update s :counter inc) {:out [:ok]}])})
+        wf   {:procs {:probe hmap} :conns [] :in :probe :out :probe}
+        wf   (step/serial (step/as-step :probe wf) (step/sink))]
+    (flow/run! wf {:data :x})
+    (is (= {:counter 42} @seen-state))))
+
+;; Tier-3: a handler-map can supply :on-stop for resource cleanup.
+;; It fires exactly once per proc on `flow/stop!`. The command is delivered
+;; asynchronously via core.async.flow's control channel, so the test awaits
+;; a latch promise the hook itself delivers.
+(deftest on-stop-fires-once-on-shutdown
+  (let [stopped (atom 0)
+        fired   (promise)
+        hmap (step/handler-map
+              {:on-data (fn [_ctx s _d] [s {:out [:ok]}])
+               :on-stop (fn [_ctx _s]
+                          (swap! stopped inc)
+                          (deliver fired true))})
+        wf   (step/serial
+              (step/as-step :probe
+                            {:procs {:probe hmap} :conns []
+                             :in :probe :out :probe})
+              (step/sink))
+        h    (flow/start! wf)]
+    (flow/inject! h {:data :x})
+    (flow/await-quiescent! h)
+    (is (zero? @stopped) ":on-stop has not fired during the run")
+    (flow/stop! h)
+    (is (= true (deref fired 2000 :timeout)) ":on-stop delivered before timeout")
+    (is (= 1 @stopped) ":on-stop fired exactly once at shutdown")))
+
 ;; ============================================================================
 ;; Act XIII — Running a collection: run-seq
 ;;
@@ -1211,7 +1250,7 @@
     (testing "odd inputs produce output; even inputs produce empty slots"
       (is (= [[1] [] [3] []] (:outputs result))))))
 
-;; One input can produce many outputs — each attributed to its seed.
+;; One input can produce many outputs — each attributed to its originating input.
 (deftest run-seq-fan-out-produces-multiple-outputs-per-input
   (let [result (flow/run-seq (step/serial (step/step :dbl #(* 2 %))
                                           (c/fan-out :three 3))
@@ -1230,10 +1269,10 @@
     (is (= [[10 11 12] [20 21 22]]
            (mapv #(vec (sort %)) (:outputs result))))))
 
-;; A single output descended from multiple seeds appears under every
+;; A single output descended from multiple inputs appears under every
 ;; matching index in :outputs. Here a pair-merger collects two inputs and
-;; emits one merged message whose lineage reaches both seeds.
-(deftest run-seq-cross-input-merge-appears-under-every-seed
+;; emits one merged message whose lineage reaches both.
+(deftest run-seq-cross-input-merge-appears-under-every-input
   (let [pairer (step/step :pairer {:ins {:in ""} :outs {:out ""}}
                           (fn [ctx s _d]
                             (if-let [pending (:pending s)]
@@ -1244,7 +1283,7 @@
                               [(assoc s :pending (:msg ctx)) {}])))
         result (flow/run-seq pairer [:a :b])]
     (is (= :completed (:state result)))
-    (testing "the one merged output is attributed to BOTH seeds"
+    (testing "the one merged output is attributed to BOTH originating inputs"
       (is (= [[[:a :b]] [[:a :b]]] (:outputs result))))))
 
 ;; A failure on one input doesn't drop the others — the failed index gets an
@@ -1272,7 +1311,7 @@
 ;;     [<kind> "flow" <flow-id> ("flow" <sub-id>)* ("step" <sid>)?]
 ;;
 ;; where <kind> is one of :recv / :success / :send-out / :failure / :split /
-;; :merge / :seed / :run-started. Nesting via `as-step` inserts one extra
+;; :merge / :inject / :run-started. Nesting via `as-step` inserts one extra
 ;; `"flow" <sub-id>` segment per level. Subscribers use glob patterns like
 ;; `["recv" "flow" :* :>]` (all recvs across all flows) or
 ;; `["recv" "flow" "outer" "flow" "sub" "step" "inc"]` (a specific nested step).
@@ -1480,9 +1519,10 @@
       (is (= :completed (:state result)))
       (is (= 1 (count dones))))))
 
-;; `inner` may be a composite step, not just an arrow — internal sids get
-;; prefixed per-worker so state is isolated even when inner has multiple procs.
-(deftest workers-accepts-step-not-just-arrow
+;; `inner` may be a composite step, not just a single handler-map — internal
+;; sids get prefixed per-worker so state is isolated even when inner has
+;; multiple procs.
+(deftest workers-accepts-composite-step
   (let [inner (step/serial (step/step :a inc) (step/step :b #(* 2 %)))
         wf    (step/serial (c/workers :pool 2 inner))
         res   (flow/run-seq wf [1 2 3 4])]
