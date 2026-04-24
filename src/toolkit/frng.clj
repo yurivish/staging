@@ -119,7 +119,7 @@
    keywords are fine). Total weight must be positive."
   [frng weights]
   (let [entries (sort-by key (seq weights))
-        total   (reduce + 0 (map val entries))]
+        total   (reduce + (map val entries))]
     (assert (pos? total) "weights must sum to a positive number")
     (loop [pick (long (int-inclusive frng (dec total)))
            es   entries]

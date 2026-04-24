@@ -38,7 +38,7 @@
    :outs    outs})
 
 (defn- validate-ports! [trace-sid port-map outs]
-  (let [unknown (seq (filter #(not (contains? outs %)) (keys port-map)))]
+  (let [unknown (seq (remove #(contains? outs %) (keys port-map)))]
     (when unknown
       (throw (ex-info (str "step " trace-sid
                            " emitted on undeclared port(s): " (vec unknown)

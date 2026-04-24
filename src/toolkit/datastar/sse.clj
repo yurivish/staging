@@ -151,7 +151,7 @@
   Ignores client-specified quality factors, which is useful when the server has strong preferences."
   [accept-encoding-str ranked-prefs]
   (let [encodings (parse-accept-encoding (or accept-encoding-str default-content-encoding))
-        first-match (some (into #{} encodings) ranked-prefs)]
+        first-match (some (set encodings) ranked-prefs)]
     (or first-match default-content-encoding)))
 
 ;; Shared header and encoding negotiation for streaming (`stream`) and

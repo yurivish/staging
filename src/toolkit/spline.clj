@@ -55,7 +55,7 @@
         tol (double tol)
         dx  (- (* 2.0 p1x) p0x p2x)
         dy  (- (* 2.0 p1y) p0y p2y)
-        dd  (Math/sqrt (+ (* dx dx) (* dy dy)))
+        dd  (Math/hypot dx dy)
         n   (Math/ceil (Math/sqrt (/ dd (* 4.0 tol))))]
     (long (max 1 (min 100 n)))))
 
@@ -106,7 +106,7 @@
   ^double [[ax ay] [bx by]]
   (let [dx (- (double ax) (double bx))
         dy (- (double ay) (double by))]
-    (Math/sqrt (+ (* dx dx) (* dy dy)))))
+    (Math/hypot dx dy)))
 
 (defn- window->pair
   "Two quadratic Bézier triples interpolating the middle two points of a

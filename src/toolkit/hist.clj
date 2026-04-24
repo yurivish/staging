@@ -188,7 +188,7 @@
         a  (long (:a snap))
         b  (long (:b snap))]
     (when (pos? n)
-      (let [first-idx (first (first bs))
+      (let [first-idx (ffirst bs)
             last-idx  (first (last bs))
             min-v     (h2/decode-lower a b first-idx)
             max-v     (dec (+ (h2/decode-lower a b last-idx)

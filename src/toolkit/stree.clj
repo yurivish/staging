@@ -283,7 +283,7 @@
   "Removes the entry at `subject` and returns `[deleted-value deleted?]`.
    Rejects nil or empty subject (matches Go stree.go:233)."
   [st ^String subject]
-  (if (or (nil? subject) (zero? (.length subject)))
+  (if (empty? subject)
     [nil false]
     (let [result (volatile! nil)]
       (swap! st
@@ -431,7 +431,7 @@
 (defn- has-fwc? [parts]
   (let [n (count parts)]
     (and (pos? n)
-         (let [^String last-p (nth parts (dec n))]
+         (let [^String last-p (peek parts)]
            (and (pos? (.length last-p)) (= fwc (.charAt last-p 0)))))))
 
 (defn- do-match
@@ -445,7 +445,7 @@
         (when matched?
           (cond
             (leaf? n)
-            (when (or (zero? (count nparts))
+            (when (or (empty? nparts)
                       (and hasfwc? (= 1 (count nparts))))
               (cb (str pre (:suffix n)) (:value n)))
 
@@ -455,12 +455,12 @@
                 ;; All parts consumed, no trailing fwc — check for
                 ;; terminal-pwc case and for children whose suffix
                 ;; completes an exact match (stree.go:326-354).
-                (and (zero? (count nparts)) (not hasfwc?))
+                (and (empty? nparts) (not hasfwc?))
                 (let [term-pwc? (and (pos? (count parts))
-                                     (let [^String lp (nth parts (dec (count parts)))]
+                                     (let [^String lp (peek parts)]
                                        (and (= 1 (.length lp)) (= pwc (.charAt lp 0)))))
                       nparts'   (if term-pwc?
-                                  [(nth parts (dec (count parts)))]
+                                  [(peek parts)]
                                   nparts)]
                   (doseq [[_ cn] (:children n)]
                     (when (some? cn)
@@ -468,7 +468,7 @@
                         (leaf? cn)
                         (let [^String s (:suffix cn)]
                           (cond
-                            (zero? (.length s))
+                            (empty? s)
                             (cb (str pre' s) (:value cn))
 
                             (and term-pwc? (neg? (.indexOf s tsep-int)))
@@ -478,8 +478,8 @@
                         (do-match cn nparts' pre' hasfwc? cb)))))
 
                 ;; Trailing fwc consumed — restore it and continue.
-                (and hasfwc? (zero? (count nparts)))
-                (let [nparts' [(nth parts (dec (count parts)))]
+                (and hasfwc? (empty? nparts))
+                (let [nparts' [(peek parts)]
                       fp      ^String (nth nparts' 0)]
                   (if (and (= 1 (.length fp))
                            (or (= pwc (.charAt fp 0)) (= fwc (.charAt fp 0))))

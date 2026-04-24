@@ -256,7 +256,7 @@
 (defn- aggregate-queue [node queues]
   (if (= :leaf (:kind node))
     (long (or (get queues (:path node)) 0))
-    (reduce + 0 (map #(aggregate-queue % queues) (:children node)))))
+    (reduce + (map #(aggregate-queue % queues) (:children node)))))
 
 (defn- card [fid node by-path queues]
   (let [{:keys [recv success failure]} (aggregate node by-path)

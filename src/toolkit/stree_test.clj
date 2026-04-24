@@ -528,6 +528,8 @@
     (st/insert! t "foo" 1)
     ;; delete with empty subject
     (is (= [nil false] (st/delete! t "")))
+    ;; delete with nil subject
+    (is (= [nil false] (st/delete! t nil)))
     (is (= [1 true] (st/lookup t "foo")))
     ;; delete with subject shorter than prefix
     (let [t2 (st/make)]

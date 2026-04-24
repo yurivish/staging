@@ -85,11 +85,9 @@
 (defn- add-to-bucket [bucket q v]
   (if q
     (update-in bucket [:qsubs q]
-               (fn [grp]
-                 (let [grp (or grp [])]
-                   (if (some #(= v %) grp)
-                     grp
-                     (conj grp v)))))
+               (fnil (fn [grp]
+                       (if (some #(= v %) grp) grp (conj grp v)))
+                     []))
     (update bucket :psubs conj v)))
 
 (defn- ins [node [t & rst] v q]
@@ -211,13 +209,13 @@
 
 (defn- count-node [node]
   (+ (count (:psubs node))
-     (reduce + 0 (map count (vals (:qsubs node))))))
+     (reduce + (map count (vals (:qsubs node))))))
 
 (defn- count-tree [node]
   (if (nil? node)
     0
     (+ (count-node node)
-       (reduce + 0 (map count-tree (vals (:children node))))
+       (reduce + (map count-tree (vals (:children node))))
        (if-let [pwc (:pwc node)] (count-tree pwc) 0)
        (if-let [fwc (:fwc node)] (count-node fwc) 0))))
 
@@ -483,7 +481,7 @@
   (or (seq (:children n)) (some? (:pwc n)) (some? (:fwc n))))
 
 (defn- walk-intersect [st node subj wc? cb]
-  (let [prefix (if (zero? (count subj)) subj (str subj "."))]
+  (let [prefix (if (empty? subj) subj (str subj "."))]
     (if (:fwc node)
       (stree/match st (str prefix ">") cb)
       (do

@@ -1,5 +1,7 @@
 # Improvements — menu
 
+> **Status: applied.** All 9 items below have been landed on the working tree. Baseline tests (317) and the 12 new tests added for this pass all continue to pass (329 tests, 919,165 assertions, 0 failures). See the "Tests added" section at the bottom.
+
 A pruned list of **mechanical substitutions** across the Clojure codebase — pure idiom swaps where the new form is shorter, uses a named stdlib operation, and behaves identically (or identically under a condition you can verify in seconds). Each item below is written as a **standalone prompt** that you can paste into a new LLM session with no further context.
 
 Filtered against:
@@ -312,3 +314,18 @@ The earlier version of this directory contained per-package lists with ~100 item
 - **Type-hint additions** — would need `*warn-on-reflection* true` runs to verify.
 
 If any of those feel worth revisiting, they’re still findable by re-reading the relevant source files; the list above is the distilled intersection of "clearly a win" and "no context needed".
+
+---
+
+## Tests added
+
+Before applying the 9 changes, three test gaps were filled so the menu had a way to fail loudly on regression:
+
+- **`toolkit/frng_test.clj`** (new file, 8 deftests): `int-inclusive` bounds, `range-inclusive` bounds, `weighted` with single key / zero weights / zero total / rough distribution, and `swarm-weights` bounds. This covers the `(reduce + …)` substitution in `frng.clj:122` (`weighted`), which previously had no tests.
+- **`toolkit/datastar/sse_test.clj`** (new file, 4 deftests): `parse-accept-encoding` basics, `preferred-content-encoding` pref-ordering, no-overlap fallback, nil-accept fallback. This covers the `(set …)` substitution in `sse.clj:154`, which previously had no tests.
+- **`toolkit/stree_test.clj`** (1-line addition in `delete-edge-cases`): `(delete! t nil)` must return `[nil false]`. The existing test covered `""` but not `nil`; after the `empty?` substitution folds both branches, this guards against accidentally letting a `(.length nil)` NPE slip in.
+
+`toolkit/datapotamus/viz.clj:259` has no test file, but the change there — dropping a `0` seed from a `reduce +` — is identical semantics on every input. No test was added; the risk is zero.
+
+Baseline tests (pre-change, pre-new-tests): **317 tests, 918,594 assertions, 0 failures.**
+After adding the 12 new tests and applying all 9 changes: **329 tests, 919,165 assertions, 0 failures.**

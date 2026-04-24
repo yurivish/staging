@@ -117,7 +117,7 @@
           min      (long min)
           max      (long max)
           diff     (bit-xor min max)
-          diff-msb (bit-shift-left 1 (unchecked-subtract 63 (Long/numberOfLeadingZeros diff)))
+          diff-msb (Long/highestOneBit diff)
           split-x? (not (zero? (bit-and diff-msb x-mask-2d)))
           split-mask (if split-x? x-mask-2d y-mask-2d)
           major-mask (bit-and (unchecked-dec diff-msb) split-mask)
