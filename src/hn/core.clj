@@ -45,7 +45,12 @@
 (def fetch-workers 16)
 (def llm-workers 4)
 
-(defonce claude (delay (anthropic/client (str/trim (slurp "claude.key")))))
+(defonce ^:private summarizer
+  (delay (-> (AnthropicChatModel/builder)
+             (.apiKey (str/trim (slurp "claude.key")))
+             (.modelName haiku)
+             (.maxTokens (int 256))
+             .build)))
 
 (defn- get-json [url]
   (-> @(http/get url) :body (json/read-str :key-fn keyword)))
@@ -87,15 +92,12 @@
 (def summarize
   (step/step :summarize
              (fn [row]
-               (assoc row :summary
-                      (:text (llm/query
-                              @claude
-                              {:model      haiku
-                               :max-tokens 256
-                               :system     "Summarize HN comments in one sentence. No preface."
-                               :messages   [{:role :user
-                                             :content [{:type :text
-                                                        :text (:comment row)}]}]}))))))
+               (let [req (-> (ChatRequest/builder)
+                             (.messages [(SystemMessage/from "Summarize HN comments in one sentence. No preface.")
+                                         (UserMessage/from (:comment row))])
+                             .build)]
+                 (assoc row :summary
+                        (-> (.chat @summarizer req) .aiMessage .text))))))
 
 (defn- fake-summary []
   (apply str (repeatedly (+ 20 (rand-int 40))

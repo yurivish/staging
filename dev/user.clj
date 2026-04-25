@@ -13,8 +13,6 @@
             [toolkit.datastar.core]
             [toolkit.datastar.sse]
             [toolkit.h2]
-            [toolkit.llm]
-            [toolkit.llm.anthropic]
             [toolkit.lmdb]
             [toolkit.pubsub]
             [toolkit.singleflight]
