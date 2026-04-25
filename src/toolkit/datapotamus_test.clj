@@ -30,6 +30,7 @@
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.token :as tok]
+            [toolkit.datapotamus.trace :as trace]
             [toolkit.pubsub :as pubsub]))
 
 ;; --- helpers ----------------------------------------------------------------
@@ -1550,6 +1551,38 @@
     (is (= ["outer" "sub"] (:scope-path (first @inner-recvs))))
     (is (= 5 (:data (first @outer-recvs))))
     (is (= 6 (:data (first @inner-recvs))))))
+
+;; Handlers can broadcast their own point events via `trace/emit`. The
+;; envelope matches harness-emitted events (auto-stamped :scope, :scope-path,
+;; :at) so generic wildcard subscribers pick them up; the dedicated subject
+;; `["status" "scope" :>]` lets a status-only subscriber filter cheaply.
+(deftest emit-publishes-status-event
+  (let [ps        (pubsub/make)
+        all-evs   (atom [])
+        status-evs (atom [])
+        u-all     (pubsub/sub ps [:>]
+                              (fn [_ ev _] (swap! all-evs conj ev)))
+        u-status  (pubsub/sub ps ["status" :>]
+                              (fn [_ ev _] (swap! status-evs conj ev)))
+        wf (step/serial
+            (step/step :probe nil
+                       (fn [ctx _s d]
+                         (trace/emit ctx {:hello :world :seen d})
+                         {:out [d]}))
+            (step/sink))
+        result (run! wf {:pubsub ps :flow-id "F" :data :x})]
+    (u-all) (u-status)
+    (is (= :completed (:state result)))
+    (let [s (filterv #(= :status (:kind %)) @all-evs)]
+      (is (= 1 (count s)) "exactly one status event reached the wildcard")
+      (is (= 1 (count @status-evs)) "and exactly one reached the status-only subscriber")
+      (is (= (first s) (first @status-evs)) "subjects route the same event to both"))
+    (let [ev (first @status-evs)]
+      (is (= :status (:kind ev)))
+      (is (= :probe  (:step-id ev)))
+      (is (= ["F"]   (:scope-path ev)))
+      (is (= {:hello :world :seen :x} (:data ev)))
+      (is (number?   (:at ev))))))
 
 ;; ============================================================================
 ;; Act XV — A worked example

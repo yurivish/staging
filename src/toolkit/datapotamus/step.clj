@@ -118,7 +118,16 @@
    splits will conflict and conservation will silently break. If you
    need deferred derivation, stash the parent ref, return `msg/drain`,
    and emit a single `msg/merge` that lists all the eventual parents
-   in one later invocation (the pair-merger pattern)."
+   in one later invocation (the pair-merger pattern).
+
+   Status events. A handler may call `(trace/emit ctx payload)` to
+   broadcast a side-band point event onto the scoped pubsub. This is
+   purely effectful — it does not affect tokens or the handler's return
+   shape — and rides the same envelope as harness-emitted events
+   (`:kind :status` plus the auto-stamped scope/at/scope-path), so
+   generic subscribers render it without code changes. Useful for
+   long-running handlers (subprocess wrappers, LLM calls) to surface
+   what they're doing mid-flight."
   ([id f]
    (step id nil (fn [_ctx _s d] {:out [(f d)]})))
   ([id ports handler]

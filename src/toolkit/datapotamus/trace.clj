@@ -58,6 +58,12 @@
 (defn send-out-event [step-id port child]
   (assoc (msg-envelope child) :kind :send-out :port port :step-id step-id))
 
+(defn status-event
+  "Handler-emitted point event. `data` is opaque to the framework; convention
+   is that consumers render it generically (e.g. `(pr-str data)` in a log)."
+  [step-id data]
+  {:kind :status :step-id step-id :data data})
+
 ;; ============================================================================
 ;; Scope helpers
 ;; ============================================================================
@@ -103,3 +109,14 @@
   (pubsub/pub raw
               (into [(name (:kind ev))] subject-prefix)
               (assoc ev :scope prefix :scope-path scope-path :at (now))))
+
+(defn emit
+  "Publish a :status event from inside a handler. `ctx` is the handler ctx
+   (carries :pubsub step-sp and :step-id); `data` is opaque payload, free-form
+   for now — only the envelope (kind/step-id/scope/scope-path/at) is fixed.
+
+   Routed on subject [\"status\" \"scope\" fid \"step\" sid ...], so wildcard
+   subscribers (`[:>]`) pick it up automatically and topic subscribers can
+   filter on `[\"status\" :>]` for a status-only stream."
+  [{:keys [pubsub step-id]} data]
+  (sp-pub pubsub (status-event step-id data)))
