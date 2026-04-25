@@ -117,6 +117,46 @@
     (is (nil? (ps/pub pubsub ["bar"] :m))
         "sub exists but doesn't match → still safe")))
 
+(deftest watch-reduces-events
+  (let [pubsub (ps/make)
+        !state (atom [])
+        unsub  (ps/watch pubsub ["foo" :>] !state
+                         (fn [s subj msg] (conj s [subj msg])))]
+    (ps/pub pubsub ["foo" "a"]     :m1)
+    (ps/pub pubsub ["foo" "b" "c"] :m2)
+    (ps/pub pubsub ["bar"]         :m3)
+    (is (= [[["foo" "a"] :m1] [["foo" "b" "c"] :m2]] @!state))
+    (unsub)
+    (ps/pub pubsub ["foo" "a"] :m4)
+    (is (= 2 (count @!state)) "unsub stops further delivery")
+    (unsub)
+    (is (= 2 (count @!state)) "unsub is idempotent")))
+
+(deftest watch-tap-fires-per-event
+  (let [pubsub (ps/make)
+        !state (atom 0)
+        taps   (atom [])]
+    (ps/watch pubsub ["x"] !state
+              (fn [s _ _] (inc s))
+              {:tap (fn [subj msg] (swap! taps conj [subj msg]))})
+    (ps/pub pubsub ["x"] :a)
+    (ps/pub pubsub ["x"] :b)
+    (is (= 2 @!state))
+    (is (= [[["x"] :a] [["x"] :b]] @taps) "tap fires once per event with subj+msg")))
+
+(deftest watch-tap-fires-on-noop-events
+  (let [pubsub (ps/make)
+        !state (atom {:count 0})
+        taps   (atom 0)]
+    ;; rf returns identical state — no "actual" change, but tap still fires
+    (ps/watch pubsub ["x"] !state
+              (fn [s _ _] s)
+              {:tap (fn [_ _] (swap! taps inc))})
+    (ps/pub pubsub ["x"] :a)
+    (ps/pub pubsub ["x"] :b)
+    (is (= {:count 0} @!state))
+    (is (= 2 @taps) "tap fires per event even when state doesn't change")))
+
 (deftest sub-chan-basic
   (let [pubsub     (ps/make)
         [ch stop!] (ps/sub-chan pubsub ["foo" :*] 10)]

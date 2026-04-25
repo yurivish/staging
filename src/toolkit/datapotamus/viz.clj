@@ -222,11 +222,9 @@
   "Subscribe to every event on `pubsub`; reduce into `store` and arm the
    ticker on each event. Returns a zero-arg unsubscribe fn."
   [pubsub store ticker]
-  (pubsub/sub pubsub
-              [:>]
-              (fn [_subj ev _match]
-                (swap! store apply-event ev)
-                ((:tick! ticker)))))
+  (pubsub/watch pubsub [:>] store
+                (fn [s _subj ev] (apply-event s ev))
+                {:tap (fn [_ _] ((:tick! ticker)))}))
 
 ;; ============================================================================
 ;; Rendering

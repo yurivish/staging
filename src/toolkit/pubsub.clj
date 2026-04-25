@@ -41,6 +41,22 @@
        (sl/remove! (:subs ps) subject-pattern stored opts)
        nil))))
 
+(defn watch
+  "Reduces matching events into `state` (a caller-owned atom). `rf` is
+   `(state subj msg) → state'` — mirrors `sub`'s handler minus the
+   match-result. Opts: `{:tap (fn [subj msg])}` — called after each
+   `swap!` on the same subscription, for side effects like driving a
+   viz tick. Returns the zero-arg unsub fn."
+  ([ps pattern state rf] (watch ps pattern state rf nil))
+  ([ps pattern state rf {:keys [tap]}]
+   (sub ps pattern
+        (if tap
+          (fn [subj msg _]
+            (swap! state rf subj msg)
+            (tap subj msg))
+          (fn [subj msg _]
+            (swap! state rf subj msg))))))
+
 (defn- pick-one
   "Collapses a sublist match result into the final delivery set: every
    `:plain` subscriber plus one random member from each non-empty queue

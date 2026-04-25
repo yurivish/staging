@@ -8,4 +8,4 @@
 .rebel_readline_history
 /datapotamus
 /core.async.flow-monitor
-/out.json
+/*.json
