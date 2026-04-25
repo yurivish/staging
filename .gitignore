@@ -9,3 +9,8 @@
 /datapotamus
 /core.async.flow-monitor
 /*.json
+cache
+.claude
+dev
+out
+out copy
