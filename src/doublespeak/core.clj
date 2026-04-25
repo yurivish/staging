@@ -93,19 +93,13 @@
                  :seed       [{:round 0 :history [] :prompt data} {:to-ivw [data]}]
                  :ivw-result (handle-round config state data)))))
 
-(defn- collect-into [a]
-  (step/step :collect {:ins {:in ""} :outs {}}
-             (fn [_ctx _s d] (reset! a d) {})))
-
-(defn- build-flow [config out-atom]
+(defn- build-flow [config]
   (-> (step/beside (optimizer config)
-                   (interview (:models config))
-                   (collect-into out-atom))
+                   (interview (:models config)))
       (step/input-at  [:optimizer :seed])
       (step/connect   [:optimizer :to-ivw] [:interview :in])
       (step/connect   [:interview :out]    [:optimizer :ivw-result])
-      (step/connect   [:optimizer :final]  [:collect :in])
-      (step/output-at :collect)))
+      (step/output-at [:optimizer :final])))
 
 ;; --- Console rendering -----------------------------------------------------
 
@@ -160,24 +154,24 @@
   ([config]              (run-doublespeak! config nil {}))
   ([config out-path]     (run-doublespeak! config out-path {}))
   ([config out-path {:keys [trace? pubsub]}]
-   (let [result (atom nil)
-         ps     (or pubsub (when trace? (pubsub/make)))
+   (let [ps     (or pubsub (when trace? (pubsub/make)))
          unsub  (when trace? (pubsub/sub ps [:>] print-event))
          prefix (when out-path (str/replace out-path #"\.json$" ""))
          cfg    (cond-> config prefix (assoc :out-prefix prefix))
-         opts   (cond-> {:data (:prompt cfg)} ps (assoc :pubsub ps))
-         res    (flow/run! (build-flow cfg result) opts)]
+         opts   (cond-> {} ps (assoc :pubsub ps))
+         res    (flow/run-seq (build-flow cfg) [(:prompt cfg)] opts)
+         result (ffirst (:outputs res))]
      (when unsub (unsub))
-     (when (and out-path (= :completed (:state res)) @result)
-       (spit out-path (with-out-str (json/pprint @result))))
+     (when (and out-path (= :completed (:state res)) result)
+       (spit out-path (with-out-str (json/pprint result))))
      (locking *out*
        (println)
        (cond
-         (:final-prompt @result)
+         (:final-prompt result)
          (do (println (format "Best prompt found — round %d, gap = %s:"
-                              (:final-round @result)
-                              (llm/gap-str (:final-gap @result))))
-             (println (:final-prompt @result)))
+                              (:final-round result)
+                              (llm/gap-str (:final-gap result))))
+             (println (:final-prompt result)))
          (not= :completed (:state res))
          (do (println "Run did not complete.")
              (println " state:" (:state res))

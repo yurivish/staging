@@ -11,6 +11,7 @@
    [org.httpkit.server :as hk]
    [reitit.ring :as ring]
    [toolkit.datapotamus.flow :as flow]
+   [toolkit.datapotamus.step :as step]
    [toolkit.datapotamus.viz :as viz]
    [toolkit.datastar.core :as d]
    [toolkit.hotreload :as hotreload]
@@ -124,7 +125,7 @@
 (defn viz-start-handler [app]
   (fn [_req]
     (let [fid      (str (random-uuid))
-          flow-def (hn/build-flow (atom []))]
+          flow-def (step/serial (hn/build-flow) (step/sink))]
       (viz/register-flow! (:viz-store app) fid (viz/from-step flow-def) "hn")
       ;; Arm one render tick immediately so the new section appears.
       ((:tick! (:viz-ticker app)))

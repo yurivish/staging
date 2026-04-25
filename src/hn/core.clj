@@ -109,23 +109,20 @@
                (Thread/sleep (+ 300 (rand-int 700)))
                (assoc row :summary (fake-summary)))))
 
-(defn- collect-into [a]
-  (step/step :collect {:ins {:in ""} :outs {}}
-             (fn [_ctx _s row]
-               (swap! a conj row)
-               {})))
-
 ;; --- Flow -------------------------------------------------------------------
 
-(defn build-flow [out-atom]
+;; The flow's `:out` boundary is left exposed — `run-once!` uses
+;; `flow/run-seq`, which appends its own collector. Callers that want
+;; the manual API (e.g. the visualizer in `demo/server.clj`) can wrap
+;; this in `(step/serial _ (step/sink))` to terminate the stream.
+(defn build-flow []
   (step/serial
    fetch-top-ids
    split-ids
    (c/workers :story-fetchers   fetch-workers fetch-story)
    split-comments
    (c/workers :comment-fetchers fetch-workers fetch-comment)
-   (c/workers :summarizers      llm-workers   fake-summarize)
-   (collect-into out-atom)))
+   (c/workers :summarizers      llm-workers   fake-summarize)))
 
 (defn- preview [v]
   (let [s (pr-str v)] (if (> (count s) 80) (str (subs s 0 77) "...") s)))
@@ -145,16 +142,15 @@
   ([] (run-once! "./out.json" {}))
   ([out-path] (run-once! out-path {}))
   ([out-path {:keys [trace? pubsub]}]
-   (let [rows   (atom [])
-         ps     (or pubsub (when trace? (pubsub/make)))
+   (let [ps     (or pubsub (when trace? (pubsub/make)))
          unsub  (when trace? (pubsub/sub ps [:>] print-event))
-         opts   (cond-> {:data :tick}
-                  ps (assoc :pubsub ps))
-         res    (flow/run! (build-flow rows) opts)]
+         opts   (cond-> {} ps (assoc :pubsub ps))
+         res    (flow/run-seq (build-flow) [:tick] opts)
+         rows   (first (:outputs res))]
      (when unsub (unsub))
      (when (= :completed (:state res))
-       (spit out-path (with-out-str (json/pprint @rows))))
-     {:state (:state res) :count (count @rows) :error (:error res)})))
+       (spit out-path (with-out-str (json/pprint rows))))
+     {:state (:state res) :count (count rows) :error (:error res)})))
 
 ;; --- Scheduler --------------------------------------------------------------
 
