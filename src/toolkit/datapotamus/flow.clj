@@ -327,19 +327,10 @@
   (a/io-thread
    (loop [first? true]
      (when-let [m (a/<!! error-chan)]
-       (let [ex  (:clojure.core.async.flow/ex m)
-             err {:message (ex-message ex) :data (ex-data ex)}]
+       (let [ev  (trace/flow-error-event scope fid m)
+             err (:error ev)]
          (reset! error err)
-         (pubsub/pub raw-ps
-                     (trace/run-subject-for scope :flow-error)
-                     {:kind       :flow-error
-                      :pid        (:clojure.core.async.flow/pid m)
-                      :cid        (:clojure.core.async.flow/cid m)
-                      :msg-id     (get-in m [:clojure.core.async.flow/msg :msg-id])
-                      :error      err
-                      :scope      scope
-                      :scope-path [fid]
-                      :at         (trace/now)})
+         (pubsub/pub raw-ps (trace/run-subject-for scope :flow-error) ev)
          (when first?
            (deliver @done-p [:failed err])
            (when-not (realized? cancel-p) (deliver cancel-p :failed))

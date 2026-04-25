@@ -64,6 +64,21 @@
   [step-id data]
   {:kind :status :step-id step-id :data data})
 
+(defn flow-error-event
+  "Run-level event for a system error drained off `core.async.flow`'s
+   error-chan. Includes the stamps `run-started` carries inline so the
+   caller can `pubsub/pub` directly on `(run-subject-for scope :flow-error)`."
+  [scope fid m]
+  (let [ex (:clojure.core.async.flow/ex m)]
+    {:kind       :flow-error
+     :pid        (:clojure.core.async.flow/pid m)
+     :cid        (:clojure.core.async.flow/cid m)
+     :msg-id     (get-in m [:clojure.core.async.flow/msg :msg-id])
+     :error      {:message (ex-message ex) :data (ex-data ex)}
+     :scope      scope
+     :scope-path [fid]
+     :at         (now)}))
+
 ;; ============================================================================
 ;; Scope helpers
 ;; ============================================================================
