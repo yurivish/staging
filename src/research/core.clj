@@ -5,12 +5,15 @@
 
    Pipeline:
 
-       term ─▶ :build-request ─▶ :research ─▶ :extract ─▶ :collect ─▶ atom
+       term ─▶ :build-request ─▶ :research ─▶ :extract ─▶ result
 
    :build-request   wrap the term in a prompt
    :research        cc/step — runs `claude -p` with WebSearch / WebFetch
    :extract         pluck the schema-conforming payload off the result
-   :collect         stash each row into an out-atom
+
+   `flow/run-seq` appends its own collector and attributes each
+   `:out` value back to the input that produced it, so we don't need
+   a hand-rolled sink — the example flow is just the three steps above.
 
    One-shot from the shell (swap the term):
 
@@ -78,24 +81,16 @@
 (def extract
   (step/step :extract :structured-output))
 
-;; --- :collect ---------------------------------------------------------------
-
-(defn- collect-into [a]
-  (step/step :collect {:ins {:in ""} :outs {}}
-             (fn [_ctx _s row] (swap! a conj row) {})))
-
-;; --- the flow ---------------------------------------------------------------
-
-;; `step/serial` wires the four steps end-to-end: each step's `:out`
-;; becomes the next step's `:in`.
-(defn- build-flow [out]
-  (step/serial build-request research extract (collect-into out)))
-
 ;; --- entry point ------------------------------------------------------------
 
+;; `step/serial` wires the three steps end-to-end. `flow/run-seq` runs
+;; the chain against the singleton input vector and returns
+;; `:outputs` aligned to it — `[[result-map]]` here, since one input
+;; produced one output.
 (defn find-feeds! [term]
-  (let [out (atom [])
-        res (flow/run! (build-flow out) {:data term})]
+  (let [flow   (step/serial build-request research extract)
+        res    (flow/run-seq flow [term])
+        result (ffirst (:outputs res))]
     (when (= :completed (:state res))
-      (pp/pprint (first @out)))
-    {:state (:state res) :result (first @out) :error (:error res)}))
+      (pp/pprint result))
+    {:state (:state res) :result result :error (:error res)}))
