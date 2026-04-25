@@ -1,5 +1,5 @@
 (ns toolkit.hist-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is]]
             [toolkit.hist :as h])
   (:import [java.util.concurrent CountDownLatch]))
 

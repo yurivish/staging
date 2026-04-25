@@ -121,7 +121,7 @@
   (let [entries (sort-by key (seq weights))
         total   (reduce + (map val entries))]
     (assert (pos? total) "weights must sum to a positive number")
-    (loop [pick (long (int-inclusive frng (dec total)))
+    (loop [pick (int-inclusive frng (dec total))
            es   entries]
       (let [[k w] (first es)
             w     (long w)]

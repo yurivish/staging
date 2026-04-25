@@ -26,7 +26,6 @@
    `workers` is a different axis: K round-robin copies of one inner
    step for stream-level throughput parallelism — unrelated to the
    scatter-gather pair above."
-  (:refer-clojure :exclude [merge])
   (:require [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.token :as tok]))

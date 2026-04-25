@@ -1,6 +1,7 @@
 (ns distill.core-test
   "Smoke tests for the distill flow. The three LLM fns are stubbed via
    `with-redefs`; each test exercises one stop-reason."
+  (:refer-clojure :exclude [run!])
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [distill.core :as distill]

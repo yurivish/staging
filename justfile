@@ -10,3 +10,9 @@ prep:
 
 lint path="src":
     clojure -M:kondo --lint {{path}}
+
+test:
+    clj -X:test
+
+test-costly:
+    clj -X:test-costly
