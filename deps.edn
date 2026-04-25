@@ -134,6 +134,12 @@
           :main-opts   ["-m" "toolkit.bench"]}
   :rebel {:extra-deps {com.bhauman/rebel-readline {:mvn/version "0.1.7"}}
           :main-opts  ["-m" "rebel-readline.main"]}
+  ;; Podcast extraction pipeline. Carries the lmdbjava add-opens because
+  ;; toolkit.llm.cache opens an LMDB env. Use as:
+  ;;   clojure -M:podcast -e '(require (quote podcast.core)) (podcast.core/extract! ...)'
+  ;;   clojure -M:podcast -m podcast.core sentiment stumpf.json out/sentiment.json
+  :podcast {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                       "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}
   ;; Check for outdated deps: clojure -M:outdated
   ;; Upgrade in place:        clojure -M:outdated --upgrade
   :outdated {:deps      {com.github.liquidz/antq {:mvn/version "RELEASE"}

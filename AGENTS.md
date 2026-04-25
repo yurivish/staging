@@ -27,14 +27,29 @@ namespace.
 
 ## LLM calls
 
-LLM calls go through langchain4j (already in `deps.edn`:
-`dev.langchain4j/langchain4j` plus per-provider adapters). There is no
-project-internal LLM client; do not reintroduce one.
+Two paths exist for calling LLMs. Pick by capability, not by preference.
+
+**Default — langchain4j**: `dev.langchain4j/langchain4j` plus per-provider
+adapters in `deps.edn`. Use this when the feature you need is supported
+by the adapter — text/tool completion, prompt caching markers,
+provider-specific knobs reachable via the typed builder methods or its
+`customParameters` passthrough.
 
 Reference pattern: `/work/src/doublespeak/llm.clj` — Anthropic via
 `AnthropicChatModel`, structured output via `JsonObjectSchema` inside a
 `ToolSpecification`, per-model `:provider-extra` mapped to typed builder
 methods (`thinkingType` / `thinkingBudgetTokens`) and `customParameters`
 for raw passthrough. The `chat-tool!` helper there is the one-call
-wrapper to copy. For plain text completion (no tools), `/work/src/hn/core.clj`
-shows the inline 5-line pattern.
+wrapper to copy. For plain text completion (no tools),
+`/work/src/hn/core.clj` shows the inline 5-line pattern.
+
+**Fallback — `toolkit.llm` + provider adapters**: when langchain4j's
+adapter doesn't expose the wire feature you need (e.g. the Anthropic
+documents/citations API as of langchain4j 1.13), reach for
+`/work/src/toolkit/llm.clj` (a small unified-request HTTP driver) and
+its provider adapters under `/work/src/toolkit/llm/`. Don't write a new
+one-off HTTP client — extend `toolkit.llm` (or the relevant adapter)
+with the missing capability so the next caller benefits.
+
+Both paths can share the response cache; see `toolkit.llm.cache` (LMDB-
+backed, request → response).
