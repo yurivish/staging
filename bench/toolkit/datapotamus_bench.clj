@@ -14,6 +14,7 @@
   (:require [toolkit.datapotamus.combinators :as dc]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.step :as step]
+            [toolkit.datapotamus.watchers.latency :as latency]
             [toolkit.hist :as hist]
             [toolkit.pubsub :as pubsub])
   (:import [java.lang.management ManagementFactory]
@@ -122,7 +123,8 @@
   (let [kind         (:kind load)
         sent-ctr     (AtomicLong. 0)
         done-ctr     (AtomicLong. 0)
-        warmup-hist  (hist/dense {:a 2 :b 4 :max-v hist-max-ns})
+        hist-opts    {:a 2 :b 4 :max-v hist-max-ns}
+        warmup-hist  (hist/dense hist-opts)
         hist-ref     (AtomicReference. warmup-hist)
         sem          (case kind
                        :closed (Semaphore. (int (:concurrency load 1)))
@@ -137,13 +139,18 @@
     (try
       (case kind
         :closed
-        (let [stop-inject
-              (start-closed-loop-injector handle sem (:concurrency load 1) input-fn sent-ctr)]
+        (let [warmup-watcher (latency/make hist-opts)
+              warmup-unsub   (latency/attach! ps warmup-watcher)
+              stop-inject    (start-closed-loop-injector
+                               handle sem (:concurrency load 1) input-fn sent-ctr)]
           (try
             (Thread/sleep (long (* 1000 (long warmup-s))))
-            (let [measurement-hist (hist/dense {:a 2 :b 4 :max-v hist-max-ns})
-                  pre-sent (.get sent-ctr)
-                  pre-done (.get done-ctr)]
+            (warmup-unsub)
+            (let [measurement-hist    (hist/dense hist-opts)
+                  measurement-watcher (latency/make hist-opts)
+                  _                   (latency/attach! ps measurement-watcher)
+                  pre-sent            (.get sent-ctr)
+                  pre-done            (.get done-ctr)]
               (.set hist-ref measurement-hist)
               (let [t0 (System/nanoTime)]
                 (Thread/sleep (long (* 1000 (long duration-s))))
@@ -155,6 +162,7 @@
                         post-done (.get done-ctr)]
                     {:config    {:load load :warmup-s warmup-s :duration-s duration-s}
                      :snapshot  snap
+                     :per-step  (latency/snapshot measurement-watcher)
                      :summary   (with-rates snap
                                             (- post-sent pre-sent)
                                             (- post-done pre-done)
@@ -165,7 +173,9 @@
             (finally (stop-inject))))
 
         :count
-        (let [n (int (:count load))]
+        (let [n       (int (:count load))
+              watcher (latency/make hist-opts)
+              _       (latency/attach! ps watcher)]
           (dotimes [_ n]
             (flow/inject! handle {:data (stamp-payload (input-fn))})
             (.incrementAndGet sent-ctr))
@@ -173,6 +183,7 @@
           (let [snap (hist/snapshot warmup-hist)]
             {:config    {:load load}
              :snapshot  snap
+             :per-step  (latency/snapshot watcher)
              :summary   (with-rates snap (.get sent-ctr) (.get done-ctr)
                                     (- (System/nanoTime) wall-start))
              :sent      (.get sent-ctr)
@@ -220,6 +231,17 @@
     (> r 1e3) (format "%6.2fK/s" (/ r 1e3))
     :else     (format "%6.1f /s" r)))
 
+(defn- print-per-step [per-step]
+  (when (seq per-step)
+    (println (format "%26sPer-step latency:" ""))
+    (let [step-w (->> per-step keys (map #(count (str %))) (apply max 0))]
+      (doseq [[step-id snap] (sort-by #(str (key %)) per-step)
+              :let [s (hist/summary snap)]]
+        (println (format (str "%28s%-" step-w "s  p50=%s  p90=%s  p99=%s  max=%s")
+                         "" (str step-id)
+                         (fmt-ns (or (:p50 s) 0)) (fmt-ns (or (:p90 s) 0))
+                         (fmt-ns (or (:p99 s) 0)) (fmt-ns (or (:max s) 0))))))))
+
 (defn print-result [label result]
   (let [s (:summary result)]
     (println (format "  %-24s  sent=%d  completed=%d  throughput=%s"
@@ -230,7 +252,8 @@
     (println (format "%26sE2E latency: p50=%s  p90=%s  p99=%s  p999=%s  max=%s"
                      "" (fmt-ns (or (:p50 s) 0)) (fmt-ns (or (:p90 s) 0))
                      (fmt-ns (or (:p99 s) 0)) (fmt-ns (or (:p999 s) 0))
-                     (fmt-ns (or (:max s) 0))))))
+                     (fmt-ns (or (:max s) 0))))
+    (print-per-step (:per-step result))))
 
 ;; ---- Multi-sample aggregation -------------------------------------
 
@@ -266,25 +289,49 @@
         (nth v (quot n 2))
         (/ (+ (nth v (dec (quot n 2))) (nth v (quot n 2))) 2.0)))))
 
+(defn- merge-per-step
+  "Fold per-step snapshots from N samples into one merged snapshot per
+   step-id (bucket-wise sum via hist/merge-snapshots). Tighter percentile
+   estimates than averaging summary stats across samples."
+  [results]
+  (->> results
+       (mapcat :per-step)
+       (group-by key)
+       (reduce-kv (fn [acc step-id entries]
+                    (assoc acc step-id
+                           (reduce hist/merge-snapshots (map val entries))))
+                  {})))
+
 (defn- summarize-samples
   "Fold a seq of run-bench results into median + range on throughput and
-   p50 latency."
+   p50 latency, plus per-step merged snapshots across samples."
   [results]
   (let [thps (mapv #(double (or (get-in % [:summary :throughput-msgs-per-s]) 0.0)) results)
         p50s (mapv #(double (or (get-in % [:summary :p50]) 0.0)) results)]
-    {:n          (count results)
-     :thp-med    (median thps)
-     :thp-min    (apply min thps)
-     :thp-max    (apply max thps)
-     :p50-med    (median p50s)
-     :p50-min    (apply min p50s)
-     :p50-max    (apply max p50s)}))
+    {:n               (count results)
+     :thp-med         (median thps)
+     :thp-min         (apply min thps)
+     :thp-max         (apply max thps)
+     :p50-med         (median p50s)
+     :p50-min         (apply min p50s)
+     :p50-max         (apply max p50s)
+     :per-step-merged (merge-per-step results)}))
 
-(defn- print-aggregate [label {:keys [n thp-med thp-min thp-max p50-med p50-min p50-max]}]
+(defn- print-aggregate [label {:keys [n thp-med thp-min thp-max p50-med p50-min p50-max
+                                      per-step-merged]}]
   (println (format "  %-24s  thp med=%s  range=[%s .. %s]  (n=%d)"
                    label (fmt-rate thp-med) (fmt-rate thp-min) (fmt-rate thp-max) n))
   (println (format "%26sp50 med=%s  range=[%s .. %s]"
-                   "" (fmt-ns p50-med) (fmt-ns p50-min) (fmt-ns p50-max))))
+                   "" (fmt-ns p50-med) (fmt-ns p50-min) (fmt-ns p50-max)))
+  (when (seq per-step-merged)
+    (println (format "%26sPer-step (merged across %d samples):" "" n))
+    (let [step-w (->> per-step-merged keys (map #(count (str %))) (apply max 0))]
+      (doseq [[step-id snap] (sort-by #(str (key %)) per-step-merged)
+              :let [s (hist/summary snap)]]
+        (println (format (str "%28s%-" step-w "s  p50=%s  p90=%s  p99=%s  max=%s")
+                         "" (str step-id)
+                         (fmt-ns (or (:p50 s) 0)) (fmt-ns (or (:p90 s) 0))
+                         (fmt-ns (or (:p99 s) 0)) (fmt-ns (or (:max s) 0))))))))
 
 ;; ---- Sweep runner --------------------------------------------------
 

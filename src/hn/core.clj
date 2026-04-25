@@ -28,14 +28,15 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
-            [toolkit.llm :as llm]
-            [toolkit.llm.anthropic :as anthropic]
             [toolkit.datapotamus.combinators :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.pubsub :as pubsub])
-  (:import (java.util.concurrent Executors TimeUnit)))
+  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
+           [dev.langchain4j.model.chat.request ChatRequest]
+           [dev.langchain4j.data.message UserMessage SystemMessage]
+           [java.util.concurrent Executors TimeUnit]))
 
 (def base "https://hacker-news.firebaseio.com/v0")
 (def haiku "claude-haiku-4-5")
