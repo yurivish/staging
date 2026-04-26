@@ -560,41 +560,60 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
        a 32k-context slot when there are ≥ ~150 mentions and the
        model reasons heavily.
 
+     :tree
+       Hierarchical merge-sort. Leaves cluster per-chunk with
+       transcript context; internal nodes pairwise merge two child
+       registries using only canonical + aliases + summary (no
+       transcript). Bounded prompts at every level; parallelisable.
+       Requires `chunks` to be passed in.
+
    Returns `{:registry {entity_id → {...}} :rejected [...] :tokens n :cache ...}`.
 
-   `paragraphs` and `description` are used only by the :llm strategy
-   (transcript-as-document side input)."
-  [config all-mentions paragraphs description]
-  (let [{:keys [id-key system schema model-cfg]} (resolve-call-config config)
-        strategy (or (:resolve-strategy config) :llm)]
-    (case strategy
-      :group
-      (let [registry (pre-cluster-mentions all-mentions id-key)]
-        {:registry registry :rejected [] :tokens 0 :cache :pure})
+   `paragraphs` and `description` are used by :llm (transcript-as-document
+   side input). `chunks` (5-arg form) is used by :tree."
+  ([config all-mentions paragraphs description]
+   (resolve-entities! config all-mentions paragraphs description nil))
+  ([config all-mentions paragraphs description chunks]
+   (let [{:keys [id-key system schema model-cfg]} (resolve-call-config config)
+         strategy (or (:resolve-strategy config) :llm)]
+     (case strategy
+       :group
+       (let [registry (pre-cluster-mentions all-mentions id-key)]
+         {:registry registry :rejected [] :tokens 0 :cache :pure})
 
-      :llm
-      (let [document-part {:type        :document
-                           :source-kind :blocks
-                           :blocks      (mapv #(str "[" (:id %) "] " (:text %)) paragraphs)
-                           :title       "Episode transcript"
-                           :context     (when description (subs description 0 (min (count description) 800)))}
-            text-part     {:type :text
-                           :text (str "Mentions to cluster (indices match the FOCUS list):\n\n"
-                                      (render-mentions all-mentions))}
-            {:keys [value tokens cache]}
-            (cached-chat! :resolve model-cfg system [document-part text-part] schema)
-            {:keys [valid rejected]}
-            (partition-by-pred #(well-formed-entity? id-key %) (:entities value))
-            registry (into {} (map (fn [e]
-                                     [(id-key e)
-                                      (assoc e :aliases
-                                             (compute-aliases all-mentions
-                                                              (:mention_indices e)))]))
-                           valid)]
-        {:registry registry
-         :rejected rejected
-         :tokens   tokens
-         :cache    cache}))))
+       :llm
+       (let [document-part {:type        :document
+                            :source-kind :blocks
+                            :blocks      (mapv #(str "[" (:id %) "] " (:text %)) paragraphs)
+                            :title       "Episode transcript"
+                            :context     (when description (subs description 0 (min (count description) 800)))}
+             text-part     {:type :text
+                            :text (str "Mentions to cluster (indices match the FOCUS list):\n\n"
+                                       (render-mentions all-mentions))}
+             {:keys [value tokens cache]}
+             (cached-chat! :resolve model-cfg system [document-part text-part] schema)
+             {:keys [valid rejected]}
+             (partition-by-pred #(well-formed-entity? id-key %) (:entities value))
+             registry (into {} (map (fn [e]
+                                      [(id-key e)
+                                       (assoc e :aliases
+                                              (compute-aliases all-mentions
+                                                               (:mention_indices e)))]))
+                            valid)]
+         {:registry registry
+          :rejected rejected
+          :tokens   tokens
+          :cache    cache})
+
+       :tree
+       (do
+         (when (empty? chunks)
+           (throw (ex-info ":tree resolve-strategy requires chunks (use 5-arg resolve-entities!)"
+                           {:strategy :tree})))
+         ;; Loaded lazily via requiring-resolve to avoid a circular require:
+         ;; podcast.tree-resolve uses cached-chat! from this ns.
+         (let [tree-resolve! (requiring-resolve 'podcast.tree-resolve/tree-resolve!)]
+           (tree-resolve! config all-mentions paragraphs chunks)))))))
 
 (defn- render-registry [id-key registry]
   (str/join "\n"

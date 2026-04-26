@@ -109,7 +109,7 @@
                               (/ a-elapsed 1000.0)))
         b-t0           (System/currentTimeMillis)
         {:keys [registry tokens cache rejected]}
-        (llm/resolve-entities! config all-mentions paragraphs description)
+        (llm/resolve-entities! config all-mentions paragraphs description chunks)
         b-elapsed      (- (System/currentTimeMillis) b-t0)]
     (log-stage :resolve "—" (count registry) tokens cache)
     (when (seq rejected)
