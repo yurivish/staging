@@ -435,10 +435,22 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
 ;; ============================================================================
 
 (defn extract-mentions!
-  "Run Stage A on one chunk."
+  "Run Stage A on one chunk.
+
+   `(:episode-metadata config)` (optional) is prepended verbatim to the
+   user prompt so Stage A can canonicalise speaker self-references
+   (\"I\", \"my\") to the actual host/guest names instead of leaving
+   them as generic \"the speaker\". This lifts the burden off Stage B,
+   which matters most under `:resolve-strategy :group` — pure-code
+   clustering can't merge \"the speaker\" → \"Andy Stumpf\", so it
+   has to come out right at extraction time."
   [config chunk]
   (let [{:keys [system schema model-cfg]} (mention-call-config config)
-        content [{:type :text :text (render-chunk-text chunk)}]
+        meta-prefix (when-let [m (:episode-metadata config)]
+                      (str "EPISODE METADATA (use to canonicalise self-references like \"I\" / \"my\" to host/guest names; do not add metadata-only entities):\n"
+                           m
+                           "\n\n=====\n\n"))
+        content [{:type :text :text (str meta-prefix (render-chunk-text chunk))}]
         {:keys [value tokens cache]}
         (cached-chat! :mentions model-cfg system content schema)
         focus-ids (:focus-ids chunk)
@@ -461,34 +473,109 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
                 s)]
     (vec (distinct forms))))
 
+(defn- normalize-mention-text
+  "Lowercase + whitespace collapse + outer-punctuation strip. Used as
+   the clustering key for deterministic pre-clustering — two mentions
+   with the same normalised text become the same entity."
+  [s]
+  (-> (or s "")
+      str/lower-case
+      (str/replace #"\s+" " ")
+      (str/replace #"^[^\p{Alnum}]+|[^\p{Alnum}]+$" "")
+      str/trim))
+
+(defn pre-cluster-mentions
+  "Deterministic pre-clustering: group by normalised mention_text. Each
+   group becomes one entity. The canonical name is the longest
+   distinct mention_text in the group (preserves the most-specific
+   form when Stage A wrote different but equivalent names like \"Joe\"
+   vs \"Joe Rogan\"). Returns the same registry shape as
+   resolve-entities!:
+     {entity_id → {entity_id, canonical, aliases, mention_indices}}.
+
+   Quality compared to LLM resolve: misses cross-form merges (\"Trump\"
+   vs \"the president\" stay separate) but never gets confused by
+   reasoning, never truncates, runs in milliseconds. Combined with a
+   smart Stage A that canonicalises consistently, this captures most
+   of the grouping value at none of the cost."
+  [all-mentions id-key]
+  (let [groups (->> (map-indexed vector all-mentions)
+                    (filter (fn [[_ m]] (not (str/blank? (:mention_text m)))))
+                    (group-by (fn [[_ m]] (normalize-mention-text (:mention_text m)))))
+        sorted-groups (sort-by key groups)
+        entries
+        (for [[i [_ group]] (map-indexed vector sorted-groups)
+              :let [members   (mapv second group)
+                    indices   (mapv first group)
+                    canonical (->> members
+                                   (map :mention_text)
+                                   (remove str/blank?)
+                                   (sort-by #(- (count %)))
+                                   first)
+                    aliases   (vec (distinct
+                                    (concat (keep :mention_text members)
+                                            (keep :surface_form members))))
+                    id        (format "g_%03d" (inc i))]]
+          [id (cond-> {:canonical canonical
+                       :mention_indices indices
+                       :aliases aliases}
+                true (assoc id-key id))])]
+    (into (sorted-map) entries)))
+
 (defn resolve-entities!
-  "Run Stage B once over all mentions. Sends the full transcript as a
-   side document so the resolver can disambiguate referents with
-   ground truth."
+  "Cluster Stage A's mentions into a canonical registry.
+
+   Strategy is controlled by `(:resolve-strategy config)`:
+
+     :group  (default for reasoning models)
+       Deterministic exact-match grouping by mention_text. Pure
+       Clojure, milliseconds, never truncates, no LLM call. Misses
+       cross-form merges (\"Trump\" vs \"the president\") — those
+       become separate entities.
+
+     :llm
+       Single LLM call that sees the full transcript as a document
+       plus the mention list, and produces a clustered registry.
+       Maximum quality (catches anaphora, hallucination cleanup,
+       cross-form merges) but eats output budget; doesn't fit in
+       a 32k-context slot when there are ≥ ~150 mentions and the
+       model reasons heavily.
+
+   Returns `{:registry {entity_id → {...}} :rejected [...] :tokens n :cache ...}`.
+
+   `paragraphs` and `description` are used only by the :llm strategy
+   (transcript-as-document side input)."
   [config all-mentions paragraphs description]
-  (let [{:keys [system schema id-key model-cfg]} (resolve-call-config config)
-        document-part {:type        :document
-                       :source-kind :blocks
-                       :blocks      (mapv #(str "[" (:id %) "] " (:text %)) paragraphs)
-                       :title       "Episode transcript"
-                       :context     (when description (subs description 0 (min (count description) 800)))}
-        text-part     {:type :text
-                       :text (str "Mentions to cluster (indices match the FOCUS list):\n\n"
-                                  (render-mentions all-mentions))}
-        {:keys [value tokens cache]}
-        (cached-chat! :resolve model-cfg system [document-part text-part] schema)
-        {:keys [valid rejected]}
-        (partition-by-pred #(well-formed-entity? id-key %) (:entities value))
-        registry (into {} (map (fn [e]
-                                 [(id-key e)
-                                  (assoc e :aliases
-                                         (compute-aliases all-mentions
-                                                          (:mention_indices e)))]))
-                       valid)]
-    {:registry registry
-     :rejected rejected
-     :tokens   tokens
-     :cache    cache}))
+  (let [{:keys [id-key system schema model-cfg]} (resolve-call-config config)
+        strategy (or (:resolve-strategy config) :llm)]
+    (case strategy
+      :group
+      (let [registry (pre-cluster-mentions all-mentions id-key)]
+        {:registry registry :rejected [] :tokens 0 :cache :pure})
+
+      :llm
+      (let [document-part {:type        :document
+                           :source-kind :blocks
+                           :blocks      (mapv #(str "[" (:id %) "] " (:text %)) paragraphs)
+                           :title       "Episode transcript"
+                           :context     (when description (subs description 0 (min (count description) 800)))}
+            text-part     {:type :text
+                           :text (str "Mentions to cluster (indices match the FOCUS list):\n\n"
+                                      (render-mentions all-mentions))}
+            {:keys [value tokens cache]}
+            (cached-chat! :resolve model-cfg system [document-part text-part] schema)
+            {:keys [valid rejected]}
+            (partition-by-pred #(well-formed-entity? id-key %) (:entities value))
+            registry (into {} (map (fn [e]
+                                     [(id-key e)
+                                      (assoc e :aliases
+                                             (compute-aliases all-mentions
+                                                              (:mention_indices e)))]))
+                           valid)]
+        {:registry registry
+         :rejected rejected
+         :tokens   tokens
+         :cache    cache}))))
 
 (defn- render-registry [id-key registry]
   (str/join "\n"

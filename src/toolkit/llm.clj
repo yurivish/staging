@@ -73,11 +73,12 @@
                     {:errors (me/humanize explanation)}))))
 
 (def ^:private default-timeout-ms
-  "10-minute idle timeout. Reasoning models (Gemma 4, o1, claude-opus
-   with thinking) routinely take minutes on a single response;
-   http-kit's default 60s is too tight. Override per-call with
-   `:timeout-ms` on the request."
-  600000)
+  "1-hour idle timeout. Reasoning models doing big tasks (Stage B
+   resolve over a full transcript with hundreds of mentions) routinely
+   spend 20+ minutes on a single response; http-kit's default 60s and
+   our previous 10-min cap were both too tight. Override per-call with
+   `:timeout-ms` on the request when you know better."
+  3600000)
 
 (defn query
   "Performs the HTTP call. `provider` is a map of two pure fns:

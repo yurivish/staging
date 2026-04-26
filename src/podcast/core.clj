@@ -99,22 +99,32 @@
                              (println (format "    rejected %d mention(s) in %s"
                                               (count rejected) (name (:chunk-id chunk)))))
                            {:chunk-id (:chunk-id chunk) :mentions mentions :tokens tokens}))
+        a-t0           (System/currentTimeMillis)
         per-chunk      (bounded-pmap workers step-fn chunks)
+        a-elapsed      (- (System/currentTimeMillis) a-t0)
         all-mentions   (vec (mapcat :mentions per-chunk))
         stage-a-tokens (apply + (map :tokens per-chunk))
-        _ (log-banner (format "Stage A: %d mentions across %d chunks (%d tokens)"
-                              (count all-mentions) (count chunks) stage-a-tokens))
+        _ (log-banner (format "Stage A: %d mentions across %d chunks (%d tokens, %.1fs)"
+                              (count all-mentions) (count chunks) stage-a-tokens
+                              (/ a-elapsed 1000.0)))
+        b-t0           (System/currentTimeMillis)
         {:keys [registry tokens cache rejected]}
-        (llm/resolve-entities! config all-mentions paragraphs description)]
+        (llm/resolve-entities! config all-mentions paragraphs description)
+        b-elapsed      (- (System/currentTimeMillis) b-t0)]
     (log-stage :resolve "—" (count registry) tokens cache)
     (when (seq rejected)
       (println (format "    rejected %d entity record(s)" (count rejected))))
-    (log-banner (format "Stage B: %d canonical entities (%d tokens)"
-                        (count registry) tokens))
+    (log-banner (format "Stage B: %d canonical entities (%d tokens, %.1fs, strategy=%s)"
+                        (count registry) tokens (/ b-elapsed 1000.0)
+                        (or (:resolve-strategy config) :llm)))
     {:registry          registry
      :all-mentions      all-mentions
      :per-chunk-mentions per-chunk
-     :tokens            (+ stage-a-tokens tokens)}))
+     :tokens            (+ stage-a-tokens tokens)
+     :stage-a-tokens    stage-a-tokens
+     :stage-b-tokens    tokens
+     :stage-a-ms        a-elapsed
+     :stage-b-ms        b-elapsed}))
 
 ;; ============================================================================
 ;; 4. Flow 2 — chunks + registry → per-chunk records.
@@ -132,14 +142,17 @@
                       (println (format "    rejected %d record(s) in %s"
                                        (count rejected) (name (:chunk-id chunk)))))
                     {:chunk-id (:chunk-id chunk) :records records :tokens tokens}))
-        per-chunk (bounded-pmap workers step-fn chunks)
+        c-t0       (System/currentTimeMillis)
+        per-chunk  (bounded-pmap workers step-fn chunks)
+        c-elapsed  (- (System/currentTimeMillis) c-t0)
         all-records (vec (mapcat :records per-chunk))
         tokens    (apply + (map :tokens per-chunk))]
-    (log-banner (format "Stage C: %d records across %d chunks (%d tokens)"
-                        (count all-records) (count chunks) tokens))
+    (log-banner (format "Stage C: %d records across %d chunks (%d tokens, %.1fs)"
+                        (count all-records) (count chunks) tokens (/ c-elapsed 1000.0)))
     {:records          all-records
      :per-chunk-records per-chunk
-     :tokens           tokens}))
+     :tokens           tokens
+     :stage-c-ms       c-elapsed}))
 
 ;; ============================================================================
 ;; 5. Stage D — pure aggregation. Group records by id-key, sort each
@@ -186,14 +199,20 @@
 (def ^:private local-resolve-cfg
   (assoc local-cfg :max-tokens 32768))
 
+;; :resolve-strategy :group is the default for the local config because
+;; gemma4-26B's reasoning blows past the 32k slot context when asked to
+;; cluster ≥ ~150 mentions in a single call. Pure-code grouping by
+;; normalised mention_text gets us most of the value at zero LLM cost.
 (def sentiment-config
   {:task          :sentiment
+   :resolve-strategy :group
    :mention-model local-cfg
    :resolve-model local-resolve-cfg
    :record-model  local-cfg})
 
 (def conspiracy-config
   {:task          :conspiracy
+   :resolve-strategy :group
    :mention-model local-cfg
    :resolve-model local-resolve-cfg
    :record-model  local-cfg})
@@ -239,7 +258,8 @@
      :run-dir <File|path> — write into this dir instead of allocating a new one."
   [config in-path out-name & {:keys [slice chunking run-dir workers]
                               :or   {chunking default-chunking}}]
-  (let [json-doc (json/read-str (slurp in-path) :key-fn keyword)
+  (let [run-t0   (System/currentTimeMillis)
+        json-doc (json/read-str (slurp in-path) :key-fn keyword)
         description (:description json-doc)
         paras    (maybe-slice (:paragraphs json-doc) slice)
         chunks   (paragraph-chunks paras chunking)
@@ -251,6 +271,15 @@
         ;; this — Anthropic's rate limits make heavy concurrency a
         ;; foot-gun there anyway.
         workers  (or workers (llm/detect-slots) 1)
+        ;; Inject episode metadata into the config so Stage A can
+        ;; canonicalise self-references at extraction time.
+        ;; (`:episode-metadata` already in the config wins over the
+        ;; auto-derived default.)
+        config   (cond-> config
+                   (and description (not (:episode-metadata config)))
+                   (assoc :episode-metadata
+                          (str "Host: Joe Rogan. Description: "
+                               (subs description 0 (min (count description) 600)))))
         _ (log-banner (format "Podcast extraction (%s) — %d paragraphs → %d chunks (N=%d, K=%d)%s  workers=%d"
                               (name (:task config)) (count paras) (count chunks)
                               (:n chunking) (:k chunking)
@@ -261,12 +290,22 @@
         id-key   (case (:task config) :sentiment :entity_id :conspiracy :theory_id)
         entities (aggregate (:registry f1) id-key (:records f2))
         total-tokens (+ (:tokens f1) (:tokens f2))
+        run-elapsed-ms (- (System/currentTimeMillis) run-t0)
+        timings  {:total-ms   run-elapsed-ms
+                  :stage-a-ms (:stage-a-ms f1)
+                  :stage-b-ms (:stage-b-ms f1)
+                  :stage-c-ms (:stage-c-ms f2)
+                  :workers    workers}
         result   {:task         (name (:task config))
                   :n-paragraphs (count paras)
                   :n-chunks     (count chunks)
                   :slice        slice
                   :chunking     chunking
                   :tokens       total-tokens
+                  :stage-tokens {:a (:stage-a-tokens f1)
+                                 :b (:stage-b-tokens f1)
+                                 :c (:tokens f2)}
+                  :timings      timings
                   :n-mentions   (count (:all-mentions f1))
                   :n-entities   (count (:registry f1))
                   :n-records    (count (:records f2))
@@ -289,6 +328,9 @@
                      :slice        slice
                      :chunking     chunking
                      :tokens       total-tokens
+                     :stage-tokens (:stage-tokens result)
+                     :timings      timings
+                     :n-mentions   (count (:all-mentions f1))
                      :n-entities   (count (:registry f1))
                      :n-records    (count (:records f2))
                      :config       (-> config
@@ -299,9 +341,16 @@
                      :timestamp    (str (java.time.Instant/now))}]
       (spit meta-path
             (with-out-str (json/pprint (update existing :runs (fnil conj []) this-run)))))
-    (log-banner (format "Done. %d entities, %d records, %d total tokens. → %s"
-                        (count (:registry f1)) (count (:records f2))
-                        total-tokens out-path))
+    (let [tps (when (pos? run-elapsed-ms)
+                (* 1000.0 (/ total-tokens (double run-elapsed-ms))))]
+      (log-banner
+       (format "Done. %d entities, %d records, %d tokens, %.1fs total (%.1f tok/s).  Stage A: %.1fs · B: %.1fs · C: %.1fs.  → %s"
+               (count (:registry f1)) (count (:records f2)) total-tokens
+               (/ run-elapsed-ms 1000.0) tps
+               (/ (:stage-a-ms f1) 1000.0)
+               (/ (:stage-b-ms f1) 1000.0)
+               (/ (:stage-c-ms f2) 1000.0)
+               out-path)))
     result))
 
 (defn -main
