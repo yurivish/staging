@@ -68,6 +68,7 @@ CLUSTERING RULES — read these carefully:
 
 ALWAYS CLUSTER the speakers and named persons:
   - Stage A's `guess` column gives a canonical name for each mention (often resolving \"I\" / \"you\" / \"he\" to the actual person using episode metadata). If `guess` is a named person, place, or organization, that mention IS for an entity — cluster it under that name even if no literal name appears in the FOCUS paragraphs. The host and guest of the podcast almost always appear as \"I\" / \"my\" / \"you\" mentions and MUST appear in your registry.
+  - The HOST and the GUEST are TWO DIFFERENT people. \"I\" alternates between them depending on whose turn it is in the conversation; the FOCUS paragraphs make this clear by attribution. Stage A's `guess` field disambiguates per-mention — if mention A has guess='Joe Rogan' and mention B has guess='Andy Stumpf', they belong to TWO different entities. NEVER produce a single entity called \"Joe Rogan and Andy Stumpf\" — output Joe Rogan as one entity and Andy Stumpf as another, even when both appear in the same chunk.
 
 For each canonical entity you DO output:
   - entity_id: a stable id you assign (e_001, e_002, ...).
@@ -114,8 +115,10 @@ MERGE WHEN any of these hold:
   - The summaries describe the same person/place/organization, even if from different angles (e.g., 'Joe Rogan, the host' + 'the host of the podcast' → merge).
 
 DO NOT MERGE WHEN:
+  - The canonical names refer to DIFFERENT named people, even if they share a role. The host and guest of a podcast are two different people; both may have 'I', 'you', or 'me' as aliases (because Stage A canonicalised pronouns per chunk to whichever speaker was talking), but if LEFT canonical is 'Joe Rogan' and RIGHT canonical is 'Andy Stumpf', they are DIFFERENT entities — never merge them, no matter how similar the summaries sound. Pronoun-alias overlap is NOT a merge signal.
   - The two sides are different people who share a name component ('Andy Stumpf' vs 'Andy Stumpf's friend' — different people).
   - One is a category, the other an instance ('pharmaceutical companies' vs 'Pfizer').
+  - One is a specific category, the other a broader category ('pharmaceutical companies' vs 'corporations'; 'mRNA vaccines' vs 'vaccines'). Even if one is technically a subset of the other, keep them separate when the speakers use them as distinct topics.
   - Generic noun phrases ('people', 'they', 'some people') with anything specific.
   - Semantic neighbours that are clearly distinct entities ('Cybertruck' vs 'electric car').
   - The two sides are different things that happen to share a topic ('mRNA vaccines linked to cancer' vs 'vaccine injuries' — related concerns but distinct entities).
