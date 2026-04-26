@@ -26,9 +26,7 @@
   (:require [toolkit.os-guard]
             [clojure.data.json :as json]
             [clojure.string :as str]
-            [podcast.llm :as llm]
-            [toolkit.datapotamus.flow :as flow]
-            [toolkit.datapotamus.step :as step]))
+            [podcast.llm :as llm]))
 
 ;; ============================================================================
 ;; 1. Chunking — pure. Non-overlapping focus, backward-only context.
@@ -75,25 +73,33 @@
 ;;    call with all mentions, called directly after fan-in.
 ;; ============================================================================
 
-(defn- mention-step [config]
-  (step/step :mentions
-             (fn [chunk]
-               (let [{:keys [mentions tokens cache rejected]}
-                     (llm/extract-mentions! config chunk)]
-                 (log-stage :mentions (:chunk-id chunk) (count mentions) tokens cache)
-                 (when (seq rejected)
-                   (println (format "    rejected %d mention(s) in %s"
-                                    (count rejected) (name (:chunk-id chunk)))))
-                 {:chunk-id (:chunk-id chunk)
-                  :mentions mentions
-                  :rejected rejected
-                  :tokens   tokens}))))
 
-(defn- run-flow-1 [config chunks paragraphs description]
-  (log-banner (format "── Flow 1: %d chunks → mentions → registry ──"
-                      (count chunks)))
-  (let [res            (flow/run-seq (mention-step config) chunks)
-        per-chunk      (mapv first (:outputs res))
+(defn- bounded-pmap
+  "Like `pmap` but caps concurrency at `n` workers. Order-preserving.
+   Designed for I/O-bound chunk processing — the worker pool gates how
+   many concurrent LLM calls are in flight."
+  [n f coll]
+  (let [coll (vec coll)
+        sem  (java.util.concurrent.Semaphore. (int n))
+        futs (mapv (fn [x]
+                     (.acquire sem)
+                     (future
+                       (try (f x) (finally (.release sem)))))
+                   coll)]
+    (mapv deref futs)))
+
+(defn- run-flow-1 [config chunks paragraphs description workers]
+  (log-banner (format "── Flow 1: %d chunks → mentions → registry  (%d worker%s) ──"
+                      (count chunks) workers (if (= 1 workers) "" "s")))
+  (let [step-fn        (fn [chunk]
+                         (let [{:keys [mentions tokens cache rejected]}
+                               (llm/extract-mentions! config chunk)]
+                           (log-stage :mentions (:chunk-id chunk) (count mentions) tokens cache)
+                           (when (seq rejected)
+                             (println (format "    rejected %d mention(s) in %s"
+                                              (count rejected) (name (:chunk-id chunk)))))
+                           {:chunk-id (:chunk-id chunk) :mentions mentions :tokens tokens}))
+        per-chunk      (bounded-pmap workers step-fn chunks)
         all-mentions   (vec (mapcat :mentions per-chunk))
         stage-a-tokens (apply + (map :tokens per-chunk))
         _ (log-banner (format "Stage A: %d mentions across %d chunks (%d tokens)"
@@ -115,27 +121,20 @@
 ;;    Registry is closed over in the step's handler.
 ;; ============================================================================
 
-(defn- record-step [config registry]
-  (step/step :records
-             (fn [chunk]
-               (let [{:keys [records tokens cache rejected]}
-                     (llm/extract-records! config chunk registry)]
-                 (log-stage :records (:chunk-id chunk) (count records) tokens cache)
-                 (when (seq rejected)
-                   (println (format "    rejected %d record(s) in %s"
-                                    (count rejected) (name (:chunk-id chunk)))))
-                 {:chunk-id (:chunk-id chunk)
-                  :records  records
-                  :rejected rejected
-                  :tokens   tokens}))))
-
-(defn- run-flow-2 [config chunks registry]
-  (log-banner (format "── Flow 2: %d chunks + registry → records ──"
-                      (count chunks)))
-  (let [res         (flow/run-seq (record-step config registry) chunks)
-        per-chunk   (mapv first (:outputs res))
+(defn- run-flow-2 [config chunks registry workers]
+  (log-banner (format "── Flow 2: %d chunks + registry → records  (%d worker%s) ──"
+                      (count chunks) workers (if (= 1 workers) "" "s")))
+  (let [step-fn (fn [chunk]
+                  (let [{:keys [records tokens cache rejected]}
+                        (llm/extract-records! config chunk registry)]
+                    (log-stage :records (:chunk-id chunk) (count records) tokens cache)
+                    (when (seq rejected)
+                      (println (format "    rejected %d record(s) in %s"
+                                       (count rejected) (name (:chunk-id chunk)))))
+                    {:chunk-id (:chunk-id chunk) :records records :tokens tokens}))
+        per-chunk (bounded-pmap workers step-fn chunks)
         all-records (vec (mapcat :records per-chunk))
-        tokens      (apply + (map :tokens per-chunk))]
+        tokens    (apply + (map :tokens per-chunk))]
     (log-banner (format "Stage C: %d records across %d chunks (%d tokens)"
                         (count all-records) (count chunks) tokens))
     {:records          all-records
@@ -177,17 +176,27 @@
 (def ^:private haiku-resolve-cfg
   (assoc haiku-cfg :max-tokens 24576))
 
+;; Local llama.cpp / Ollama. The Gemma 4 quant on the user's mac mini
+;; is a reasoning model — needs generous max-tokens to leave room for
+;; the chain-of-thought before the visible output.
+(def ^:private local-cfg
+  {:model "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q5_K_XL"
+   :max-tokens 16384})
+
+(def ^:private local-resolve-cfg
+  (assoc local-cfg :max-tokens 32768))
+
 (def sentiment-config
   {:task          :sentiment
-   :mention-model haiku-cfg
-   :resolve-model haiku-resolve-cfg
-   :record-model  haiku-cfg})
+   :mention-model local-cfg
+   :resolve-model local-resolve-cfg
+   :record-model  local-cfg})
 
 (def conspiracy-config
   {:task          :conspiracy
-   :mention-model haiku-cfg
-   :resolve-model haiku-resolve-cfg
-   :record-model  haiku-cfg})
+   :mention-model local-cfg
+   :resolve-model local-resolve-cfg
+   :record-model  local-cfg})
 
 ;; ============================================================================
 ;; 7. Public entry — load, slice, chunk, run, aggregate, persist.
@@ -200,25 +209,55 @@
     (let [[a b] slice] (subvec (vec paragraphs) a b))
     (vec paragraphs)))
 
+(defn next-run-dir!
+  "Find the next available `out/N` directory and create it. Returns the
+   `java.io.File` for the new directory. Versioning means runs never
+   overwrite each other; comparing two runs is a directory diff."
+  []
+  (let [root (clojure.java.io/file "out")]
+    (.mkdirs root)
+    (let [used (->> (.listFiles root)
+                    (keep #(when (.isDirectory %)
+                             (try (Long/parseLong (.getName %)) (catch Exception _ nil))))
+                    set)
+          n (loop [i 1] (if (used i) (recur (inc i)) i))
+          d (clojure.java.io/file root (str n))]
+      (.mkdirs d)
+      d)))
+
 (defn extract!
   "Run the full pipeline and write a JSON result. Returns the in-memory
    result map.
 
+   `out-name` is a basename; the file lands in a freshly-allocated
+   `out/N/` directory (next available N). A `run.json` companion is
+   written alongside with the config metadata (model names, slice, task).
+
    Options:
      :slice [start end]   — process only paragraphs[start, end). Default: all.
-     :chunking {:n :k}    — override chunk sizing. Default {:n 8 :k 5}."
-  [config in-path out-path & {:keys [slice chunking]
+     :chunking {:n :k}    — override chunk sizing. Default {:n 8 :k 5}.
+     :run-dir <File|path> — write into this dir instead of allocating a new one."
+  [config in-path out-name & {:keys [slice chunking run-dir workers]
                               :or   {chunking default-chunking}}]
   (let [json-doc (json/read-str (slurp in-path) :key-fn keyword)
         description (:description json-doc)
         paras    (maybe-slice (:paragraphs json-doc) slice)
         chunks   (paragraph-chunks paras chunking)
-        _ (log-banner (format "Podcast extraction (%s) — %d paragraphs → %d chunks (N=%d, K=%d)%s"
+        run-dir  (or (when run-dir (doto (clojure.java.io/file run-dir) .mkdirs))
+                     (next-run-dir!))
+        out-path (.getPath (clojure.java.io/file run-dir out-name))
+        ;; Auto-detect parallelism from llama.cpp's /props endpoint.
+        ;; Fall back to 1 (sequential) for providers that don't expose
+        ;; this — Anthropic's rate limits make heavy concurrency a
+        ;; foot-gun there anyway.
+        workers  (or workers (llm/detect-slots) 1)
+        _ (log-banner (format "Podcast extraction (%s) — %d paragraphs → %d chunks (N=%d, K=%d)%s  workers=%d"
                               (name (:task config)) (count paras) (count chunks)
                               (:n chunking) (:k chunking)
-                              (if slice (format ", slice=%s" (pr-str slice)) "")))
-        f1       (run-flow-1 config chunks paras description)
-        f2       (run-flow-2 config chunks (:registry f1))
+                              (if slice (format ", slice=%s" (pr-str slice)) "")
+                              workers))
+        f1       (run-flow-1 config chunks paras description workers)
+        f2       (run-flow-2 config chunks (:registry f1) workers)
         id-key   (case (:task config) :sentiment :entity_id :conspiracy :theory_id)
         entities (aggregate (:registry f1) id-key (:records f2))
         total-tokens (+ (:tokens f1) (:tokens f2))
@@ -235,6 +274,31 @@
                   :entities     entities}]
     (clojure.java.io/make-parents out-path)
     (spit out-path (with-out-str (json/pprint result)))
+    ;; Write run metadata alongside the output for posthoc analysis.
+    ;; If multiple extract! calls share the same run-dir (e.g. sentiment +
+    ;; conspiracy in one bundle), each call appends to the same run.json
+    ;; if it exists, otherwise creates it.
+    (let [meta-path (.getPath (clojure.java.io/file run-dir "run.json"))
+          existing  (when (.exists (clojure.java.io/file meta-path))
+                      (try (json/read-str (slurp meta-path) :key-fn keyword)
+                           (catch Throwable _ {})))
+          this-run  {:task         (name (:task config))
+                     :out-name     out-name
+                     :n-paragraphs (count paras)
+                     :n-chunks     (count chunks)
+                     :slice        slice
+                     :chunking     chunking
+                     :tokens       total-tokens
+                     :n-entities   (count (:registry f1))
+                     :n-records    (count (:records f2))
+                     :config       (-> config
+                                       (update :mention-model #(into {} %))
+                                       (update :resolve-model #(into {} %))
+                                       (update :record-model  #(into {} %))
+                                       (dissoc :task))
+                     :timestamp    (str (java.time.Instant/now))}]
+      (spit meta-path
+            (with-out-str (json/pprint (update existing :runs (fnil conj []) this-run)))))
     (log-banner (format "Done. %d entities, %d records, %d total tokens. → %s"
                         (count (:registry f1)) (count (:records f2))
                         total-tokens out-path))

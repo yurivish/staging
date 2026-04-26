@@ -32,11 +32,14 @@
    Configs in `podcast.core` parameterise this with sentiment-vs-
    conspiracy prompts/schemas; everything else (model, cache,
    validation, content-part construction) is shared."
-  (:require [clojure.string :as str]
+  (:require [clojure.data.json :as json]
+            [clojure.string :as str]
+            [org.httpkit.client :as http]
             [toolkit.approxmatch :as am]
             [toolkit.llm :as llm]
             [toolkit.llm.anthropic :as anthropic]
-            [toolkit.llm.cache :as cache]))
+            [toolkit.llm.cache :as cache]
+            [toolkit.llm.openai :as openai]))
 
 ;; ============================================================================
 ;; 1. Cache + provider client.
@@ -52,6 +55,36 @@
 (def ^:private anthropic-client
   (delay (anthropic/client (str/trim (slurp "claude.key")))))
 
+(def local-base-url
+  "Server root for the local llama.cpp / Ollama box. The OpenAI
+   adapter appends `/v1`; other endpoints (`/props`, `/slots`) sit at
+   the root."
+  "http://192.168.0.10:8080")
+
+(def ^:private local-client
+  "llama.cpp / Ollama-compat server on the user's mac mini. The model
+   name is set per-call via the unified request, so the same client
+   value works for every model the server has loaded."
+  (delay (openai/client "ollama" (str local-base-url "/v1"))))
+
+(defn detect-slots
+  "Probe llama.cpp's /props endpoint and return total_slots, or nil if
+   the server doesn't expose the field (i.e. it's not llama.cpp). Used
+   to size the worker pool dynamically — a 4-slot box runs 4 chunks
+   in parallel; a 1-slot Anthropic-style API stays sequential."
+  ([] (detect-slots local-base-url))
+  ([server-root]
+   (try
+     (let [{:keys [status body]} @(http/get (str server-root "/props")
+                                            {:timeout 3000})]
+       (when (= status 200)
+         (-> (json/read-str body :key-fn keyword) :total_slots)))
+     (catch Throwable _ nil))))
+
+;; Active LLM client. Edit this binding to swap providers — every stage
+;; goes through whichever value is selected here.
+(def ^:private llm-client local-client)
+
 (defn- cache-key [stage model system content-parts schema]
   (cache/key-bytes-of (str (name stage) "\n--\n" model
                            "\n--\n" system
@@ -64,13 +97,20 @@
 ;;    the config when we want per-stage provider selection).
 ;; ============================================================================
 
-(defn- usage-tokens [resp]
-  (let [u (some-> resp :raw :usage)]
-    (long (+ (or (:input_tokens u) 0) (or (:output_tokens u) 0)))))
+(defn- usage-tokens
+  "Total tokens consumed, normalised across provider shapes:
+   Anthropic uses input_tokens / output_tokens; OpenAI uses
+   prompt_tokens / completion_tokens (and exposes total_tokens)."
+  [resp]
+  (let [u (or (:usage resp) (some-> resp :raw :usage))]
+    (long
+     (or (:total_tokens u)
+         (+ (or (:input_tokens u) (:prompt_tokens u) 0)
+            (or (:output_tokens u) (:completion_tokens u) 0))))))
 
 (defn- chat-structured!*
   [{:keys [model max-tokens]} system content-parts schema]
-  (let [resp (llm/query @anthropic-client
+  (let [resp (llm/query @llm-client
                         {:model           model
                          :max-tokens      (or max-tokens 4096)
                          :system          system
