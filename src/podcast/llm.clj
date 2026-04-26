@@ -67,6 +67,24 @@
    value works for every model the server has loaded."
   (delay (openai/client "ollama" (str local-base-url "/v1"))))
 
+(def ^:private clients-by-base-url
+  "Memoised OpenAI-compat clients keyed by base URL. Lets a model-cfg
+   say `:base-url \"http://192.168.0.10:8081\"` to route this one
+   stage to a different llama.cpp server without touching the global
+   active-client binding."
+  (atom {}))
+
+(defn- client-for-base-url [base-url]
+  (or (get @clients-by-base-url base-url)
+      (get (swap! clients-by-base-url
+                  (fn [m]
+                    (if (contains? m base-url)
+                      m
+                      (assoc m base-url
+                             (openai/client (str "local-" base-url)
+                                            (str base-url "/v1"))))))
+           base-url)))
+
 (defn detect-slots
   "Probe llama.cpp's /props endpoint and return total_slots, or nil if
    the server doesn't expose the field (i.e. it's not llama.cpp). Used
@@ -109,8 +127,9 @@
             (or (:output_tokens u) (:completion_tokens u) 0))))))
 
 (defn- chat-structured!*
-  [{:keys [model max-tokens]} system content-parts schema]
-  (let [resp (llm/query @llm-client
+  [{:keys [model max-tokens base-url]} system content-parts schema]
+  (let [client (if base-url (client-for-base-url base-url) @llm-client)
+        resp (llm/query client
                         {:model           model
                          :max-tokens      (or max-tokens 4096)
                          :system          system

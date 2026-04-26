@@ -141,6 +141,39 @@ re-fires that one.
 - **Sarcasm.** Both Haiku and gemma4 missed "Well, they're doing
   good" (sarcastic about California tax policy). The judge catches
   these consistently.
+- **`:llm` resolve fails on small local models.** Tested Mistral
+  Small 3.2 24B Q4 on the slice: it over-merged 36 unrelated
+  clusters into mega-clusters (one had 36 aliases spanning cancer,
+  COVID, mRNA, "Andy Stumpf's friend", and pharma). A separate
+  conservative merge-probe over the `:group` baseline produced
+  near-random adjacent pairings (1/8 correct). Holistic resolve at
+  this density needs a stronger reasoner — Anthropic Haiku-class
+  or better. For local models, `:group` is the floor and gives
+  98% record-grounding (run #3); the cost is uncollapsed cross-form
+  duplicates, which is bounded.
+- **Mistral all-stages tradeoff.** Run #5 (Mistral A+:group+C, slice)
+  hits 86% supported in 12 min (vs gemma's 98% in 35 min). Run #6
+  (full transcript, 114 min) hits 76% strict-supported on a 60-record
+  judge sample, with 22% partial — most partials are misattributed
+  entity_ids (same quote attached to multiple wrong entities at large
+  registry scale), not bad quotes. For "fast pass over a corpus"
+  Mistral wins; for "canonical analysis of one episode" gemma + meta
+  + :group is the best quality.
+
+## Tested configurations (Stumpf episode)
+
+| Run | Stages (A / B / C) | Strategy | Slice | Wall | Ents | Recs | Judge |
+|-----|--------|---|---|---|---|---|---|
+| 1   | haiku / haiku / haiku       | :llm    | 60   | ~2m  | 43  | 40  | 85% |
+| 2   | gemma / gemma / gemma       | :group  | 60   | 15m  | 208 | 60  | 95% |
+| 3   | gemma+meta / gemma / gemma  | :group  | 60   | 35m  | 181 | 53  | 98% |
+| 4   | gemma+meta / mistral / gemma | :llm  | 60   | 5m   | 145 | 56  | 96% (7 mega-clusters from over-merge) |
+| 5   | mistral+meta / mistral / mistral | :group | 60 | 12m | 51 | 43 | 86% |
+| 6   | mistral+meta / mistral / mistral | :group | 677 | 114m | 420 | 314 | 76% (sample 60) |
+
+All runs use the metadata-injection prompt for Stage A (host/guest
+names so "I"/"my" canonicalize correctly), except run 1 / run 2 which
+predate it.
 
 ## Files
 
