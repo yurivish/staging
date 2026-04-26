@@ -160,13 +160,33 @@
            s)
          s))
       ([s in-port m]
-       ;; Publish :recv on arrival, before the handler runs. Emitting it
-       ;; alongside :success (as we used to) made every pair atomic in the
-       ;; event log, so live consumers couldn't derive in-flight counts.
-       (emit! (trace/recv-event trace-sid m in-port))
-       (let [[s' port-map events] (run-step hmap m in-port s trace-sid step-sp cancel-p)]
-         (doseq [e events] (emit! e))
-         [s' port-map])))))
+       (cond
+         ;; Channel closed on a port not in the handler's declared :ins.
+         ;; Happens when ::flow/in-ports injects an input under a name
+         ;; the handler doesn't list. Don't dispatch — that would add a
+         ;; non-declared key to ::closed-ins and break run-done's
+         ;; (= closed all-ins) test, permanently blocking cascade.
+         ;; Framework's read loop already dissocs the chan on the first
+         ;; nil read.
+         (and (nil? m) (not (contains? ins in-port)))
+         [s {}]
+
+         :else
+         ;; `or` branch: when m is nil, the channel was closed and
+         ;; core.async.flow has called us once with nil before dropping
+         ;; the chan. Synthesize a fresh done envelope so the rest of
+         ;; the pipeline (recv-event, run-step → run-done, ::closed-ins,
+         ;; cascade, auto-append) runs identically to an envelope-done
+         ;; arrival. Lineage gap is intrinsic — close has no upstream
+         ;; message to attribute to.
+         (let [m (or m (msg/new-done))]
+           ;; Publish :recv on arrival, before the handler runs. Emitting it
+           ;; alongside :success (as we used to) made every pair atomic in the
+           ;; event log, so live consumers couldn't derive in-flight counts.
+           (emit! (trace/recv-event trace-sid m in-port))
+           (let [[s' port-map events] (run-step hmap m in-port s trace-sid step-sp cancel-p)]
+             (doseq [e events] (emit! e))
+             [s' port-map])))))))
 
 ;; ============================================================================
 ;; Instrumentation — subflow inlining + endpoint resolution

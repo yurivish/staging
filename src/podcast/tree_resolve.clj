@@ -66,11 +66,14 @@ CLUSTERING RULES — read these carefully:
     - Generic stage props or ambient referents mentioned in passing without sustained attention (\"this table\", \"the road\", \"a note\", \"a bag of masks\" if just mentioned once as a prop).
     - Pure rhetorical framings (\"an inconvenient fact\", \"the situation\", \"the claim that X\") — these are descriptions of speech acts, not entities. Drop them.
 
+ALWAYS CLUSTER the speakers and named persons:
+  - Stage A's `guess` column gives a canonical name for each mention (often resolving \"I\" / \"you\" / \"he\" to the actual person using episode metadata). If `guess` is a named person, place, or organization, that mention IS for an entity — cluster it under that name even if no literal name appears in the FOCUS paragraphs. The host and guest of the podcast almost always appear as \"I\" / \"my\" / \"you\" mentions and MUST appear in your registry.
+
 For each canonical entity you DO output:
   - entity_id: a stable id you assign (e_001, e_002, ...).
   - canonical: the most specific full name available, or a short noun phrase if no name.
   - summary: ONE sentence (≤ 25 words) describing what this entity IS in the transcript — concrete and grounded in the surrounding paragraphs. Downstream merge steps will read this in place of the transcript.
-  - mention_indices: the integer indices (the leftmost number on each MENTIONS row) of the input mentions that belong to this entity. It is FINE to leave a mention unassigned if it's an incidental referent that doesn't deserve its own entity — not every mention must be clustered.
+  - mention_indices: the integer indices (the leftmost number on each MENTIONS row) of the input mentions that belong to this entity. Leave a mention unassigned ONLY when it falls under \"DO NOT CREATE AN ENTITY FOR\" above; every other mention must be clustered into some entity.
 
 If a referent is genuinely ambiguous between two entities you've created, give it its own entity rather than guessing.
 
