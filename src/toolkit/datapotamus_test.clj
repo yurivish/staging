@@ -1739,6 +1739,145 @@
     (is (= :completed (:state res)))
     (is (= [[4] [6] [8] [10]] (:outputs res)))))
 
+;; ----------------------------------------------------------------------------
+;; stealing-workers — work-stealing sibling of `workers`.
+;;
+;; The combinator's design: 1 feeder + K shims + K inners + 1 join. The feeder
+;; declares K output ports all merged to a shared core.async channel via
+;; ::flow/out-ports. K shims read from that shared channel via ::flow/in-ports.
+;; Multi-taker on a single channel = queue-group dispatch, intrinsic to
+;; core.async. The feeder's :on-all-closed default fires auto-append on all K
+;; declared outputs, writing K done envelopes onto the shared queue — exactly
+;; one for each shim. Each shim sets ::flow/input-filter on cascade so it
+;; can't grab a sibling's done before the framework's read loop sees its own
+;; state update.
+;;
+;; Tests below mirror the `workers` suite where they apply, plus a wall-clock
+;; assertion that demonstrates work-stealing actually rebalances skewed load.
+;; ----------------------------------------------------------------------------
+
+(deftest stealing-workers-exactly-once-delivery
+  (let [wf  (c/stealing-workers :pool 4 (step/step :id identity))
+        res (flow/run-seq wf (range 20))]
+    (is (= :completed (:state res)))
+    ;; Each input produces exactly one output with the same value;
+    ;; no drops, no duplicates. (run-seq attributes by lineage, so
+    ;; :outputs is in input order regardless of dispatch race.)
+    (is (= (mapv vector (range 20)) (:outputs res)))))
+
+(deftest stealing-workers-done-cascade-fires-once
+  (let [wf (step/serial
+            (c/stealing-workers :pool 3 (step/passthrough :w))
+            (step/sink))
+        h  (start! wf)]
+    (flow/inject! h {})
+    (flow/await-quiescent! h)
+    (let [result (stop! h)
+          dones  (events-of result :recv :done)]
+      (is (= :completed (:state result)))
+      ;; One done arrives at the sink — not K. The K shims each take one
+      ;; auto-appended done from the feeder, cascade independently through
+      ;; their inner, and the join's K-input cascade dedupes to 1.
+      (is (= 1 (count (filter #(= :sink (:step-id %)) dones)))))))
+
+(deftest stealing-workers-k-1-degenerate
+  (let [wf  (c/stealing-workers :pool 1 (step/step :inc inc))
+        res (flow/run-seq wf [1 2 3])]
+    (is (= :completed (:state res)))
+    (is (= [[2] [3] [4]] (:outputs res)))))
+
+(deftest stealing-workers-preserve-tokens
+  (let [wf (step/serial
+            (step/step :inc inc)
+            (c/stealing-workers :pool 3 (step/step :noop identity))
+            (step/sink))
+        h  (start! wf)]
+    (try
+      (flow/inject! h {:data 1 :tokens {"g" 7}})
+      (flow/await-quiescent! h)
+      (let [result    (stop! h)
+            sink-recv (first (filter #(and (= :sink (:step-id %))
+                                           (= :recv (:kind %))
+                                           (= :data (:msg-kind %)))
+                                     (:events result)))]
+        (is (some? sink-recv))
+        (is (= {"g" 7} (:tokens sink-recv))))
+      (finally
+        (when-not (realized? (::flow/cancel h)) (stop! h))))))
+
+(deftest stealing-workers-route-signals-not-broadcast
+  ;; A signal arrives at the feeder; the feeder emits on a single port
+  ;; (:q0), which writes one signal onto the shared queue. Exactly one
+  ;; shim takes it, forwards it to its inner, and downstream sees one
+  ;; signal — not K.
+  (let [wf (step/serial
+            (c/stealing-workers :pool 4 (step/passthrough :w))
+            (step/sink))
+        h  (start! wf)]
+    (try
+      (flow/inject! h {:tokens {"g" 9}})
+      (flow/await-quiescent! h)
+      (let [result (stop! h)
+            sigs   (filterv #(and (= :sink (:step-id %))
+                                  (= :recv (:kind %))
+                                  (= :signal (:msg-kind %)))
+                            (:events result))]
+        (is (= 1 (count sigs)))
+        (is (= {"g" 9} (:tokens (first sigs)))))
+      (finally
+        (when-not (realized? (::flow/cancel h)) (stop! h))))))
+
+(deftest stealing-workers-accepts-composite-step
+  (let [inner (step/serial (step/step :a inc) (step/step :b #(* 2 %)))
+        wf    (step/serial (c/stealing-workers :pool 2 inner))
+        res   (flow/run-seq wf [1 2 3 4])]
+    (is (= :completed (:state res)))
+    (is (= [[4] [6] [8] [10]] (:outputs res)))))
+
+(deftest stealing-workers-inner-emits-multiple
+  ;; Each input fans out to two children inside `inner`. K=2 workers,
+  ;; 3 inputs → 6 outputs total, attributed correctly by lineage.
+  (let [inner  (step/step :double {:ins {:in ""} :outs {:out ""}}
+                          (fn [ctx _ d]
+                            {:out [(msg/child ctx d) (msg/child ctx (- d))]}))
+        wf     (c/stealing-workers :pool 2 inner)
+        result (flow/run-seq wf [1 2 3])]
+    (is (= :completed (:state result)))
+    (is (= [#{1 -1} #{2 -2} #{3 -3}]
+           (mapv set (:outputs result))))))
+
+(deftest stealing-workers-distributes-skewed-load
+  ;; The point of this combinator. With round-robin (`workers`), items at
+  ;; even indices go to w0 and odd to w1. If costs are correlated with
+  ;; index parity — e.g., every odd item is slow — round-robin pins all
+  ;; the slow work to one worker and gates wall-clock on that. Work-
+  ;; stealing rebalances dynamically: idle workers grab the next slow
+  ;; item instead of waiting.
+  ;;
+  ;; Compare directly to `workers` rather than asserting an absolute
+  ;; bound: timing noise (GC, scheduling, JIT warmup) cancels out in
+  ;; the ratio, giving a stable signal. Optimal ratio = 220/400 ≈ 0.55;
+  ;; bound at 0.75 leaves margin for variance while still falsifying a
+  ;; regression to round-robin behavior.
+  (let [items   [200 10 200 10 200 10 200 10]   ; alternating slow/fast ms
+        slow    (step/step :sleep
+                           (fn [d] (Thread/sleep (long d)) d))
+        time!   (fn [wf]
+                  (let [t0 (System/currentTimeMillis)]
+                    (flow/run-seq wf items)
+                    (- (System/currentTimeMillis) t0)))
+        rr-time (time! (c/workers :pool 2 slow))
+        ws-time (time! (c/stealing-workers :pool 2 slow))]
+    ;; Optimal: rr ≈ 800 ms (slow worker pinned to all four 200s),
+    ;; ws ≈ 420 ms (rebalanced). Ratio ≈ 0.53. The ws topology has
+    ;; a few more hops than rr (feeder + shim + inner vs router +
+    ;; inner) so its per-item overhead is higher — bound at 0.85 to
+    ;; leave room for that overhead and JVM/scheduling jitter while
+    ;; still clearly falsifying a regression to round-robin dispatch.
+    (is (< ws-time (* 0.85 rr-time))
+        (str "stealing-workers=" ws-time "ms, workers (round-robin)=" rr-time
+             "ms; expected ws < 0.85 * rr"))))
+
 ;; ============================================================================
 ;; Act XVII — Agent workflow patterns
 ;;

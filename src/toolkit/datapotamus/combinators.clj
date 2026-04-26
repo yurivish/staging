@@ -23,10 +23,14 @@
    hand it a composed step as a port's value. A fan-out's id doubles
    as its group name; `fan-in` references the fan-out by that id.
 
-   `workers` is a different axis: K round-robin copies of one inner
-   step for stream-level throughput parallelism — unrelated to the
-   scatter-gather pair above."
-  (:require [toolkit.datapotamus.msg :as msg]
+   `workers` and `stealing-workers` are a different axis: K parallel
+   copies of one inner step for stream-level throughput parallelism —
+   unrelated to the scatter-gather pair above. `workers` partitions
+   work statically (round-robin); `stealing-workers` lets workers race
+   for a single shared queue (work-stealing)."
+  (:require [clojure.core.async :as a]
+            [clojure.core.async.flow :as-alias flow]
+            [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.token :as tok]))
 
@@ -242,4 +246,129 @@
                                    [[w :out]    [:join (join-ins i)]]])
                                 (range) ws))
          pool      {:procs procs :conns conns :in :router :out :join}]
+     {:procs {id pool} :conns [] :in id :out id})))
+
+(defn stealing-workers
+  "K parallel copies of `inner` sharing a single bounded queue. Workers
+   race for each item — whichever finishes its previous one pulls the
+   next, so slow items don't gate fast ones and overall wall-clock
+   approaches `total-work / k` rather than `max-item × ceil(n/k)`.
+
+   Best fit: I/O-bound stages with embarrassingly-parallel, homogeneous
+   items where per-item cost varies (LLM calls, HTTP fetches, batch
+   jobs).
+
+   Use `workers` instead when:
+     - Workers hold per-worker state (warmed contexts, primed caches,
+       sticky connections) — work-stealing throws away locality.
+     - Each worker has its own rate-limit bucket (one API key per
+       worker) — a free worker can take consecutive items and blow
+       through one bucket while the others sit idle.
+     - Items must route to a specific worker (consistent hashing,
+       sticky-by-key, ordered-by-key).
+     - Items are sub-millisecond (queue contention dominates).
+
+   Order is NOT preserved. Tag items upstream and re-sort downstream
+   if you need order. Same trace topology as `workers`: each worker
+   runs in its own proc inside a nested step named `id`, so events
+   carry `[:scope id]` and per-worker events add `[:scope wN]` below
+   that. Backpressure arrives via the queue's bound: when every
+   worker is busy and the queue is full, the feeder blocks.
+
+   `inner` may be a handler-map or a step; internal sids are prefixed
+   per-worker so state is isolated.
+
+   Implementation note. K worker procs share a single `core.async`
+   channel via `::flow/in-ports`. The feeder declares K output ports,
+   all merged onto the shared channel via `::flow/out-ports`, so the
+   framework's done auto-append (one per declared output) writes K
+   done envelopes — one for each worker. Each worker shim takes
+   exactly one done (by setting `::flow/input-filter` after its first
+   close, so subsequent dones are taken by sibling shims). This gives
+   work-stealing for the data path and a clean per-shim cascade for
+   the done path, all within flow's normal counter accounting."
+  ([k inner]    (stealing-workers (gensym "stealing-workers-") k inner))
+  ([id k inner]
+   (assert (pos-int? k) "stealing-workers: k must be a positive integer")
+   (let [shared-q (a/chan k)
+         q-ports  (mapv #(keyword (str "q" %)) (range k))
+         shim-ids (mapv #(keyword (str "s" %)) (range k))
+         ws       (mapv #(keyword (str "w" %)) (range k))
+         join-ins (mapv #(keyword (str "in" %)) (range k))
+
+         ;; Feeder: 1 input from upstream, K declared outputs all
+         ;; pointing at `shared-q` via the in-ports merge. :on-data
+         ;; emits on :q0 (one write per item). :on-all-closed default
+         ;; → auto-append fires on all K outputs → K done envelopes
+         ;; written to `shared-q`, one for each shim to consume.
+         feeder    (step/handler-map
+                    {:ports {:ins {:in ""} :outs (zipmap q-ports (repeat ""))}
+                     :on-init (fn []
+                                {::flow/out-ports
+                                 (zipmap q-ports (repeat shared-q))})
+                     :on-data   (fn [ctx _ _]
+                                  {(first q-ports) [(msg/pass ctx)]})
+                     :on-signal (fn [ctx _]
+                                  {(first q-ports) [(msg/signal ctx)]})})
+
+         ;; Idle sink wired to the feeder's K declared output ports so
+         ;; validate-wired-outs! sees them as connected. The actual writes
+         ;; from the feeder go to `shared-q` via the ::flow/out-ports
+         ;; init-time merge override, so the framework-allocated channel
+         ;; behind these conns is never written to and `:drop` never wakes.
+         drop-sink (step/handler-map
+                    {:ports     {:ins {:in ""} :outs {}}
+                     :on-data   (fn [_ _ _] {})
+                     :on-signal (fn [_ _]   {})})
+
+         ;; Shim: K independent procs all reading from `shared-q` via
+         ;; in-ports. Forwards data/signals to its own :to-inner port,
+         ;; which is wired by :conns to its inner's :in. On :on-all-closed
+         ;; (fired by an envelope-done arriving on :queue), sets an
+         ;; ::flow/input-filter that excludes :queue so a fast shim
+         ;; can't grab a sibling's done envelope on its next iteration.
+         shim      (step/handler-map
+                    {:ports     {:ins {:queue ""} :outs {:to-inner ""}}
+                     :on-init   (fn [] {::flow/in-ports {:queue shared-q}})
+                     :on-data   (fn [ctx _ _]   {:to-inner [(msg/pass ctx)]})
+                     :on-signal (fn [ctx _]     {:to-inner [(msg/signal ctx)]})
+                     :on-all-closed
+                     (fn [_ s]
+                       [(assoc s ::flow/input-filter (fn [cid] (not= cid :queue)))
+                        {}])})
+
+         join      (step/handler-map
+                    {:ports {:ins (zipmap join-ins (repeat ""))
+                             :outs {:out ""}}
+                     :on-data (fn [ctx _ _] {:out [(msg/pass ctx)]})})
+
+         procs     (clojure.core/merge
+                    {:feeder feeder :drop drop-sink :join join}
+                    (zipmap shim-ids (repeat shim))
+                    (zipmap ws (repeat inner)))
+
+         conns     (vec (concat
+                         ;; Stub conns to satisfy validate-wired-outs! for
+                         ;; the K declared feeder outputs. The framework
+                         ;; allocates one channel for `[:drop :in]` and
+                         ;; points each `[:feeder :qN]`'s out-chan at it
+                         ;; (1:1 connect → shared chan); the ::flow/out-ports
+                         ;; merge then overrides each cid's write target to
+                         ;; `shared-q`, so nothing actually flows through
+                         ;; the drop chan.
+                         (mapv (fn [q] [[:feeder q] [:drop :in]]) q-ports)
+                         ;; Shim→inner buffer is 1: a shim must block until
+                         ;; its inner has consumed the previous item before
+                         ;; pulling the next from `shared-q`. Without this
+                         ;; (default buf=10), a fast shim drains many items
+                         ;; from shared-q into inner's queue before inner
+                         ;; finishes one, defeating work-stealing — items
+                         ;; end up statically partitioned among the shims
+                         ;; rather than rebalancing on inner-cost variation.
+                         (mapcat (fn [i s w]
+                                   [[[s :to-inner] [w :in] {:buf-or-n 1}]
+                                    [[w :out]      [:join (join-ins i)]]])
+                                 (range) shim-ids ws)))
+
+         pool      {:procs procs :conns conns :in :feeder :out :join}]
      {:procs {id pool} :conns [] :in id :out id})))

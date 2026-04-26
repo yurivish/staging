@@ -221,26 +221,27 @@
   (testing "scenario A: close immediately"
     (let [{:keys [events counters]} (close-scenario [])
           probe-shapes (shapes-for events :probe)]
-      (testing "exactly one :recv (the synthesized done)"
+      (testing "probe: exactly one :recv (the synthesized done) on :in"
         (is (= 1 (count (:recv probe-shapes))))
         (is (= {:kind :recv :msg-kind :done :step-id :probe :in-port :in}
                (first (:recv probe-shapes)))))
-      (testing "exactly one :send-out for the auto-appended done on :out"
+      (testing "probe: exactly one :send-out for the auto-appended done on :out"
         (is (= 1 (count (:send-out probe-shapes))))
         (is (= {:kind :send-out :msg-kind :done :step-id :probe :port :out}
                (first (:send-out probe-shapes)))))
-      (testing "exactly one :success"
+      (testing "probe: exactly one :success"
         (is (= 1 (count (:success probe-shapes))))
         (is (= :done (-> probe-shapes :success first :msg-kind))))
-      (testing "counters: 1 send-out → sent=1; 1 recv; 1 success → completed=1"
-        (is (= {:sent 1 :recv 1 :completed 1} counters)))))
+      (testing "counters: probe (sent +1 send-out, recv +1, completed +1) +
+                          sink   (recv +1 done arrival, completed +1, no sent)"
+        (is (= {:sent 1 :recv 2 :completed 2} counters)))))
   (testing "scenario B: envelope-done"
     (let [{:keys [events counters]} (envelope-scenario [])
           probe-shapes (shapes-for events :probe)]
       (is (= 1 (count (:recv probe-shapes))))
       (is (= 1 (count (:send-out probe-shapes))))
       (is (= 1 (count (:success probe-shapes))))
-      (is (= {:sent 1 :recv 1 :completed 1} counters))))
+      (is (= {:sent 1 :recv 2 :completed 2} counters))))
   (testing "shapes are identical between scenarios (I-1)"
     (is (equivalent? []))))
 
@@ -388,7 +389,9 @@
                 {:ports   {:ins {:queue ""} :outs {:out ""}}
                  :on-init (fn [] {::caf/in-ports {:queue test-chan}})
                  :on-data (fn [ctx _s _d] {:out [(msg/pass ctx)]})})
-          wf {:procs {:probe hmap} :conns [] :in :probe :out :probe}
+          wf {:procs {:probe hmap :sink (absorbing-sink)}
+              :conns [[[:probe :out] [:sink :in]]]
+              :in :probe :out :sink}
           h  (start-with-events wf)]
       (try
         (a/close! test-chan)
@@ -458,10 +461,14 @@
                              (swap! seen conj (:in-port ctx))
                              {})})
           h (start-with-events
-             {:procs {:probe hmap} :conns [] :in :probe :out :probe})]
+             {:procs {:probe hmap :sink (absorbing-sink)}
+              :conns [[[:probe :out] [:sink :in]]]
+              :in :probe :out :sink})]
       (try
         (a/>!! extra-chan (msg/new-msg :hello))
-        (success-of h :probe 1)
+        ;; one :on-data invocation on the probe — no :send-out (handler returns {}),
+        ;; so we use a raw event poll instead of success-of (which expects :success).
+        (wait-for-event h #(and (= :success (:kind %)) (= :probe (:step-id %))) 1)
         (is (= [:queue] @seen)
             "data on undeclared ::flow/in-ports port is delivered to :on-data")
         (finally (stop! h))))))
@@ -491,17 +498,12 @@
       (finally (stop! h)))))
 
 (deftest d1b-recv-event-shape-equivalent-to-envelope-done
-  (let [shape-of (fn [pre]
-                   (-> (single-input-probe (a/chan))
-                       (start-with-events)
-                       (as-> h (do (a/close! (-> h ::evs deref :ignored))
-                                   nil))))]
-    ;; Compare just the projected shape across both scenarios.
-    (let [a (close-scenario [])
-          b (envelope-scenario [])
-          ar (-> (shapes-for (:events a) :probe) :recv first)
-          br (-> (shapes-for (:events b) :probe) :recv first)]
-      (is (= ar br) "recv-event projections match"))))
+  ;; Compare just the projected recv-event shape across both scenarios.
+  (let [a (close-scenario [])
+        b (envelope-scenario [])
+        ar (-> (shapes-for (:events a) :probe) :recv first)
+        br (-> (shapes-for (:events b) :probe) :recv first)]
+    (is (= ar br) "recv-event projections match")))
 
 ;; ============================================================================
 ;; E. Counter parity
@@ -541,7 +543,9 @@
                  :on-data       (fn [_ s _] [s {}])
                  :on-all-closed (fn [_ _] (throw (ex-info "boom" {})))})
           h (start-with-events
-             {:procs {:probe hmap} :conns [] :in :probe :out :probe})]
+             {:procs {:probe hmap :sink (absorbing-sink)}
+              :conns [[[:probe :out] [:sink :in]]]
+              :in :probe :out :sink})]
       (try
         (a/close! c)
         (wait-for-event h #(and (= :failure (:kind %)) (= :probe (:step-id %))) 1)
