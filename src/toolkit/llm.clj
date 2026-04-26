@@ -72,18 +72,29 @@
     (throw (ex-info "llm: invalid request"
                     {:errors (me/humanize explanation)}))))
 
+(def ^:private default-timeout-ms
+  "10-minute idle timeout. Reasoning models (Gemma 4, o1, claude-opus
+   with thinking) routinely take minutes on a single response;
+   http-kit's default 60s is too tight. Override per-call with
+   `:timeout-ms` on the request."
+  600000)
+
 (defn query
   "Performs the HTTP call. `provider` is a map of two pure fns:
      {:->request      (fn [request] {:url :headers :body})
       :parse-response (fn [response-map] unified-result)}
-   produced by e.g. (anthropic/client api-key)."
-  [{:keys [->request parse-response]} request]
-  (validate-request! request)
+   produced by e.g. (anthropic/client api-key).
+
+   `request` may carry `:timeout-ms` to override the default 10-minute
+   idle timeout for slow / reasoning-heavy models."
+  [{:keys [->request parse-response]} {:keys [timeout-ms] :as request}]
+  (validate-request! (dissoc request :timeout-ms))
   (let [{:keys [url headers body]} (->request request)
         body (deep-merge body (:provider-extra request))
         {:keys [status body error]}
         @(http/post url {:headers (merge {"Content-Type" "application/json"} headers)
-                         :body    (json/write-str body)})]
+                         :body    (json/write-str body)
+                         :timeout (or timeout-ms default-timeout-ms)})]
     (when error
       (throw (ex-info "llm: http error" {} error)))
     (when-not (= 200 status)
