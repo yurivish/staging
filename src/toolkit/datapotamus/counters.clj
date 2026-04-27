@@ -1,57 +1,56 @@
 (ns toolkit.datapotamus.counters
   "Flow counters — sent/recv/completed.
 
-   Shared across the inject thread and every proc thread, so the fields
-   are `LongAdder`s (low-contention concurrent bumps). A defrecord keeps
-   the shape fixed and gives direct field access so the hot path avoids
-   map lookups and per-call type hints."
-  (:import [java.util.concurrent.atomic LongAdder]))
+   Shared across the inject thread and every proc thread. The three counts
+   live together inside one atom so a single deref gives an atomic
+   snapshot — quiescence detection has to read all three coherently or it
+   can false-positive at a moment when the three sums happen to coincide
+   while real work is still in flight, drop `done-p`, and lose mid-flight
+   messages.")
 
-(defrecord Counters [^LongAdder sent ^LongAdder recv ^LongAdder completed])
+(defrecord Counters [^long sent ^long recv ^long completed])
 
 (defn make []
-  (->Counters (LongAdder.) (LongAdder.) (LongAdder.)))
+  (atom (->Counters 0 0 0)))
+
+(defn- balanced-record? [^Counters c]
+  (and (pos? (.-sent c))
+       (= (.-sent c) (.-recv c))
+       (= (.-recv c) (.-completed c))))
 
 (defn balanced?
-  "True iff some work has been sent and sent = recv = completed.
-
-   Reads each LongAdder's sum independently — not atomic across the
-   three. Under concurrent writes a transient skew can produce a false
-   negative; it cannot produce a false positive for long, because the
-   counters are monotonic and balance is a steady state. Callers use
-   this as a steady-state quiescence check, not a mid-flight consistency
-   claim."
-  [^Counters c]
-  (let [s  (.sum (.-sent c))
-        r  (.sum (.-recv c))
-        co (.sum (.-completed c))]
-    (and (pos? s) (= s r) (= r co))))
+  "True iff some work has been sent and sent = recv = completed. Atomic
+   across the three fields — `@counters` is one snapshot."
+  [counters]
+  (balanced-record? @counters))
 
 (defn record-event!
-  "Apply an event's counter delta in place. Returns `true` iff this event
-   advanced `completed` and the flow is now balanced (potentially
-   quiescent). Only completion-advancing events can close the gap, so
-   every other kind returns `false` without reading the counters."
-  [^Counters c ev]
+  "Apply an event's counter delta atomically. Returns `true` iff this
+   event advanced `completed` and the flow is now balanced (potentially
+   quiescent). The completion path checks balance against the post-swap
+   value, so the answer reflects the same atomic snapshot the increment
+   produced."
+  [counters ev]
   (case (:kind ev)
-    :recv     (do (.increment (.-recv c)) false)
-    :send-out (do (when (:port ev) (.increment (.-sent c))) false)
+    :recv     (do (swap! counters update :recv unchecked-inc)
+                  false)
+    :send-out (do (when (:port ev)
+                    (swap! counters update :sent unchecked-inc))
+                  false)
     (:success :failure)
-      (do (.increment (.-completed c)) (balanced? c))
+    (balanced-record? (swap! counters update :completed unchecked-inc))
     false))
 
 (defn record-inject!
   "Count a message injected into the flow from outside. The inject path
    has no corresponding event to dispatch on — it just ticks `:sent`."
-  [^Counters c]
-  (.increment (.-sent c)))
+  [counters]
+  (swap! counters update :sent unchecked-inc))
 
 (defn snapshot
-  "Plain-map view of the current counts. Each `.sum` is read
-   independently, so the three values may come from slightly different
-   moments; callers that need a consistent triple should treat the
-   snapshot as eventually-consistent."
-  [^Counters c]
-  {:sent      (.sum (.-sent c))
-   :recv      (.sum (.-recv c))
-   :completed (.sum (.-completed c))})
+  "Plain-map view of the current counts, read atomically."
+  [counters]
+  (let [c @counters]
+    {:sent      (.-sent ^Counters c)
+     :recv      (.-recv ^Counters c)
+     :completed (.-completed ^Counters c)}))
