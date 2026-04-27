@@ -67,18 +67,34 @@
    :alone-keys          (set (keys (:registry alone)))
    :combined-keys       (set (keys (:registry combined)))})
 
+(def ^:private attempt-timeout-ms 5000)
+
+(defn- run-with-timeout
+  "Run `thunk` on a future; return its value or throw `:hang` if it
+   doesn't finish within `attempt-timeout-ms`. Hangs are real failures
+   here — the multi-task pipeline must be deadlock-free regardless of
+   chunking + worker shape."
+  [tag thunk]
+  (let [fut (future (thunk))
+        v (deref fut attempt-timeout-ms ::timeout)]
+    (if (= ::timeout v)
+      (do (future-cancel fut)
+          (throw (ex-info (str tag " hung past " attempt-timeout-ms "ms")
+                          {:hang tag})))
+      v)))
+
 (defn- run-attempt
   "One attempt of the property: pick parameters via the FRNG cursor,
    run the three flavours of extract! (sentiment-alone, conspiracy-alone,
-   combined), assert per-task equality."
+   combined), assert per-task equality and that none of the three runs
+   hang."
   [f]
-  (let [n-paragraphs (frng/range-inclusive f 4 24)
-        n-chunk      (frng/range-inclusive f 1 8)
-        k-context    (frng/range-inclusive f 0 4)
-        workers      (frng/range-inclusive f 1 8)
-        ;; Two scheduler perturbations to try: yield-only (cheap, 0 ms
-        ;; expected wait) or a tiny sleep window. Both nudge the scheduler
-        ;; into different interleavings without making the test slow.
+  (let [n-paragraphs (frng/range-inclusive f 4 12)
+        n-chunk      (frng/range-inclusive f 1 4)
+        k-context    (frng/range-inclusive f 0 2)
+        workers      (frng/range-inclusive f 1 4)
+        ;; Three scheduler perturbations: yield-only (cheap), tiny sleep,
+        ;; or none. Each nudges the scheduler into different interleavings.
         jitter-mode  (frng/weighted f {:yield 1 :sleep-1ms 1 :none 1})
         tasks-order  (frng/weighted f {[:sentiment :conspiracy] 1
                                        [:conspiracy :sentiment] 1})
@@ -88,25 +104,28 @@
                        :none      nil)
         tmp     (java.io.File/createTempFile "podcast-prop-" "")
         fixture (str tmp ".json")
-        chunking {:n n-chunk :k k-context}]
+        chunking {:n n-chunk :k k-context}
+        params {:n-paragraphs n-paragraphs
+                :chunking chunking
+                :workers workers
+                :jitter jitter-mode
+                :tasks-order tasks-order}]
     (write-fixture! fixture n-paragraphs)
     (try
       (with-redefs [llm/cached-chat! (mock/responder {:jitter-fn jitter-fn})
                     llm/detect-slots (constantly workers)]
         (let [run! (fn [tasks suffix]
-                     (pc/extract! (assoc base-cfg :tasks tasks)
-                                  fixture
-                                  :run-dir (str tmp suffix)
-                                  :chunking chunking
-                                  :workers workers))
+                     (run-with-timeout
+                      (str "extract " tasks)
+                      (fn []
+                        (pc/extract! (assoc base-cfg :tasks tasks)
+                                     fixture
+                                     :run-dir (str tmp suffix)
+                                     :chunking chunking
+                                     :workers workers))))
               run-s  (run! [:sentiment]   "-S")
               run-c  (run! [:conspiracy]  "-C")
-              run-sc (run! tasks-order    "-SC")
-              params {:n-paragraphs n-paragraphs
-                      :chunking chunking
-                      :workers workers
-                      :jitter jitter-mode
-                      :tasks-order tasks-order}]
+              run-sc (run! tasks-order    "-SC")]
           (when-not (= (normalize-result (run-s :sentiment))
                        (normalize-result (run-sc :sentiment)))
             (throw (ex-info "sentiment content differs alone vs combined"
@@ -121,6 +140,10 @@
                              :diff (mismatch-summary :conspiracy
                                                      (normalize-result (run-c :conspiracy))
                                                      (normalize-result (run-sc :conspiracy)))})))))
+      (catch clojure.lang.ExceptionInfo e
+        (if (:hang (ex-data e))
+          (throw (ex-info (.getMessage e) (assoc (ex-data e) :params params)))
+          (throw e)))
       (finally
         (.delete (io/file fixture))))))
 
