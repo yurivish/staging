@@ -104,6 +104,10 @@
 (def ^:private llm-client local-client)
 
 (defn- cache-key [stage model system content-parts schema]
+  ;; Per-task cache isolation is implicit: `system` (prompt) and `schema`
+  ;; differ between tasks at every stage, so the same chunk under sentiment
+  ;; vs. conspiracy hashes to distinct keys without `:task` in the mix. If a
+  ;; future change deduplicates prompts/schemas across tasks, add :task here.
   (cache/key-bytes-of (str (name stage) "\n--\n" model
                            "\n--\n" system
                            "\n--\n" (pr-str content-parts)
@@ -184,17 +188,12 @@
        (string? (:quote m))
        (quote-matches? (paragraphs-by-id (:paragraph_id m)) (:quote m))))
 
-(defn- well-formed-entity? [id-key e]
-  (and (not (str/blank? (id-key e)))
-       (not (str/blank? (:canonical e)))))
-
 (defn- partition-by-pred [pred xs]
   (reduce (fn [acc x] (if (pred x) (update acc :valid conj x) (update acc :rejected conj x)))
           {:valid [] :rejected []} xs))
 
 ;; ============================================================================
-;; 4. Prompt rendering — paragraphs and mentions get pretty-printed
-;;    once each; both configs share these.
+;; 4. Prompt rendering — paragraphs get pretty-printed once.
 ;; ============================================================================
 
 (defn- render-paragraph [{:keys [id timestamp text]}]
@@ -212,15 +211,6 @@
               "\n\n=====\n\n"))
        "FOCUS (extract from these paragraphs only):\n\n"
        (render-paragraphs focus)))
-
-(defn- render-mentions
-  "Compact one-line-per-mention list with stable indices."
-  [mentions]
-  (str/join "\n"
-            (map-indexed (fn [i {:keys [paragraph_id mention_text surface_form]}]
-                           (format "%d. [%s] mention=%s surface=%s"
-                                   i paragraph_id (pr-str mention_text) (pr-str surface_form)))
-                         mentions)))
 
 ;; ============================================================================
 ;; 5. JSON-Schema fragments. Standard shape (`:type "string" :enum [...]`),
@@ -243,23 +233,6 @@
                                        :description "The exact word(s) used in the focus paragraph — e.g. \"him\", \"the president\", \"that thing\"."}}
                        :required ["paragraph_id" "mention_text" "surface_form"]}}}
    :required ["mentions"]})
-
-(defn- resolve-schema [id-key item-noun]
-  {:type "object"
-   :properties
-   {:entities {:type "array"
-               :description (str "Canonical " item-noun "s, clustered from the input mentions.")
-               :items {:type "object"
-                       :properties
-                       {id-key {:type "string"
-                                :description (str "Stable ID for this " item-noun " (you assign — \"e_001\", \"e_002\", ...).")}
-                        :canonical {:type "string"
-                                    :description (str "The canonical name (or short noun phrase) for this " item-noun ".")}
-                        :mention_indices {:type "array"
-                                          :description "Indices (0-based) of input mentions that refer to this entity."
-                                          :items {:type "integer"}}}
-                       :required [(name id-key) "canonical" "mention_indices"]}}}
-   :required ["entities"]})
 
 (defn- record-schema [id-key extra-props extra-required]
   {:type "object"
@@ -333,51 +306,6 @@ Be COMPLETE — list every distinct theory reference, including repeated referen
 
 Respond with a JSON object conforming to the supplied schema. Output nothing else.")
 
-(def ^:private sentiment-resolve-system
-  "You are clustering raw entity mentions from a podcast transcript into a canonical registry.
-
-You are given THREE inputs:
-1. The full episode transcript as a document — paragraphs are tagged with their IDs (e.g. [t96-23]). The episode metadata in `context` names the host and guest. Use the transcript to verify referents whenever you're uncertain.
-2. Episode metadata in the document's `context` field, which names the host and guest.
-3. A numbered list of mentions extracted per chunk. Each row has a paragraph_id, a `surface_form` (the literal text from that paragraph — a name, a pronoun, a description) and a `mention_text` (the per-chunk extractor's guess at canonicalisation, which can be inconsistent across mentions of the same person — including hallucinated names or wrong attributions).
-
-Cluster mentions into canonical entities:
-- The HOST and the GUEST are the two speakers; the metadata gives their names. \"I\" / \"me\" / \"my\" alternate between them depending on conversational turn — read the surrounding paragraphs in the transcript to decide which speaker each self-reference belongs to.
-- A name that appears in the transcript may refer to a third party even if some chunks' mention_text guessed it was the speaker. Verify with the document.
-- Pronouns (\"him\", \"that guy\") attach to the most recent named referent, which may sit a few paragraphs above the mention's own paragraph_id.
-- \"Trump\", \"the president\", \"him\" (when context indicates Trump) all belong together. \"Bill Gates\" and \"Bezos\" are separate entities even if both are billionaires.
-
-For each canonical entity, output:
-- entity_id: a stable ID you assign (e_001, e_002, ...).
-- canonical: the most specific full name available, or a noun phrase if no name (e.g. \"the unnamed cancer patient\").
-- mention_indices: the integer indices (0-based) of the input mentions that belong to this entity. Aliases will be derived from these — DO NOT include an alias field.
-
-If a mention is genuinely ambiguous (you can't tell from the transcript which of two entities it refers to), give it its own entity. It's better to over-split than to merge wrongly.
-
-Respond with a JSON object conforming to the supplied schema. Output nothing else.")
-
-(def ^:private conspiracy-resolve-system
-  "You are clustering raw conspiracy-theory mentions from a podcast transcript into a canonical registry.
-
-You are given THREE inputs:
-1. The full episode transcript as a document — paragraphs are tagged with their IDs (e.g. [t96-23]). Use the transcript to disambiguate when two mentions might refer to the same theory.
-2. Episode metadata in the document's `context` field.
-3. A numbered list of mentions, each with a paragraph_id, a `surface_form` (the literal text from that paragraph) and a `mention_text` (the per-chunk extractor's canonicalisation, which can be inconsistent across mentions of the same theory).
-
-Cluster mentions into canonical theories:
-- \"vaccines reduce population\" and \"depopulation through immunisation\" are the same theory.
-- \"vaccine injuries hidden by media\" is a DIFFERENT theory than \"vaccines reduce population\" — keep them separate.
-- An anaphoric reference (\"that idea\", \"this concept\") attaches to whichever theory was most recently discussed in the surrounding paragraphs — read the transcript to decide which.
-
-For each canonical theory, output:
-- theory_id: a stable ID you assign (e_001, e_002, ...).
-- canonical: a short noun-phrase statement of the theory.
-- mention_indices: the integer indices of the input mentions that belong to this theory. Aliases will be derived from these — DO NOT include an alias field.
-
-When in doubt, prefer over-splitting (two narrow theories) to over-merging (one fuzzy umbrella). It's easier to merge later than to disentangle.
-
-Respond with a JSON object conforming to the supplied schema. Output nothing else.")
-
 (def ^:private sentiment-record-system
   "You are extracting expressed SENTIMENT toward specific entities from a podcast transcript chunk.
 
@@ -434,14 +362,6 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
    :schema    mention-schema
    :model-cfg (:mention-model config)})
 
-(defn- resolve-call-config [{:keys [task] :as config}]
-  (let [id-key (case task :sentiment :entity_id :conspiracy :theory_id)
-        item   (case task :sentiment "entity"    :conspiracy "theory")]
-    {:system    (case task :sentiment sentiment-resolve-system :conspiracy conspiracy-resolve-system)
-     :schema    (resolve-schema id-key item)
-     :id-key    id-key
-     :model-cfg (:resolve-model config)}))
-
 (defn- record-call-config [{:keys [task] :as config}]
   {:system    (case task :sentiment sentiment-record-system :conspiracy conspiracy-record-system)
    :schema    (case task :sentiment sentiment-record-schema :conspiracy conspiracy-record-schema)
@@ -457,12 +377,9 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
   "Run Stage A on one chunk.
 
    `(:episode-metadata config)` (optional) is prepended verbatim to the
-   user prompt so Stage A can canonicalise speaker self-references
-   (\"I\", \"my\") to the actual host/guest names instead of leaving
-   them as generic \"the speaker\". This lifts the burden off Stage B,
-   which matters most under `:resolve-strategy :group` — pure-code
-   clustering can't merge \"the speaker\" → \"Andy Stumpf\", so it
-   has to come out right at extraction time."
+   user prompt so Stage A canonicalises speaker self-references
+   (\"I\", \"my\") to the actual host/guest names. This gives Stage B's
+   leaf clusterer consistent per-chunk inputs to align across chunks."
   [config chunk]
   (let [{:keys [system schema model-cfg]} (mention-call-config config)
         meta-prefix (when-let [m (:episode-metadata config)]
@@ -480,140 +397,19 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
      :tokens   tokens
      :cache    cache}))
 
-(defn- compute-aliases
-  "Distinct (surface_form ∪ mention_text) strings observed for an
-   entity, in stable order."
-  [all-mentions indices]
-  (let [forms (for [i indices
-                    :when (and (integer? i) (< -1 i (count all-mentions)))
-                    :let [m (nth all-mentions i)]
-                    s [(:surface_form m) (:mention_text m)]
-                    :when (and (string? s) (not (str/blank? s)))]
-                s)]
-    (vec (distinct forms))))
-
-(defn- normalize-mention-text
-  "Lowercase + whitespace collapse + outer-punctuation strip. Used as
-   the clustering key for deterministic pre-clustering — two mentions
-   with the same normalised text become the same entity."
-  [s]
-  (-> (or s "")
-      str/lower-case
-      (str/replace #"\s+" " ")
-      (str/replace #"^[^\p{Alnum}]+|[^\p{Alnum}]+$" "")
-      str/trim))
-
-(defn pre-cluster-mentions
-  "Deterministic pre-clustering: group by normalised mention_text. Each
-   group becomes one entity. The canonical name is the longest
-   distinct mention_text in the group (preserves the most-specific
-   form when Stage A wrote different but equivalent names like \"Joe\"
-   vs \"Joe Rogan\"). Returns the same registry shape as
-   resolve-entities!:
-     {entity_id → {entity_id, canonical, aliases, mention_indices}}.
-
-   Quality compared to LLM resolve: misses cross-form merges (\"Trump\"
-   vs \"the president\" stay separate) but never gets confused by
-   reasoning, never truncates, runs in milliseconds. Combined with a
-   smart Stage A that canonicalises consistently, this captures most
-   of the grouping value at none of the cost."
-  [all-mentions id-key]
-  (let [groups (->> (map-indexed vector all-mentions)
-                    (filter (fn [[_ m]] (not (str/blank? (:mention_text m)))))
-                    (group-by (fn [[_ m]] (normalize-mention-text (:mention_text m)))))
-        sorted-groups (sort-by key groups)
-        entries
-        (for [[i [_ group]] (map-indexed vector sorted-groups)
-              :let [members   (mapv second group)
-                    indices   (mapv first group)
-                    canonical (->> members
-                                   (map :mention_text)
-                                   (remove str/blank?)
-                                   (sort-by #(- (count %)))
-                                   first)
-                    aliases   (vec (distinct
-                                    (concat (keep :mention_text members)
-                                            (keep :surface_form members))))
-                    id        (format "g_%03d" (inc i))]]
-          [id (cond-> {:canonical canonical
-                       :mention_indices indices
-                       :aliases aliases}
-                true (assoc id-key id))])]
-    (into (sorted-map) entries)))
-
 (defn resolve-entities!
-  "Cluster Stage A's mentions into a canonical registry.
+  "Cluster Stage A's mentions into a canonical registry via the
+   Datapotamus tree merge-sort. Leaves cluster per-chunk with
+   transcript context; internal nodes pairwise merge using only
+   canonical + aliases + summary. Bounded prompts at every level;
+   parallelisable.
 
-   Strategy is controlled by `(:resolve-strategy config)`:
-
-     :group  (default for reasoning models)
-       Deterministic exact-match grouping by mention_text. Pure
-       Clojure, milliseconds, never truncates, no LLM call. Misses
-       cross-form merges (\"Trump\" vs \"the president\") — those
-       become separate entities.
-
-     :llm
-       Single LLM call that sees the full transcript as a document
-       plus the mention list, and produces a clustered registry.
-       Maximum quality (catches anaphora, hallucination cleanup,
-       cross-form merges) but eats output budget; doesn't fit in
-       a 32k-context slot when there are ≥ ~150 mentions and the
-       model reasons heavily.
-
-     :tree
-       Hierarchical merge-sort. Leaves cluster per-chunk with
-       transcript context; internal nodes pairwise merge two child
-       registries using only canonical + aliases + summary (no
-       transcript). Bounded prompts at every level; parallelisable.
-       Requires `chunks` to be passed in.
-
-   Returns `{:registry {entity_id → {...}} :rejected [...] :tokens n :cache ...}`.
-
-   `paragraphs` and `description` are used by :llm (transcript-as-document
-   side input). `chunks` (5-arg form) is used by :tree."
-  ([config all-mentions paragraphs description]
-   (resolve-entities! config all-mentions paragraphs description nil))
-  ([config all-mentions paragraphs description chunks]
-   (let [{:keys [id-key system schema model-cfg]} (resolve-call-config config)
-         strategy (or (:resolve-strategy config) :llm)]
-     (case strategy
-       :group
-       (let [registry (pre-cluster-mentions all-mentions id-key)]
-         {:registry registry :rejected [] :tokens 0 :cache :pure})
-
-       :llm
-       (let [document-part {:type        :document
-                            :source-kind :blocks
-                            :blocks      (mapv #(str "[" (:id %) "] " (:text %)) paragraphs)
-                            :title       "Episode transcript"
-                            :context     (when description (subs description 0 (min (count description) 800)))}
-             text-part     {:type :text
-                            :text (str "Mentions to cluster (indices match the FOCUS list):\n\n"
-                                       (render-mentions all-mentions))}
-             {:keys [value tokens cache]}
-             (cached-chat! :resolve model-cfg system [document-part text-part] schema)
-             {:keys [valid rejected]}
-             (partition-by-pred #(well-formed-entity? id-key %) (:entities value))
-             registry (into {} (map (fn [e]
-                                      [(id-key e)
-                                       (assoc e :aliases
-                                              (compute-aliases all-mentions
-                                                               (:mention_indices e)))]))
-                            valid)]
-         {:registry registry
-          :rejected rejected
-          :tokens   tokens
-          :cache    cache})
-
-       :tree
-       (do
-         (when (empty? chunks)
-           (throw (ex-info ":tree resolve-strategy requires chunks (use 5-arg resolve-entities!)"
-                           {:strategy :tree})))
-         ;; Loaded lazily via requiring-resolve to avoid a circular require:
-         ;; podcast.tree-resolve uses cached-chat! from this ns.
-         (let [tree-resolve! (requiring-resolve 'podcast.tree-resolve/tree-resolve!)]
-           (tree-resolve! config all-mentions paragraphs chunks)))))))
+   Returns `{:registry {entity_id → {...}} :rejected [] :tokens n :cache :tree}`."
+  [config all-mentions paragraphs chunks]
+  ;; requiring-resolve breaks the otherwise-circular require:
+  ;; podcast.tree-resolve uses cached-chat! from this ns.
+  (let [tree-resolve! (requiring-resolve 'podcast.tree-resolve/tree-resolve!)]
+    (tree-resolve! config all-mentions paragraphs chunks)))
 
 (defn- render-registry [id-key registry]
   (str/join "\n"

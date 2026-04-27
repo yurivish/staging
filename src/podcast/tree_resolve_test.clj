@@ -7,12 +7,12 @@
             [podcast.tree-resolve :as tr]
             [toolkit.datapotamus.step :as step]))
 
-(def ^:private fwd-ctx       @#'tr/forward-context-paragraphs)
-(def ^:private prefix-ids    @#'tr/prefix-leaf-ids)
-(def ^:private compute-aliases @#'tr/compute-aliases)
-(def ^:private render-leaf   @#'tr/render-leaf-text)
-(def ^:private render-merge  @#'tr/render-merge-text)
-(def ^:private build-graph   @#'tr/build-graph)
+(def ^:private fwd-ctx          @#'tr/forward-context-paragraphs)
+(def ^:private compute-aliases  @#'tr/compute-aliases)
+(def ^:private render-leaf      @#'tr/render-leaf-text)
+(def ^:private render-merge     @#'tr/render-merge-text)
+(def ^:private build-graph      @#'tr/build-graph)
+(def ^:private level-bin-counts @#'tr/level-bin-counts)
 
 ;; ============================================================================
 ;; Pure helpers
@@ -37,12 +37,13 @@
     (testing "last focus paragraph at end → empty seq"
       (is (= [] (fwd-ctx paras [{:id "p4"}] 2))))))
 
-(deftest prefix-leaf-ids-test
-  (let [reg (sorted-map "e_001" {:entity_id "e_001" :canonical "Andy"}
-                        "e_002" {:entity_id "e_002" :canonical "Joe"})
-        prefixed (prefix-ids reg :c-3)]
-    (is (= #{"c-3:e_001" "c-3:e_002"} (set (keys prefixed))))
-    (is (= "c-3:e_001" (:entity_id (get prefixed "c-3:e_001"))))))
+(deftest level-bin-counts-test
+  (testing "binary merge tree shape"
+    (is (= [8 4 2 1] (level-bin-counts 8)))
+    (is (= [3 2 1]   (level-bin-counts 3)))
+    (is (= [2 1]     (level-bin-counts 2)))
+    (is (= [1]       (level-bin-counts 1)))
+    (is (= [5 3 2 1] (level-bin-counts 5)))))
 
 (deftest compute-aliases-test
   (let [ms [{:surface_form "Andy"      :mention_text "Andy Stumpf"}
@@ -83,23 +84,22 @@
 ;; ============================================================================
 
 (deftest build-graph-shape
-  (testing "static graph has the four expected procs regardless of chunk count"
+  (testing "static graph has the three expected procs"
     (let [config {:task :sentiment :resolve-model {:model "stub"}}
-          g (build-graph config [] [] 2 4)]
+          g (build-graph config [] [] 2 4 8)]
       (is (step/step? g))
       (let [proc-ids (set (keys (:procs g)))]
         (is (contains? proc-ids :tree-explode))
         (is (contains? proc-ids :tree-leaves))
-        (is (contains? proc-ids :tree-gather-all))
-        (is (contains? proc-ids :tree-reducer))))))
+        (is (contains? proc-ids :tree-merger))))))
 
-(deftest reducer-self-loop-edge-present
+(deftest merger-self-loop-edge-present
   (let [config {:task :sentiment :resolve-model {:model "stub"}}
-        g (build-graph config [] [] 2 4)
+        g     (build-graph config [] [] 2 4 8)
         ;; The recursion lives on this single edge.
-        loop-edge [[:tree-reducer :loop] [:tree-reducer :in]]]
+        loop-edge [[:tree-merger :loop] [:tree-merger :in]]]
     (is (some (fn [c] (= (subvec c 0 2) loop-edge)) (:conns g))
-        ":tree-reducer :loop must connect back to :tree-reducer :in")))
+        ":tree-merger :loop must connect back to :tree-merger :in")))
 
 ;; ============================================================================
 ;; End-to-end with mocked cached-chat! — fires actual flow.
@@ -156,13 +156,12 @@
 (deftest end-to-end-with-four-chunks
   (let [chunks       (mapv fixture-chunk (range 4))
         all-mentions (vec (mapcat fixture-mentions (range 4)))
-        config       {:task           :sentiment
-                      :resolve-model  {:model "stub" :max-tokens 64}
-                      :resolve-strategy :tree}]
+        config       {:task          :sentiment
+                      :resolve-model {:model "stub" :max-tokens 64}}]
     (with-redefs [llm/cached-chat! mock-chat]
       (let [{:keys [registry tokens cache rejected]}
             (llm/resolve-entities! config all-mentions
-                                   (fixture-paragraphs) "desc" chunks)]
+                                   (fixture-paragraphs) chunks)]
         (testing "tree completes and reports :tree cache marker"
           (is (= :tree cache))
           (is (= [] rejected)))
@@ -178,19 +177,21 @@
 (deftest end-to-end-with-one-chunk
   (let [chunks       [(fixture-chunk 0)]
         all-mentions (fixture-mentions 0)
-        config       {:task           :sentiment
-                      :resolve-model  {:model "stub" :max-tokens 64}
-                      :resolve-strategy :tree}]
+        config       {:task          :sentiment
+                      :resolve-model {:model "stub" :max-tokens 64}}]
     (with-redefs [llm/cached-chat! mock-chat]
       (let [{:keys [registry tokens cache]}
             (llm/resolve-entities! config all-mentions
-                                   (fixture-paragraphs) "desc" chunks)]
+                                   (fixture-paragraphs) chunks)]
         (is (= :tree cache))
         (is (= 100 tokens))
         (is (= 1 (count registry)))))))
 
 (deftest end-to-end-with-empty-chunks
-  (let [config {:task :sentiment :resolve-model {} :resolve-strategy :tree}]
+  (let [config {:task :sentiment :resolve-model {}}]
     (with-redefs [llm/cached-chat! mock-chat]
-      (is (thrown? Exception
-                   (llm/resolve-entities! config [] [] "desc" []))))))
+      (let [{:keys [registry tokens cache]}
+            (llm/resolve-entities! config [] [] [])]
+        (is (= :tree cache))
+        (is (= 0 tokens))
+        (is (empty? registry))))))

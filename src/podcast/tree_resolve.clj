@@ -229,25 +229,21 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
        "\n\n"
        (render-registry-side "RIGHT" right)))
 
-(defn- prefix-leaf-ids
-  "Make leaf-assigned ids globally unique by prepending the chunk-id."
-  [registry chunk-id]
-  (into (sorted-map)
-        (for [[id e] registry]
-          (let [new-id (str (name chunk-id) ":" id)]
-            [new-id (assoc e :entity_id new-id)]))))
-
 ;; ============================================================================
 ;; LLM call wrappers.
 ;; ============================================================================
 
 (defn- cluster-leaf-call!
+  "Return {:entities [entity-record ...] :tokens n :cache c}.
+   Entities are returned as a vec (so they can be emitted as separate
+   msgs by the leaf step), prefix-id'd with the chunk-id."
   [model-cfg id-key chunk fwd-context chunk-mentions local->global all-mentions]
   (let [content [{:type :text
                   :text (render-leaf-text chunk fwd-context chunk-mentions)}]
         {:keys [value tokens cache]}
         (llm/cached-chat! :tree-leaf model-cfg leaf-system content leaf-schema)
-        registry
+        chunk-id (:chunk-id chunk)
+        entities
         (->> (:entities value)
              (filter well-formed-entity?)
              (map (fn [e]
@@ -256,22 +252,23 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
                                        distinct
                                        vec)
                           aliases (compute-aliases all-mentions globals)
-                          eid     (:entity_id e)]
-                      [eid (cond-> {:entity_id       eid
-                                    :canonical       (:canonical e)
-                                    :summary         (:summary e)
-                                    :aliases         aliases
-                                    :mention_indices globals}
-                             (not= id-key :entity_id) (assoc id-key eid))])))
-             (into (sorted-map)))]
-    {:registry (prefix-leaf-ids registry (:chunk-id chunk))
-     :tokens   tokens
-     :cache    cache}))
+                          eid     (str (name chunk-id) ":" (:entity_id e))]
+                      (cond-> {:entity_id       eid
+                               :canonical       (:canonical e)
+                               :summary         (:summary e)
+                               :aliases         aliases
+                               :mention_indices globals}
+                        (not= id-key :entity_id) (assoc id-key eid)))))
+             vec)]
+    {:entities entities :tokens tokens :cache cache}))
 
 (defn- merge-pair-call!
-  "One LLM cross-merge call. Returns {:registry :tokens :cache}.
-   Carry-through entries (not in any returned merge group) keep their
-   ids and content unchanged."
+  "One LLM cross-merge call across two registries (id → entity).
+   Returns:
+     {:outputs       [entity-record ...]   ; merged + carry-through, in order
+      :provenance    {output-id [contributing-input-ids]}
+      :tokens n :cache c}
+   Provenance lets the caller wire `msg/merge` parents per output entity."
   [model-cfg id-key left right]
   (let [content [{:type :text :text (render-merge-text left right)}]
         {:keys [value tokens cache]}
@@ -304,10 +301,21 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
                                   :summary         summ
                                   :aliases         aliases
                                   :mention_indices mis}
-                           (not= id-key :entity_id) (assoc id-key keep-id))]))]
-    {:registry (into (sorted-map) (clojure.core/merge carry merged))
-     :tokens   tokens
-     :cache    cache}))
+                           (not= id-key :entity_id) (assoc id-key keep-id))]))
+        provenance
+        (clojure.core/merge
+         ;; Carry-through: each output id has itself as sole contributor.
+         (into {} (for [[id _] carry] [id [id]]))
+         ;; Merged: keep-id's contributors are all merged ids.
+         (into {} (for [m valid
+                        :let [ids     (mapv first (:members m))
+                              keep-id (first (sort ids))]]
+                    [keep-id ids])))
+        outputs (vec (vals (clojure.core/merge carry merged)))]
+    {:outputs    outputs
+     :provenance provenance
+     :tokens     tokens
+     :cache      cache}))
 
 ;; ============================================================================
 ;; Step constructors.
@@ -315,10 +323,7 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
 
 (defn- explode-step
   "One chunks-vec in → N leaf-input msgs out, one per chunk. Each
-   leaf-input carries the per-chunk slice the leaf needs and (in
-   `::expected`) the total count, so the downstream gather step knows
-   how many siblings to wait for without depending on done-cascade
-   timing."
+   leaf-input carries the per-chunk slice the leaf needs."
   [config all-mentions paragraphs k-fwd]
   (let [model-cfg  (:resolve-model config)
         id-key     (case (:task config)
@@ -330,10 +335,9 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
      :tree-explode
      {:ins {:in ""} :outs {:out ""}}
      (fn [_ctx _state chunks]
-       (let [n (count chunks)
-             leaf-inputs
+       (let [leaf-inputs
              (vec
-              (for [chunk chunks]
+              (for [[pos chunk] (map-indexed vector chunks)]
                 (let [cid (:chunk-id chunk)
                       cm  (vec (get by-chunk cid []))
                       l->g (into {}
@@ -341,158 +345,302 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
                                  cm)
                       fwd  (forward-context-paragraphs paragraphs (:focus chunk) k-fwd)]
                   {:chunk          chunk
+                   :chunk-pos      pos
                    :chunk-mentions cm
                    :local->global  l->g
                    :fwd-context    fwd
                    :all-mentions   all-mentions
                    :model-cfg      model-cfg
-                   :id-key         id-key
-                   ::expected      n})))]
+                   :id-key         id-key})))]
          {:out leaf-inputs})))))
 
 (def ^:private leaf-step
+  "Per-chunk leaf clustering; emits one msg per output entity via
+   `msg/children`. The last entity carries `:leaf-meta` for tokens/cache.
+   An empty chunk emits a single sentinel msg with `:empty? true`.
+
+   Each emitted entity-msg's data shape:
+     {:entity {entity-record}      ; canonical, summary, aliases, mention_indices, ...
+      :bin-id [0 chunk-pos]        ; level + position; merger pairs by position
+      :is-last?  bool              ; true on the last entity for this leaf
+      :empty?    bool              ; true if no entities emitted (sentinel)
+      :leaf-meta {:tokens n :cache c}  ; only on the last/sentinel msg}"
   (step/step
    :tree-leaf
-   (fn [{:keys [chunk chunk-mentions local->global fwd-context
-                all-mentions model-cfg id-key ::expected]}]
-     (let [out (if (empty? chunk-mentions)
-                 {:registry (sorted-map) :tokens 0 :cache :pure}
-                 (cluster-leaf-call! model-cfg id-key chunk fwd-context
-                                     chunk-mentions local->global all-mentions))]
-       ;; Forward the expected-count tag so gather-all can close on count.
-       (assoc out ::expected expected)))))
+   {:ins {:in ""} :outs {:out ""}}
+   (fn [ctx _state {:keys [chunk chunk-pos chunk-mentions local->global fwd-context
+                           all-mentions model-cfg id-key]}]
+     (let [{:keys [entities tokens cache]}
+           (if (empty? chunk-mentions)
+             {:entities [] :tokens 0 :cache :pure}
+             (cluster-leaf-call! model-cfg id-key chunk fwd-context
+                                 chunk-mentions local->global all-mentions))
+           bin-id [0 chunk-pos]
+           leaf-meta {:tokens (or tokens 0) :cache cache}]
+       (if (empty? entities)
+         {:out [(msg/child ctx
+                           {:bin-id    bin-id
+                            :is-last?  true
+                            :empty?    true
+                            :leaf-meta leaf-meta})]}
+         (let [n (count entities)
+               datas (vec
+                      (for [[i e] (map-indexed vector entities)]
+                        (cond-> {:entity   e
+                                 :bin-id   bin-id
+                                 :is-last? (= i (dec n))}
+                          (= i (dec n)) (assoc :leaf-meta leaf-meta))))]
+           {:out (msg/children ctx datas)}))))))
 
-(defn- gather-all-step
-  "Buffer leaf outputs. Each leaf input carries `::expected` — the total
-   number of siblings produced by `explode` — so we know exactly when
-   the level has fully arrived without depending on done-cascade timing.
+;; ============================================================================
+;; Pair-merger: stateful per-bin accumulation, level-aware pairing,
+;; per-entity msg/merge or msg/pass on output.
+;; ============================================================================
 
-   On every leaf arrival except the last, return `msg/drain` (stash
-   parent ref, suppress auto-signal). On the last, emit one merged msg
-   via `msg/merge` listing all stashed parents — synthesis carries
-   every leaf's tokens forward into that one merged output."
-  []
-  {:procs
-   {:tree-gather-all
-    (step/handler-map
-     {:ports   {:ins {:in ""} :outs {:out ""}}
-      :on-init (fn [] {:parents [] :registries []})
-      :on-data
-      (fn [ctx {:keys [parents registries]} d]
-        (let [parents'    (conj parents (:msg ctx))
-              registries' (conj registries (dissoc d ::expected))
-              expected    (::expected d)]
-          (if (and expected (= (count parents') expected))
-            ;; Last sibling: emit merged.
-            [{:parents [] :registries []}
-             {:out [(msg/merge ctx parents' (vec registries'))]}]
-            ;; Still waiting: stash, suppress auto-signal so tokens
-            ;; ride forward via the eventual msg/merge.
-            [{:parents parents' :registries registries'} msg/drain])))})}
-   :conns []
-   :in :tree-gather-all
-   :out :tree-gather-all})
+(defn- level-bin-counts
+  "Sequence of bin counts per level for a binary merge tree starting
+   at N leaves. Always ends with 1.
+     N=8  → [8 4 2 1]
+     N=3  → [3 2 1]
+     N=1  → [1]"
+  [n]
+  (loop [out [n]]
+    (let [cur (peek out)]
+      (if (<= cur 1)
+        out
+        (recur (conj out (quot (inc cur) 2)))))))
 
-(defn- vthread-mapv
-  "Parallel mapv on a virtual-thread executor, bounded by `n` in-flight
-   tasks (the local server's slot count). Order-preserving."
-  [n f coll]
-  (let [items (vec coll)]
-    (if (empty? items)
-      []
-      (let [sem (java.util.concurrent.Semaphore. (int n))
-            ex  (java.util.concurrent.Executors/newVirtualThreadPerTaskExecutor)]
-        (try
-          (let [futs (mapv (fn [x]
-                             (.acquire sem)
-                             (.submit ex
-                                      ^java.util.concurrent.Callable
-                                      (fn [] (try (f x) (finally (.release sem))))))
-                           items)]
-            (mapv #(.get ^java.util.concurrent.Future %) futs))
-          (finally (.shutdown ex)))))))
+(defn- pass-msg
+  "Build a pending msg that carries forward `data`, parented on
+   `parent-msg`, with the parent's data-id preserved (same logical
+   datum). Hand-rolled because msg/pass uses (:msg ctx) and we need
+   to pass-through a stashed msg from state."
+  [parent-msg data]
+  {:msg-id         (random-uuid)
+   :data-id        (:data-id parent-msg)
+   :msg-kind       :data
+   :parent-msg-ids [(:msg-id parent-msg)]
+   :data           data
+   ::msg/parents   [parent-msg]})
 
-(defn- reducer-step
-  "One pass per invocation = one tree level. Pair up registries; merge
-   each pair via an LLM call; hand the resulting vec back to `:in` via
-   the self-loop edge until exactly one registry remains, at which
-   point emit on `:final`.
+(defn- to-registry
+  "Turn a vec of entity records into the id→entity map shape that
+   merge-pair-call! consumes. nil-safe (empty vec → empty map)."
+  [entities]
+  (into (sorted-map)
+        (for [e entities] [(:entity_id e) e])))
 
-   Within-level parallelism: pairs at the same level run concurrently
-   on a virtual-thread executor, capped at `:tree-workers` (default 4
-   = local llama.cpp slot count)."
-  [config]
-  (let [model-cfg (:resolve-model config)
-        id-key    (case (:task config)
-                    :sentiment  :entity_id
-                    :conspiracy :theory_id)
-        workers   (or (:tree-workers config) 4)]
-    (step/step
-     :tree-reducer
-     {:ins {:in ""} :outs {:loop "" :final ""}}
-     (fn [_ctx _state regs]
-       (let [regs (vec regs)]
-         (cond
-           (<= (count regs) 1)
-           {:final [(or (first regs)
-                        {:registry (sorted-map) :tokens 0 :cache :tree})]}
+(defn- emit-output-entity
+  "Build one output entity msg for the merger, given:
+     parents      — the source-entity msgs that contribute to this output
+     entity       — the new entity record
+     output-port  — :loop or :final
+     bin-id       — next-level bin-id (carry-through pair-id at next level)
+     is-last?     — true if this is the last emission for this bin
+     leaf-meta    — token/cache metadata to attach if last
 
-           :else
-           (let [pairs (partition-all 2 regs)
-                 ;; Tokens accumulate up the tree: each merge keeps the
-                 ;; sum of its two children's prior tokens plus its own.
-                 merged
-                 (vthread-mapv
-                  workers
-                  (fn [p]
-                    (if (= 1 (count p))
-                      (first p)
-                      (let [a (first p) b (second p)
-                            r (merge-pair-call! model-cfg id-key
-                                                (:registry a) (:registry b))]
-                        (assoc r :tokens
-                               (+ (or (:tokens a) 0)
-                                  (or (:tokens b) 0)
-                                  (or (:tokens r) 0))))))
-                  pairs)]
-             {:loop [merged]})))))))
+   For carry-through (single parent) we preserve `:data-id` via pass-msg.
+   For merged (multiple parents) we use `msg/merge` (fresh `:data-id`,
+   parents listed)."
+  [ctx parents entity bin-id is-last? leaf-meta]
+  (let [data (cond-> {:entity   entity
+                      :bin-id   bin-id
+                      :is-last? is-last?}
+               leaf-meta (assoc :leaf-meta leaf-meta))]
+    (cond
+      (= 1 (count parents))
+      (pass-msg (first parents) data)
+      :else
+      (msg/merge ctx parents data))))
+
+(defn- process-pair
+  "Run one merge call (or carry-through if odd singleton). Returns
+   `[state' {output-port [output-msgs]}]`."
+  [ctx state model-cfg id-key bin-counts left-bin-id right-bin-id has-right?]
+  (let [left-bin    (get-in state [:bins left-bin-id])
+        right-bin   (when has-right? (get-in state [:bins right-bin-id]))
+        next-level  (inc (first left-bin-id))
+        next-pos    (quot (second left-bin-id) 2)
+        next-bin-id [next-level next-pos]
+        is-root?    (= 1 (nth bin-counts next-level))
+        port        (if is-root? :final :loop)
+        ;; Pop processed bins from state.
+        state' (-> state
+                   (update :bins dissoc left-bin-id)
+                   (update :done-bins disj left-bin-id)
+                   (cond-> has-right?
+                     (-> (update :bins dissoc right-bin-id)
+                         (update :done-bins disj right-bin-id))))
+        left-by-id  (zipmap (map :entity_id (:entities left-bin))  (:msgs left-bin))
+        right-by-id (when has-right?
+                      (zipmap (map :entity_id (:entities right-bin)) (:msgs right-bin)))
+        ;; Tokens accumulated at the level we're processing (children).
+        accum-tokens (+ (or (:tokens left-bin) 0)
+                        (or (:tokens right-bin) 0))]
+    (if-not has-right?
+      ;; Odd singleton: forward each entity to next level unchanged.
+      (let [entities (:entities left-bin)
+            msgs     (:msgs left-bin)
+            n        (count entities)
+            outs (if (zero? n)
+                   ;; Empty bin propagates as a sentinel.
+                   [(emit-output-entity ctx msgs nil next-bin-id true
+                                        {:tokens accum-tokens})]
+                   (vec
+                    (for [[i [e parent]] (map-indexed vector
+                                                     (map vector entities msgs))]
+                      (emit-output-entity ctx [parent] e next-bin-id
+                                          (= i (dec n))
+                                          (when (= i (dec n))
+                                            {:tokens accum-tokens})))))]
+        [state' {port outs}])
+      ;; Both sides present: run LLM merge.
+      (let [left-reg  (to-registry (:entities left-bin))
+            right-reg (to-registry (:entities right-bin))
+            {:keys [outputs provenance tokens]}
+            (merge-pair-call! model-cfg id-key left-reg right-reg)
+            total-tokens (+ accum-tokens (or tokens 0))
+            n (count outputs)
+            outs (if (zero? n)
+                   [(emit-output-entity ctx
+                                        (concat (:msgs left-bin) (:msgs right-bin))
+                                        nil next-bin-id true
+                                        {:tokens total-tokens})]
+                   (vec
+                    (for [[i e] (map-indexed vector outputs)
+                          :let [contrib-ids (get provenance (:entity_id e))
+                                parent-msgs (vec (keep #(or (left-by-id %)
+                                                            (right-by-id %))
+                                                       contrib-ids))]]
+                      (emit-output-entity ctx parent-msgs e next-bin-id
+                                          (= i (dec n))
+                                          (when (= i (dec n))
+                                            {:tokens total-tokens})))))]
+        [state' {port outs}]))))
+
+(defn- pair-merger-step
+  "Stateful pair-merger. Buffers entity-msgs per bin-id. When both
+   bins of a pair are complete (both have signaled `:is-last?`), runs
+   the merge LLM and emits per-entity outputs on `:loop` or `:final`
+   depending on whether the next level is the root.
+
+   Lineage: per-entity outputs use `msg/merge` (multiple parents) when
+   the LLM grouped them, or hand-rolled `pass-msg` (data-id preserved)
+   for carry-through and odd-singleton."
+  [config initial-n]
+  (let [model-cfg  (:resolve-model config)
+        id-key     (case (:task config)
+                     :sentiment  :entity_id
+                     :conspiracy :theory_id)
+        bin-counts (level-bin-counts initial-n)]
+    {:procs
+     {:tree-merger
+      (step/handler-map
+       {:ports   {:ins {:in ""} :outs {:loop "" :final ""}}
+        :on-init (fn [] {:bins {} :done-bins #{}})
+        :on-data
+        (fn [ctx state d]
+          (let [in-msg (:msg ctx)
+                {:keys [entity bin-id is-last? empty? leaf-meta]} d
+                [level position] bin-id
+                bin-entry (-> (get-in state [:bins bin-id]
+                                      {:msgs [] :entities [] :tokens 0})
+                              (update :msgs conj in-msg))
+                bin-entry (cond-> bin-entry
+                            (and entity (not empty?)) (update :entities conj entity)
+                            leaf-meta (update :tokens + (or (:tokens leaf-meta) 0)))
+                state-1 (assoc-in state [:bins bin-id] bin-entry)
+                state-2 (cond-> state-1
+                          is-last? (update :done-bins conj bin-id))]
+            (if-not is-last?
+              [state-2 msg/drain]
+              (let [expected (nth bin-counts level)]
+                (if (= 1 expected)
+                  ;; This bin IS the root — only bin at its level.
+                  ;; Emit its entities directly to :final.
+                  (let [bin (get-in state-2 [:bins bin-id])
+                        msgs (:msgs bin)
+                        ents (:entities bin)
+                        n    (count ents)
+                        toks (:tokens bin)
+                        outs (if (zero? n)
+                               [(emit-output-entity ctx msgs nil bin-id true
+                                                    {:tokens (or toks 0)})]
+                               (vec
+                                (for [[i [e parent]]
+                                      (map-indexed vector
+                                                   (map vector ents msgs))]
+                                  (emit-output-entity ctx [parent] e bin-id
+                                                      (= i (dec n))
+                                                      (when (= i (dec n))
+                                                        {:tokens (or toks 0)})))))
+                        state' (-> state-2
+                                   (update :bins dissoc bin-id)
+                                   (update :done-bins disj bin-id))]
+                    [state' {:final outs}])
+                  ;; Normal case: check if pair partner is also done.
+                  (let [pair-pos     (quot position 2)
+                        left-pos     (* 2 pair-pos)
+                        right-pos    (inc left-pos)
+                        has-right?   (< right-pos expected)
+                        left-id      [level left-pos]
+                        right-id     [level right-pos]
+                        left-done?   (contains? (:done-bins state-2) left-id)
+                        right-done?  (or (not has-right?)
+                                         (contains? (:done-bins state-2) right-id))]
+                    (if (and left-done? right-done?)
+                      (process-pair ctx state-2 model-cfg id-key
+                                    bin-counts left-id right-id has-right?)
+                      [state-2 msg/drain])))))))})}
+     :conns []
+     :in :tree-merger
+     :out :tree-merger}))
 
 ;; ============================================================================
 ;; Static graph wiring.
 ;; ============================================================================
 
-(defn- build-graph [config all-mentions paragraphs k-fwd workers]
+(defn- build-graph [config all-mentions paragraphs k-fwd workers initial-n]
   (-> (step/beside
        (explode-step config all-mentions paragraphs k-fwd)
        (c/workers :tree-leaves workers leaf-step)
-       (gather-all-step)
-       (reducer-step config))
-      (step/connect [:tree-explode :out]    [:tree-leaves :in])
-      (step/connect [:tree-leaves :out]     [:tree-gather-all :in])
-      (step/connect [:tree-gather-all :out] [:tree-reducer :in])
-      ;; The recursion: reducer's :loop output feeds back into its own :in.
-      (step/connect [:tree-reducer :loop]   [:tree-reducer :in])
+       (pair-merger-step config initial-n))
+      (step/connect [:tree-explode :out]  [:tree-leaves :in])
+      (step/connect [:tree-leaves :out]   [:tree-merger :in])
+      ;; The recursion: merger's :loop output feeds back into its own :in.
+      (step/connect [:tree-merger :loop]  [:tree-merger :in])
       (step/input-at  :tree-explode)
-      (step/output-at [:tree-reducer :final])))
+      (step/output-at [:tree-merger :final])))
 
 ;; ============================================================================
 ;; Entry point.
 ;; ============================================================================
 
 (defn tree-resolve!
-  "Datapotamus-driven `:tree` Stage B. Returns
-   `{:registry … :rejected [] :tokens n :cache :tree}`."
+  "Datapotamus-driven `:tree` Stage B.
+
+   Final output is a stream of per-entity msgs at `:tree-merger :final`.
+   We collect them and assemble the registry by entity id. Per-entity
+   token metadata accumulates on the last sibling of each merged bin; the
+   sum across all final-port emissions is the total-tokens figure.
+
+   Returns `{:registry … :rejected [] :tokens n :cache :tree}`."
   [config all-mentions paragraphs chunks]
   (if (empty? chunks)
     {:registry (sorted-map) :rejected [] :tokens 0 :cache :tree}
-    (let [k-fwd   (or (:tree-fwd-context config) 2)
-          workers (or (:tree-workers      config) 4)
-          graph   (build-graph config all-mentions paragraphs k-fwd workers)
+    (let [k-fwd     (or (:tree-fwd-context config) 2)
+          workers   (or (:tree-workers      config) 4)
+          initial-n (count chunks)
+          graph     (build-graph config all-mentions paragraphs k-fwd workers initial-n)
           {:keys [state outputs error]} (flow/run-seq graph [(vec chunks)])]
       (when (= :failed state)
         (throw (ex-info "tree-resolve flow failed" {:error error})))
-      (let [final (-> outputs first first)]
-        {:registry (or (:registry final) (sorted-map))
+      (let [final-msgs (or (first outputs) [])
+            entities   (keep :entity final-msgs)
+            tokens     (transduce (keep (comp :tokens :leaf-meta)) + 0 final-msgs)
+            registry   (into (sorted-map)
+                             (for [e entities] [(:entity_id e) e]))]
+        {:registry registry
          :rejected []
-         :tokens   (or (:tokens final) 0)
+         :tokens   tokens
          :cache    :tree}))))
