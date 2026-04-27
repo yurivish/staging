@@ -71,7 +71,7 @@
   [pid]
   (or (some-> pid (subs 1) (str/split #"-") first parse-long) 0))
 
-(defn- aggregate
+(defn aggregate
   "Group records by id-key into `{id → {canonical aliases occurrences}}`."
   [registry id-key records]
   (let [by-id (group-by id-key records)]
@@ -82,7 +82,7 @@
             [id (assoc (select-keys entry [:canonical :aliases])
                        :occurrences occurrences)]))))
 
-(defn- task-id-key [task]
+(defn task-id-key [task]
   (case task :sentiment :entity_id :conspiracy :theory_id))
 
 ;; ============================================================================

@@ -66,9 +66,11 @@
   (:refer-clojure :exclude [run!])
   (:require [babashka.process :as bp]
             [clojure.data.json :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [toolkit.datapotamus.step :as step]
-            [toolkit.datapotamus.trace :as trace]))
+            [toolkit.datapotamus.trace :as trace])
+  (:import [java.io BufferedReader Reader]))
 
 (set! *warn-on-reflection* true)
 
@@ -95,8 +97,10 @@
            add-dir settings setting-sources
            mcp-config strict-mcp-config?
            resume continue? fork-session? session-id no-session-persistence?
-           json-schema extra-args]}]
-  (cond-> ["claude" "--print" "--output-format" "json"]
+           json-schema extra-args
+           stream?]}]
+  (cond-> ["claude" "--print" "--output-format" (if stream? "stream-json" "json")]
+    stream?                        (conj "--verbose")  ; required by CLI for stream-json
     bare?                          (conj "--bare")
     permission-mode                (into ["--permission-mode" (name permission-mode)])
     dangerously-skip-permissions?  (conj "--dangerously-skip-permissions")
