@@ -404,12 +404,16 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
    canonical + aliases + summary. Bounded prompts at every level;
    parallelisable.
 
+   `opts` is forwarded to `tree-resolve!` (`:pubsub`, `:flow-id`).
+
    Returns `{:registry {entity_id → {...}} :rejected [] :tokens n :cache :tree}`."
-  [config all-mentions paragraphs chunks]
-  ;; requiring-resolve breaks the otherwise-circular require:
-  ;; podcast.tree-resolve uses cached-chat! from this ns.
-  (let [tree-resolve! (requiring-resolve 'podcast.tree-resolve/tree-resolve!)]
-    (tree-resolve! config all-mentions paragraphs chunks)))
+  ([config all-mentions paragraphs chunks]
+   (resolve-entities! config all-mentions paragraphs chunks {}))
+  ([config all-mentions paragraphs chunks opts]
+   ;; requiring-resolve breaks the otherwise-circular require:
+   ;; podcast.tree-resolve uses cached-chat! from this ns.
+   (let [tree-resolve! (requiring-resolve 'podcast.tree-resolve/tree-resolve!)]
+     (tree-resolve! config all-mentions paragraphs chunks opts))))
 
 (defn- render-registry [id-key registry]
   (str/join "\n"

@@ -33,7 +33,8 @@
             [toolkit.datapotamus.combinators :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
-            [toolkit.datapotamus.step :as step]))
+            [toolkit.datapotamus.step :as step]
+            [toolkit.datapotamus.trace :as trace]))
 
 ;; ============================================================================
 ;; Prompts and schemas.
@@ -362,6 +363,9 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
                    :id-key         id-key})))]
          {:out leaf-inputs})))))
 
+(defn- task-from-id-key [id-key]
+  (case id-key :entity_id :sentiment :theory_id :conspiracy))
+
 (def ^:private leaf-step
   "Per-chunk leaf clustering; emits one msg per output entity via
    `msg/children`. The last entity carries `:leaf-meta` for tokens/cache.
@@ -378,13 +382,27 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
    {:ins {:in ""} :outs {:out ""}}
    (fn [ctx _state {:keys [chunk chunk-pos chunk-mentions local->global fwd-context
                            all-mentions model-cfg id-key]}]
-     (let [{:keys [entities tokens cache]}
+     (let [t0 (System/nanoTime)
+           {:keys [entities tokens cache]}
            (if (empty? chunk-mentions)
              {:entities [] :tokens 0 :cache :pure}
              (cluster-leaf-call! model-cfg id-key chunk fwd-context
                                  chunk-mentions local->global all-mentions))
+           ms (long (/ (- (System/nanoTime) t0) 1e6))
            bin-id [0 chunk-pos]
            leaf-meta {:tokens (or tokens 0) :cache cache}]
+       (trace/emit ctx
+                   {:llm-call {:stage    :tree-leaf
+                               :task     (task-from-id-key id-key)
+                               :chunk-id (:chunk-id chunk)
+                               :model    (:model model-cfg)
+                               :tokens   tokens
+                               :cache    cache
+                               :ms       ms}
+                    :inputs   {:chunk-id   (:chunk-id chunk)
+                               :n-mentions (count chunk-mentions)}
+                    :outputs  {:entity-ids (mapv :entity_id entities)
+                               :n-entities (count entities)}})
        (if (empty? entities)
          {:out [(msg/child ctx
                            {:bin-id    bin-id
@@ -505,8 +523,24 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
       ;; Both sides present: run LLM merge.
       (let [left-reg  (to-registry (:entities left-bin))
             right-reg (to-registry (:entities right-bin))
-            {:keys [outputs provenance tokens]}
+            t0 (System/nanoTime)
+            {:keys [outputs provenance tokens cache]}
             (merge-pair-call! model-cfg id-key left-reg right-reg)
+            ms (long (/ (- (System/nanoTime) t0) 1e6))
+            _ (trace/emit ctx
+                          {:llm-call {:stage  :tree-merge
+                                      :task   (task-from-id-key id-key)
+                                      :model  (:model model-cfg)
+                                      :tokens tokens
+                                      :cache  cache
+                                      :ms     ms}
+                           :inputs   {:left-bin   left-bin-id
+                                      :right-bin  right-bin-id
+                                      :left-ids   (mapv :entity_id (:entities left-bin))
+                                      :right-ids  (mapv :entity_id (:entities right-bin))}
+                           :outputs  {:entity-ids (mapv :entity_id outputs)
+                                      :provenance provenance
+                                      :n-outputs  (count outputs)}})
             total-tokens (+ accum-tokens (or tokens 0))
             n (count outputs)
             outs (if (zero? n)
@@ -649,15 +683,26 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
    token metadata accumulates on the last sibling of each merged bin; the
    sum across all final-port emissions is the total-tokens figure.
 
+   `opts` may carry `:pubsub` (shared raw pubsub for the run) and
+   `:flow-id` (string, becomes the outer `[:scope <fid>]` segment so
+   subscribers can filter per-task). Both default to a fresh pubsub /
+   random uuid when omitted.
+
    Returns `{:registry … :rejected [] :tokens n :cache :tree}`."
-  [config all-mentions paragraphs chunks]
+  ([config all-mentions paragraphs chunks]
+   (tree-resolve! config all-mentions paragraphs chunks {}))
+  ([config all-mentions paragraphs chunks opts]
   (if (empty? chunks)
     {:registry (sorted-map) :rejected [] :tokens 0 :cache :tree}
     (let [k-fwd     (or (:tree-fwd-context config) 2)
           workers   (or (:tree-workers      config) 4)
           initial-n (count chunks)
           graph     (build-graph config all-mentions paragraphs k-fwd workers initial-n)
-          {:keys [state outputs error]} (flow/run-seq graph [(vec chunks)])]
+          {:keys [state outputs error]}
+          (flow/run-seq graph [(vec chunks)]
+                        (cond-> {}
+                          (:pubsub opts)  (assoc :pubsub  (:pubsub opts))
+                          (:flow-id opts) (assoc :flow-id (:flow-id opts))))]
       (when (= :failed state)
         (throw (ex-info "tree-resolve flow failed" {:error error})))
       (let [final-msgs (or (first outputs) [])
@@ -668,4 +713,4 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
         {:registry registry
          :rejected []
          :tokens   tokens
-         :cache    :tree}))))
+         :cache    :tree})))))

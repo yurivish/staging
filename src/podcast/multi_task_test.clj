@@ -1,50 +1,14 @@
 (ns podcast.multi-task-test
-  "End-to-end multi-task `extract!` test with mocked LLM calls.
-
-   Asserts that running `:tasks [:sentiment :conspiracy]` in one
-   invocation produces independent per-task output files in a shared
-   run-dir, with per-task structure preserved and aggregated metadata
-   in run.json."
+  "End-to-end multi-task `extract!` tests using the in-process mock at
+   `podcast.mock-server`. Covers structural correctness, equality
+   between single-task and multi-task runs, cache-hit behaviour on
+   reruns, and wall-clock speedup with simulated latency."
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
-            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [podcast.core :as pc]
-            [podcast.llm :as llm]))
-
-(defn- mock-chat
-  "Stub for podcast.llm/cached-chat!. Dispatches on stage and parses
-   the rendered prompt to keep outputs aligned with chunk content so
-   validators accept them."
-  [stage _model-cfg system content-parts _schema]
-  (let [text (->> content-parts (keep :text) (str/join "\n"))]
-    (case stage
-      :mentions
-      (let [fid (or (second (re-find #"FOCUS[^\[]*\[([^\]\s]+)" text)) "p0")]
-        {:value {:mentions [{:paragraph_id fid
-                             :mention_text "Person-X"
-                             :surface_form "X"}]}
-         :tokens 100
-         :cache  :miss})
-
-      :tree-leaf
-      (let [fid (or (second (re-find #"=== FOCUS[^\n]*\n\[([^\]\s]+)" text)) "p0")]
-        {:value {:entities [{:entity_id "e_001"
-                             :canonical (str "Person-" fid)
-                             :summary (str "intro at " fid)
-                             :mention_indices [1]}]}
-         :tokens 50
-         :cache  :miss})
-
-      :tree-merge
-      ;; No merges — entities carry through.
-      {:value {:merges []} :tokens 10 :cache :miss}
-
-      :records
-      ;; Return zero records (all would need to ground into specific
-      ;; registry ids and matching quotes — out of scope for a structural
-      ;; orchestration test).
-      {:value {:records []} :tokens 20 :cache :miss})))
+            [podcast.llm :as llm]
+            [podcast.mock-server :as mock]))
 
 (defn- write-fixture! [path]
   (let [doc {:description "Test transcript for multi-task pipeline."
@@ -59,18 +23,47 @@
 (defn- read-json [path]
   (json/read-str (slurp path) :key-fn keyword))
 
+(def ^:private base-cfg
+  {:mention-model {:model "stub"}
+   :resolve-model {:model "stub"}
+   :record-model  {:model "stub"}})
+
+(def ^:private chunking {:n 2 :k 1})
+
+(defn- normalize-result
+  "Strip strictly-volatile fields (timings, token bookkeeping) and
+   normalise the only truly-nondeterministic content field — registry
+   `:mention_indices`, which is positional indices into the flattened
+   `all-mentions` vec whose construction order depends on chunk arrival
+   order through the stealing-workers pool. The semantic content (which
+   mentions belong to which entity) is preserved by `:aliases`, which
+   we sort to absorb the same ordering effect."
+  [r]
+  (let [sort-aliases #(if (sequential? %) (vec (sort %)) %)
+        norm-reg-entry #(-> % (dissoc :mention_indices) (update :aliases sort-aliases))
+        norm-ent-entry (fn [e]
+                         (-> e
+                             (update :aliases sort-aliases)
+                             (update :occurrences
+                                     (fn [os] (vec (sort-by (juxt :paragraph_id :chunk-id) os))))))]
+    (-> r
+        (dissoc :timings :tokens :stage-tokens)
+        (update :registry (fn [reg]
+                            (into (sorted-map)
+                                  (for [[k e] reg] [k (norm-reg-entry e)]))))
+        (update :entities (fn [ents]
+                            (into (sorted-map)
+                                  (for [[k e] ents] [k (norm-ent-entry e)])))))))
+
 (deftest extract-runs-both-tasks
   (let [tmp     (java.io.File/createTempFile "podcast-multi-" "")
         fixture (str tmp ".json")
         out-dir (str tmp "-out")]
     (write-fixture! fixture)
-    (with-redefs [llm/cached-chat! mock-chat
+    (with-redefs [llm/cached-chat! (mock/responder)
                   llm/detect-slots (constantly 2)]
-      (let [config  {:tasks         [:sentiment :conspiracy]
-                     :mention-model {:model "stub"}
-                     :resolve-model {:model "stub"}
-                     :record-model  {:model "stub"}}
-            results (pc/extract! config fixture :run-dir out-dir :chunking {:n 2 :k 1})]
+      (let [results (pc/extract! (assoc base-cfg :tasks [:sentiment :conspiracy])
+                                 fixture :run-dir out-dir :chunking chunking)]
 
         (testing "results map is keyed by task"
           (is (= #{:sentiment :conspiracy} (set (keys results)))))
@@ -106,12 +99,74 @@
           fixture (str tmp ".json")
           out-dir (str tmp "-out")]
       (write-fixture! fixture)
-      (with-redefs [llm/cached-chat! mock-chat
+      (with-redefs [llm/cached-chat! (mock/responder)
                     llm/detect-slots (constantly 2)]
-        (let [config  {:task          :sentiment
-                       :mention-model {:model "stub"}
-                       :resolve-model {:model "stub"}
-                       :record-model  {:model "stub"}}
-              results (pc/extract! config fixture :run-dir out-dir :chunking {:n 2 :k 1})]
+        (let [results (pc/extract! (assoc base-cfg :task :sentiment)
+                                   fixture :run-dir out-dir :chunking chunking)]
           (is (= [:sentiment] (vec (keys results))))
           (is (.exists (io/file (str out-dir "/sentiment.json")))))))))
+
+(deftest multi-task-content-equals-sequential-baselines
+  (testing "running each task alone produces the same content as running them combined"
+    (let [tmp     (java.io.File/createTempFile "podcast-eq-" "")
+          fixture (str tmp ".json")
+          dir-s   (str tmp "-S")
+          dir-c   (str tmp "-C")
+          dir-sc  (str tmp "-SC")]
+      (write-fixture! fixture)
+      (with-redefs [llm/cached-chat! (mock/responder)
+                    llm/detect-slots (constantly 4)]
+        (let [run-alone     (pc/extract! (assoc base-cfg :tasks [:sentiment])
+                                         fixture :run-dir dir-s :chunking chunking)
+              run-cons      (pc/extract! (assoc base-cfg :tasks [:conspiracy])
+                                         fixture :run-dir dir-c :chunking chunking)
+              run-combined  (pc/extract! (assoc base-cfg :tasks [:sentiment :conspiracy])
+                                         fixture :run-dir dir-sc :chunking chunking)]
+          (testing "sentiment content matches whether run alone or combined"
+            (is (= (normalize-result (run-alone :sentiment))
+                   (normalize-result (run-combined :sentiment)))))
+          (testing "conspiracy content matches whether run alone or combined"
+            (is (= (normalize-result (run-cons :conspiracy))
+                   (normalize-result (run-combined :conspiracy))))))))))
+
+(deftest cache-hits-on-rerun
+  (testing "shared cache atom: second call to the same config returns zero tokens"
+    (let [tmp     (java.io.File/createTempFile "podcast-rerun-" "")
+          fixture (str tmp ".json")
+          shared  (atom {})]
+      (write-fixture! fixture)
+      (with-redefs [llm/cached-chat! (mock/responder {:cache shared})
+                    llm/detect-slots (constantly 4)]
+        (let [config (assoc base-cfg :tasks [:sentiment :conspiracy])
+              first-run  (pc/extract! config fixture
+                                      :run-dir (str tmp "-r1") :chunking chunking)
+              second-run (pc/extract! config fixture
+                                      :run-dir (str tmp "-r2") :chunking chunking)]
+          (is (pos? (apply + (map :tokens (vals first-run))))
+              "first run should consume tokens via the mock responder")
+          (is (zero? (apply + (map :tokens (vals second-run))))
+              "second run should be all cache hits (zero tokens)"))))))
+
+(deftest multi-task-wall-clock-faster-than-sequential
+  (testing "with simulated per-call latency, multi-task < sentiment alone + conspiracy alone"
+    (let [tmp     (java.io.File/createTempFile "podcast-wc-" "")
+          fixture (str tmp ".json")]
+      (write-fixture! fixture)
+      (with-redefs [llm/detect-slots (constantly 8)]
+        (let [time-it (fn [tasks suffix]
+                        ;; Fresh cache per timed run so the mock actually does work.
+                        (with-redefs [llm/cached-chat! (mock/responder {:latency-ms 25})]
+                          (let [t0 (System/nanoTime)]
+                            (pc/extract! (assoc base-cfg :tasks tasks)
+                                         fixture
+                                         :run-dir (str tmp suffix)
+                                         :chunking chunking
+                                         :workers 8)
+                            (- (System/nanoTime) t0))))
+              t-sent  (time-it [:sentiment]                "-s")
+              t-cons  (time-it [:conspiracy]               "-c")
+              t-multi (time-it [:sentiment :conspiracy]    "-m")
+              ms      (fn [ns] (long (/ ns 1e6)))]
+          (is (< t-multi (+ t-sent t-cons))
+              (format "multi-task should be faster than sequential singles. multi=%dms, seq=%dms"
+                      (ms t-multi) (ms (+ t-sent t-cons)))))))))

@@ -15,8 +15,12 @@
      clojure -M -m podcast.core sentiment,conspiracy <in.json>  # both"
   (:require [toolkit.os-guard]
             [clojure.data.json :as json]
+            [clojure.java.io :as io]
             [clojure.string :as str]
-            [podcast.llm :as llm]))
+            [podcast.flow :as flow]
+            [podcast.llm :as llm]
+            [toolkit.datapotamus.recorder :as recorder]
+            [toolkit.pubsub :as pubsub]))
 
 ;; ============================================================================
 ;; 1. Chunking — pure. Non-overlapping focus, backward-only context.
@@ -57,25 +61,7 @@
   (locking *out* (println) (println s) (flush)))
 
 ;; ============================================================================
-;; 3. Concurrency primitive — bounded pool for Stages A and C.
-;; ============================================================================
-
-(defn- bounded-pmap
-  "Like `pmap` but caps concurrency at `n` workers. Order-preserving.
-   Designed for I/O-bound chunk processing — the worker pool gates how
-   many concurrent LLM calls are in flight."
-  [n f coll]
-  (let [coll (vec coll)
-        sem  (java.util.concurrent.Semaphore. (int n))
-        futs (mapv (fn [x]
-                     (.acquire sem)
-                     (future
-                       (try (f x) (finally (.release sem)))))
-                   coll)]
-    (mapv deref futs)))
-
-;; ============================================================================
-;; 4. Stage D — pure aggregation. Group records by id-key, sort each
+;; 3. Stage D — pure aggregation. Group records by id-key, sort each
 ;;    entry's occurrences by paragraph_id (timestamp via the t{seconds}-...
 ;;    prefix would be more correct, but paragraph_id is monotone enough).
 ;; ============================================================================
@@ -174,7 +160,7 @@
      :slice [start end]   — process only paragraphs[start, end). Default: all.
      :chunking {:n :k}    — override chunk sizing. Default {:n 8 :k 5}.
      :run-dir <File|path> — write into this dir instead of allocating a new one.
-     :workers n           — bounded-pmap worker count for Stages A and C
+     :workers n           — Datapotamus worker pool size for Stages A and C
                             (one shared pool serves all tasks). Defaults to
                             `llm/detect-slots`, then 1."
   [config in-path & {:keys [slice chunking run-dir workers]
@@ -199,6 +185,15 @@
                           (str "Host: Joe Rogan. Description: "
                                (subs description 0 (min (count description) 600)))))
         per-task (fn [t] (-> config (dissoc :tasks) (assoc :task t)))
+        run-pubsub (pubsub/make)
+        recorder-handle (recorder/start-recorder!
+                         run-pubsub
+                         {:tasks      (mapv name tasks)
+                          :in-path    in-path
+                          :slice      slice
+                          :chunking   chunking
+                          :run-dir    (.getPath run-dir)
+                          :started-at (str (java.time.Instant/now))})
         _ (log-banner
            (format "Podcast extraction (%s) — %d paragraphs → %d chunks (N=%d, K=%d)%s  workers=%d"
                    (str/join "+" (map name tasks))
@@ -207,20 +202,9 @@
                    (if slice (format ", slice=%s" (pr-str slice)) "")
                    workers))
 
-        ;; ── Stage A: per-(task, chunk) mention extraction, shared pool ──
+        ;; ── Stage A: per-(task, chunk) mention extraction, shared Datapotamus flow ──
         a-t0 (System/currentTimeMillis)
-        a-results
-        (bounded-pmap
-         workers
-         (fn [[t chunk]]
-           (let [{:keys [mentions tokens cache rejected]}
-                 (llm/extract-mentions! (per-task t) chunk)
-                 tag (str (name t) "/" (name (:chunk-id chunk)))]
-             (log-stage :mentions tag (count mentions) tokens cache)
-             (when (seq rejected)
-               (println (format "    rejected %d mention(s) in %s" (count rejected) tag)))
-             {:task t :mentions mentions :tokens tokens}))
-         (for [t tasks, c chunks] [t c]))
+        a-results (flow/run-stage-a! config tasks chunks workers run-pubsub)
         a-elapsed (- (System/currentTimeMillis) a-t0)
         a-by-task (group-by :task a-results)
         mentions-by-task (update-vals a-by-task #(vec (mapcat :mentions %)))
@@ -240,9 +224,12 @@
               (mapv deref
                     (mapv (fn [t]
                             (future
-                              (let [r (llm/resolve-entities! (per-task t)
-                                                             (mentions-by-task t)
-                                                             paras chunks)]
+                              (let [r (llm/resolve-entities!
+                                       (per-task t)
+                                       (mentions-by-task t)
+                                       paras chunks
+                                       {:pubsub  run-pubsub
+                                        :flow-id (str "stage-b-" (name t))})]
                                 (log-stage :resolve (name t) (count (:registry r))
                                            (:tokens r) (:cache r))
                                 [t r])))
@@ -256,21 +243,10 @@
                    (apply + (map (comp :tokens val) b-results))
                    (/ b-elapsed 1000.0)))
 
-        ;; ── Stage C: per-(task, chunk) record extraction, shared pool ──
+        ;; ── Stage C: per-(task, chunk) record extraction, shared Datapotamus flow ──
         c-t0 (System/currentTimeMillis)
-        c-results
-        (bounded-pmap
-         workers
-         (fn [[t chunk]]
-           (let [registry (:registry (b-results t))
-                 {:keys [records tokens cache rejected]}
-                 (llm/extract-records! (per-task t) chunk registry)
-                 tag (str (name t) "/" (name (:chunk-id chunk)))]
-             (log-stage :records tag (count records) tokens cache)
-             (when (seq rejected)
-               (println (format "    rejected %d record(s) in %s" (count rejected) tag)))
-             {:task t :records records :tokens tokens}))
-         (for [t tasks, c chunks] [t c]))
+        registries-by-task (update-vals b-results :registry)
+        c-results (flow/run-stage-c! config tasks chunks registries-by-task workers run-pubsub)
         c-elapsed (- (System/currentTimeMillis) c-t0)
         c-by-task (group-by :task c-results)
         records-by-task (update-vals c-by-task #(vec (mapcat :records %)))
@@ -343,6 +319,26 @@
                         :timestamp    (str (java.time.Instant/now))}))]
       (spit meta-path
             (with-out-str (json/pprint (update existing :runs (fnil into []) new-runs)))))
+    (let [final-trace ((:stop recorder-handle))
+          enriched (recorder/assoc-final
+                    final-trace
+                    {:tasks              (mapv name tasks)
+                     :n-paragraphs       (count paras)
+                     :n-chunks           (count chunks)
+                     :timings            timings
+                     :total-tokens       total-tokens
+                     :registries-by-task (update-vals registries-by-task
+                                                      (fn [r] (into (sorted-map) r)))
+                     :mentions-by-task   (update-vals mentions-by-task vec)
+                     :records-by-task    records-by-task
+                     :paragraphs         (vec paras)
+                     :chunks             (mapv #(dissoc % :focus-ids) chunks)
+                     :ended-at           (str (java.time.Instant/now))})
+          trace-path (.getPath (io/file run-dir "trace.edn"))]
+      (io/make-parents trace-path)
+      (with-open [w (io/writer trace-path)]
+        (binding [*out* w *print-length* nil *print-level* nil]
+          (pr enriched))))
     (let [tps (when (pos? run-elapsed-ms)
                 (* 1000.0 (/ total-tokens (double run-elapsed-ms))))]
       (log-banner

@@ -495,20 +495,29 @@
   "Run `stepmap` against each input in `coll`. Appends an internal collector
    at the step's :out boundary. Returns a map like `run!` plus :outputs —
    a vector aligned with `coll` where each element is the vector of data
-   values whose ancestry traces back to that input."
+   values whose ancestry traces back to that input.
+
+   When the caller supplies an external `:pubsub` (e.g. to share trace
+   events with a recorder/viz across multiple concurrent runs), the
+   internal provenance subscription is scoped to events whose
+   `scope-path` starts with this run's `flow-id` — otherwise sibling
+   runs' events leak into our attribution and corrupt the per-input
+   output buckets."
   ([stepmap coll] (run-seq stepmap coll {}))
   ([stepmap coll opts]
    (if (empty? coll)
      {:state :completed :outputs [] :counters {:sent 0 :recv 0 :completed 0}}
      (let [collected (atom [])
            ps        (or (:pubsub opts) (pubsub/make))
+           fid       (or (:flow-id opts) (str (random-uuid)))
            provenance (atom [])
            prov-unsub (pubsub/sub ps [:>]
                                   (fn [_ ev _]
-                                    (when (#{:inject :split :merge :send-out} (:kind ev))
+                                    (when (and (= fid (first (:scope-path ev)))
+                                               (#{:inject :split :merge :send-out} (:kind ev)))
                                       (swap! provenance conj ev))))
            wf        (step/serial stepmap (collector-step ::collector collected))
-           handle    (start! wf (assoc (select-keys opts [:flow-id]) :pubsub ps))]
+           handle    (start! wf {:pubsub ps :flow-id fid})]
        (doseq [d coll] (inject! handle {:data d}))
        (let [signal    (await-quiescent! handle)
              result    (-> (stop! handle)
