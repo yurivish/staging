@@ -80,11 +80,19 @@ If a referent is genuinely ambiguous between two entities you've created, give i
 
 Respond with a JSON object conforming to the supplied schema. Output nothing else.")
 
+;; `max-leaf-entities` is paired with `loop-buffer-size` below: it bounds
+;; how many entity-msgs a single leaf can dump on the merger's :in port,
+;; which (transitively, summed across both bins of the worst-case root
+;; pair) bounds the merger's per-pair-process emission count. The loop
+;; buffer must be ≥ that emission count or the self-loop deadlocks.
+(def ^:private max-leaf-entities 64)
+
 (def ^:private leaf-schema
   {:type "object"
    :properties
    {:entities
     {:type "array"
+     :maxItems max-leaf-entities
      :items
      {:type "object"
       :properties
@@ -600,15 +608,32 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
 ;; Static graph wiring.
 ;; ============================================================================
 
+;; Self-loop deadlock guard: the merger emits up to (left-bin + right-bin)
+;; entity-msgs in a single pair-process invocation, and those msgs go back
+;; into its own :in via the loop edge. If the loop channel buffer can't
+;; hold them all at once, the proc thread blocks emitting and (being
+;; single-threaded) is the only thing that could drain :in — classic
+;; self-loop deadlock. See `self-loop-default-buffer-deadlocks` test for
+;; the minimal reproduction.
+;;
+;; Bound: max single-invocation emissions ≤ sum of all leaf entities,
+;; which is bounded by `max-leaf-entities × initial-n`. Even on the full
+;; 677-paragraph transcript (~85 chunks) at the schema cap of 64
+;; entities/leaf, the worst-case root pair emits ≤ 5440 — `loop-buffer-size`
+;; must exceed that. We pick 8192 for headroom.
+(def ^:private loop-buffer-size 8192)
+
 (defn- build-graph [config all-mentions paragraphs k-fwd workers initial-n]
   (-> (step/beside
        (explode-step config all-mentions paragraphs k-fwd)
        (c/workers :tree-leaves workers leaf-step)
        (pair-merger-step config initial-n))
       (step/connect [:tree-explode :out]  [:tree-leaves :in])
-      (step/connect [:tree-leaves :out]   [:tree-merger :in])
+      (step/connect [:tree-leaves :out]   [:tree-merger :in]
+                    {:buf-or-n loop-buffer-size})
       ;; The recursion: merger's :loop output feeds back into its own :in.
-      (step/connect [:tree-merger :loop]  [:tree-merger :in])
+      (step/connect [:tree-merger :loop]  [:tree-merger :in]
+                    {:buf-or-n loop-buffer-size})
       (step/input-at  :tree-explode)
       (step/output-at [:tree-merger :final])))
 

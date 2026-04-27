@@ -102,6 +102,67 @@
         ":tree-merger :loop must connect back to :tree-merger :in")))
 
 ;; ============================================================================
+;; Self-loop buffer-overflow deadlock — minimal reproduction.
+;;
+;; A single-proc step that emits N msgs on its :loop output (which feeds
+;; back to its own :in) deadlocks if the loop-edge channel buffer is
+;; smaller than N: the proc thread blocks putting msg #(buffer-size+1),
+;; and the only thing that could read from :in is itself.
+;;
+;; Pair: (1) demonstrate the deadlock with default buffer; (2) verify
+;; the {:buf-or-n N} edge option fixes it. These tests are the contract
+;; that guards the loop-edge buffer setting in `tree_resolve/build-graph`.
+;; ============================================================================
+
+(defn- looper-step [n]
+  (toolkit.datapotamus.step/step
+   :loopy
+   {:ins {:in ""} :outs {:loop "" :final ""}}
+   (fn [_ctx _state d]
+     (case d
+       :start {:loop (vec (repeat n :end))}
+       :end   {:final [:end]}))))
+
+(defn- looper-graph
+  [n loop-opts]
+  (let [base (toolkit.datapotamus.step/beside (looper-step n))
+        wired (if loop-opts
+                (toolkit.datapotamus.step/connect base
+                                                  [:loopy :loop] [:loopy :in]
+                                                  loop-opts)
+                (toolkit.datapotamus.step/connect base
+                                                  [:loopy :loop] [:loopy :in]))]
+    (-> wired
+        (toolkit.datapotamus.step/input-at :loopy)
+        (toolkit.datapotamus.step/output-at [:loopy :final]))))
+
+(defn- run-with-timeout
+  [graph timeout-ms]
+  (let [fut (future
+              (try (toolkit.datapotamus.flow/run-seq graph [:start])
+                   (catch Throwable e {:err (.getMessage e)})))]
+    (deref fut timeout-ms :timeout)))
+
+(deftest self-loop-default-buffer-deadlocks
+  (testing "200 emissions on a self-loop edge with default buffer deadlocks"
+    (let [result (run-with-timeout (looper-graph 200 nil) 3000)]
+      (is (= :timeout result)
+          "default buffer is too small; first invocation blocks emitting on :loop"))))
+
+(deftest self-loop-widened-buffer-completes
+  (testing "{:buf-or-n 4096} on the loop edge clears the deadlock"
+    (let [result (run-with-timeout (looper-graph 200 {:buf-or-n 4096}) 30000)]
+      (is (not= :timeout result))
+      (is (= :completed (:state result)))
+      (is (= 200 (count (first (:outputs result))))))))
+
+(deftest self-loop-large-burst-with-large-buffer
+  (testing "1000 emissions also complete with buffer=4096"
+    (let [result (run-with-timeout (looper-graph 1000 {:buf-or-n 4096}) 30000)]
+      (is (= :completed (:state result)))
+      (is (= 1000 (count (first (:outputs result))))))))
+
+;; ============================================================================
 ;; End-to-end with mocked cached-chat! — fires actual flow.
 ;; ============================================================================
 
