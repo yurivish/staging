@@ -1,5 +1,23 @@
 # Conventions
 
+## Design & Scope Discipline
+
+- Prefer the smallest, least invasive change that solves the problem; do not bundle unrelated refactors.
+- When the user pushes back on an approach, STOP and re-plan rather than continuing in the original direction.
+- When asked to verify a claim or limitation, actually check the code before answering — never speculate about what a combinator/API can or can't do.
+
+## Communication Style
+
+- Keep explanations concise; do not produce wall-of-text design docs unless explicitly asked.
+- For Clojure code, prefer Feynman/Hickey-style clarity: name things for what they mean, not how they're implemented.
+- When writing runnable command examples in docstrings, avoid escaped quotes that break copy-paste.
+
+## Testing
+
+- Always run the full test suite after refactors and report the pass count (e.g., '337 tests passing').
+- Use the `:slow` test marker (not `:costly`) for expensive tests.
+- Never run tests that hit real LLM APIs without explicit confirmation; prefer mock/stub LLMs (e.g., fake Haiku stub) by default.
+
 ## OS guard
 
 The app expects a Linux container — lmdbjava, brotli4j, and parquet/hadoop
