@@ -106,12 +106,16 @@
 
    Options (all optional):
      :latency-ms — sleep this long on cache miss before responding (default 0).
+     :jitter-fn  — 0-arg fn called on cache miss before responding; use to
+                   inject scheduler-perturbing delays (e.g. Thread/yield or
+                   randomised sleeps) without picking a single :latency-ms.
+                   Runs after :latency-ms if both are set.
      :slots      — semaphore-cap on concurrent in-flight calls (default unlimited).
                    Mimics e.g. a 4-slot llama.cpp server.
      :cache      — atom backing the in-memory cache (default fresh atom).
                    Pass a shared atom to test cache-hit behaviour across runs."
   ([] (responder {}))
-  ([{:keys [latency-ms slots cache]
+  ([{:keys [latency-ms jitter-fn slots cache]
      :or   {latency-ms 0 cache (atom {})}}]
    (let [sem (when slots (java.util.concurrent.Semaphore. (int slots)))]
      (fn [stage model-cfg system content-parts schema]
@@ -122,6 +126,7 @@
              (when sem (.acquire sem))
              (try
                (when (pos? latency-ms) (Thread/sleep ^long latency-ms))
+               (when jitter-fn (jitter-fn))
                (let [res {:value  (payload-for stage system content-parts)
                           :tokens (stage-tokens stage 0)}]
                  (swap! cache assoc k res)

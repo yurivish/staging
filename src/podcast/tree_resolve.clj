@@ -67,6 +67,17 @@ CLUSTERING RULES — read these carefully:
     - Generic stage props or ambient referents mentioned in passing without sustained attention (\"this table\", \"the road\", \"a note\", \"a bag of masks\" if just mentioned once as a prop).
     - Pure rhetorical framings (\"an inconvenient fact\", \"the situation\", \"the claim that X\") — these are descriptions of speech acts, not entities. Drop them.
 
+PRONOUN HANDLING — be explicit:
+  - \"I\" / \"my\" / \"me\" → cluster under the speaker named in Stage A's `guess` field.
+  - \"you\" / \"your\" → cluster under the addressed speaker named in `guess`.
+  - \"we\" / \"us\" / \"our\" — these are COLLECTIVE pronouns referring to multiple speakers at once. Stage A may canonicalise them as \"Joe Rogan and Andy Stumpf\" or similar; this is a Stage A artefact, NOT a real entity. When you see such a guess: assign the mention to whichever speaker held the floor in the surrounding paragraphs. If you genuinely cannot tell, drop the mention.
+  - \"the show\" / \"your show\" / \"the podcast\" / \"this podcast\" — these refer to the PROGRAM, a SEPARATE entity from the speakers. Cluster them under a \"the podcast\" entity if they appear repeatedly, or drop them as incidental otherwise. NEVER lump them in with Joe Rogan or Andy Stumpf.
+
+WRONG ENTITY EXAMPLE — do not produce this:
+  canonical: \"Joe Rogan and Andy Stumpf\"
+  aliases: [\"us\", \"Joe Rogan and Andy Stumpf\", \"your show\", \"Joe Rogan's show\"]
+This entity conflates two speakers AND the podcast program. The correct output is THREE separate entities: Joe Rogan, Andy Stumpf, and (optionally) the podcast.
+
 ALWAYS CLUSTER the speakers and named persons:
   - Stage A's `guess` column gives a canonical name for each mention (often resolving \"I\" / \"you\" / \"he\" to the actual person using episode metadata). If `guess` is a named person, place, or organization, that mention IS for an entity — cluster it under that name even if no literal name appears in the FOCUS paragraphs. The host and guest of the podcast almost always appear as \"I\" / \"my\" / \"you\" mentions and MUST appear in your registry.
   - The HOST and the GUEST are TWO DIFFERENT people. \"I\" alternates between them depending on whose turn it is in the conversation; the FOCUS paragraphs make this clear by attribution. Stage A's `guess` field disambiguates per-mention — if mention A has guess='Joe Rogan' and mention B has guess='Andy Stumpf', they belong to TWO different entities. NEVER produce a single entity called \"Joe Rogan and Andy Stumpf\" — output Joe Rogan as one entity and Andy Stumpf as another, even when both appear in the same chunk.
@@ -116,21 +127,29 @@ Each side has already been deduplicated within itself — your only job is to fi
 
 You see, for each entry, an id, a canonical name, the surface aliases observed, and a one-sentence summary written when local transcript context was available. There is NO raw transcript here — rely on the names, aliases, and summaries.
 
-KEY PRINCIPLE: same REFERENT means merge, even if the two sides emphasized different aspects of it. A specific person mentioned with different roles, a vaccine described with different concerns — these are still ONE entity. The summaries describing different aspects is normal and EXPECTED, not a reason to keep them apart. The merged summary should combine both perspectives.
-
-MERGE WHEN any of these hold:
-  - One side's canonical (or any alias) matches the other side's canonical (or any alias) verbatim, ignoring case, plural/singular, articles ('the', 'a'), or trivial punctuation. EXAMPLES: 'Trump' = 'the president' if summaries both name him; 'Andy' = 'Andy Stumpf'; 'mRNA vaccine' = 'mRNA vaccines'; 'LA' = 'Los Angeles'; 'Joe' = 'Joe Rogan'.
-  - One side's canonical is a clear abbreviation or expansion of the other ('DTP' / 'Diphtheria, tetanus, and pertussis vaccine'; 'mRNA' / 'messenger RNA').
-  - The summaries describe the same person/place/organization, even if from different angles (e.g., 'Joe Rogan, the host' + 'the host of the podcast' → merge).
+KEY PRINCIPLE: merge requires the SAME REFERENT. Similar behaviour, similar role, or similar archetype is NOT enough. Two entities that are 'both profit-driven' or 'both controlling media' are not the same entity if their canonical names point at different things. Read the rules below before deciding.
 
 DO NOT MERGE WHEN:
   - The canonical names refer to DIFFERENT named people, even if they share a role. The host and guest of a podcast are two different people; both may have 'I', 'you', or 'me' as aliases (because Stage A canonicalised pronouns per chunk to whichever speaker was talking), but if LEFT canonical is 'Joe Rogan' and RIGHT canonical is 'Andy Stumpf', they are DIFFERENT entities — never merge them, no matter how similar the summaries sound. Pronoun-alias overlap is NOT a merge signal.
   - The two sides are different people who share a name component ('Andy Stumpf' vs 'Andy Stumpf's friend' — different people).
   - One is a category, the other an instance ('pharmaceutical companies' vs 'Pfizer').
-  - One is a specific category, the other a broader category ('pharmaceutical companies' vs 'corporations'; 'mRNA vaccines' vs 'vaccines'). Even if one is technically a subset of the other, keep them separate when the speakers use them as distinct topics.
+  - One canonical names a SPECIFIC industry, organisation, or category ('pharmaceutical companies', 'media corporations', 'tech companies'), and the other names a BROADER ABSTRACTION ('corporations', 'the system', 'the establishment', 'the elite'). These are different LEVELS OF GRANULARITY. Even if both summaries describe similar behaviour (profit-driven, controlling media, etc.), the REFERENTS are different. The speakers may rhetorically conflate them — keep them separate so downstream analysis preserves the distinction.
+  - Rhetorical similarity is NOT a merge signal. 'Both are profit-driven', 'both control media', 'both are bad actors' describe a SHARED ARCHETYPE, not the SAME REFERENT.
   - Generic noun phrases ('people', 'they', 'some people') with anything specific.
   - Semantic neighbours that are clearly distinct entities ('Cybertruck' vs 'electric car').
   - The two sides are different things that happen to share a topic ('mRNA vaccines linked to cancer' vs 'vaccine injuries' — related concerns but distinct entities).
+
+WRONG MERGE EXAMPLE — do not merge these:
+  LEFT  canonical='pharmaceutical companies'
+        summary='Profit-driven companies pushing vaccines'
+  RIGHT canonical='corporations'
+        summary='Profit-driven entities controlling media'
+  → DO NOT MERGE. These are different levels of abstraction (one industry vs all companies). The summaries describe similar BEHAVIOUR but the REFERENTS are different. Keep both, separate.
+
+MERGE WHEN any of these hold:
+  - One side's canonical (or any alias) matches the other side's canonical (or any alias) verbatim, ignoring case, plural/singular, articles ('the', 'a'), or trivial punctuation. EXAMPLES: 'Trump' = 'the president' if summaries both name him; 'Andy' = 'Andy Stumpf'; 'mRNA vaccine' = 'mRNA vaccines'; 'LA' = 'Los Angeles'; 'Joe' = 'Joe Rogan'.
+  - One side's canonical is a clear abbreviation or expansion of the other ('DTP' / 'Diphtheria, tetanus, and pertussis vaccine'; 'mRNA' / 'messenger RNA').
+  - The summaries describe the same person/place/organization, even if from different angles (e.g., 'Joe Rogan, the host' + 'the host of the podcast' → merge).
 
 For each merge group, output:
   - ids: ≥ 2 distinct ids drawn from LEFT and RIGHT (mixed).
