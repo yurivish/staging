@@ -7,17 +7,27 @@
 
    Claude Code does variable amounts of work per invocation: many tool calls
    on a hard task, few on an easy one. The reason this step still emits
-   *exactly one* `:out` message per `:in` is the output-format choice we
-   hard-wire: `--output-format json` makes the CLI buffer the entire agent
-   loop and print one JSON document on stdout when the run terminates. We
-   slurp that document and emit it as one message. Switching to
-   `--output-format stream-json` would print one JSON line per turn and
-   break this contract — that is why we don't.
+   *exactly one* `:out` message per `:in` is in how we consume the CLI's
+   output. With the default `--output-format json`, the CLI buffers the
+   entire agent loop and prints one JSON document on stdout when the run
+   terminates; we slurp it and emit one message.
+
+   With `:stream? true` (opt-in) we switch to `--output-format stream-json`
+   and read one JSON event per line as the agent works — system init,
+   each assistant turn, each tool_use / tool_result, then a final `result`
+   event whose shape matches the buffered output. We project each
+   intermediate event into a `trace/emit` status event on the scoped
+   pubsub (`:phase :assistant-text`, `:tool-use`, `:tool-result`, etc.)
+   and return the `result` event's data exactly as if we'd been in
+   buffered mode. The data port still emits exactly one final message
+   per input — streaming changes only the *side-band* trace channel,
+   not the data contract.
 
    The invariant is on the `:out` *data port*. Side-band `:status` events
    (`trace/emit`) are independent of it: this step publishes one at run
-   start and one at run finish so observers see a heartbeat across what
-   would otherwise be a long silent gap.
+   start, one at run finish, and (in stream mode) one per agent turn so
+   observers see a live heartbeat across what would otherwise be a long
+   silent gap.
 
    On failure the step emits zero `:out` messages and a `:failure` event on
    the standard trace channel (handled by `flow.clj`'s catch in
@@ -165,6 +175,139 @@
    ^Runnable
    (fn [] (.append sb ^String (slurp err)))))
 
+;; ============================================================================
+;; Stream-json (`:stream? true`) consumer
+;; ============================================================================
+;;
+;; Verified against claude 2.1.119 (2026-04). Event shapes observed live:
+;;   {"type":"system","subtype":"status",...}                 — early heartbeat, skip
+;;   {"type":"system","subtype":"init","session_id",...}      — session ready
+;;   {"type":"assistant","message":{"content":[{type:"text"|"thinking"|"tool_use",...}]}}
+;;   {"type":"user","message":{"content":[{type:"tool_result", tool_use_id, content, is_error?}]}}
+;;   {"type":"result", ...}                                   — final summary, same shape as
+;;                                                              buffered --output-format json
+;;
+;; Claude Code implements `--json-schema` as a synthetic `StructuredOutput`
+;; tool: the model emits a tool_use with name "StructuredOutput" and the
+;; structured args; the harness echoes a tool_result acknowledgement; the
+;; final `result` event's `structured_output` field is what the caller sees.
+
+(def ^:private preview-len 500)
+(def ^:private text-preview-len 200)
+
+(defn- truncate-str [^String s n]
+  (cond
+    (nil? s)        nil
+    (<= (count s) n) s
+    :else           (str (subs s 0 n) "…")))
+
+(defn- coerce-content
+  "Tool-result content can be a string or a list of content blocks
+   (e.g. for image-bearing results). Flatten to a string for preview."
+  [c]
+  (cond
+    (string? c)     c
+    (sequential? c) (str/join "\n" (keep #(or (:text %) (some-> % :content coerce-content)) c))
+    :else           (pr-str c)))
+
+(defn- project-block
+  "Project one content block from an assistant or user message into trace
+   events. Returns a vector of zero or more event-data maps."
+  [block turn-index]
+  (case (:type block)
+    "text"     [{:phase :assistant-text
+                 :turn-index turn-index
+                 :length (count (:text block))
+                 :preview (truncate-str (:text block) text-preview-len)}]
+    "thinking" [{:phase :assistant-thinking
+                 :turn-index turn-index
+                 :length (count (or (:thinking block) (:text block) ""))}]
+    "tool_use" [{:phase :tool-use
+                 :turn-index turn-index
+                 :tool (:name block)
+                 :tool-use-id (:id block)
+                 :input-preview (truncate-str (json/write-str (:input block)) preview-len)}]
+    "tool_result"
+    (let [content (coerce-content (:content block))]
+      [{:phase :tool-result
+        :tool-use-id (:tool_use_id block)
+        :is-error (boolean (:is_error block))
+        :content-length (count content)
+        :content-preview (truncate-str content preview-len)}])
+    ;; Unknown block type — just skip silently rather than fail the run.
+    []))
+
+(defn- project-event
+  "Project one parsed stream event into trace events. Returns a vector of
+   zero or more event-data maps. Top-level discrimination on `:type`."
+  [event turn-index]
+  (case (:type event)
+    "system"
+    (case (:subtype event)
+      "init"   [{:phase :session-init
+                 :session-id (:session_id event)
+                 :model (:model event)
+                 :cwd (:cwd event)
+                 :tools-count (count (:tools event))
+                 :mcp-servers-count (count (:mcp_servers event))}]
+      ;; status, etc. — quiet
+      [])
+
+    "assistant"
+    (vec (mapcat #(project-block % turn-index)
+                 (-> event :message :content)))
+
+    "user"
+    (vec (mapcat #(project-block % turn-index)
+                 (-> event :message :content)))
+
+    ;; "result" handled at the consumer level (it's the return value, not a
+    ;; status event) — :run-finished is emitted by run! itself.
+    "result" []
+    []))
+
+(defn- parse-stream-line
+  "Parse one NDJSON line. Returns the event map (raw, snake_case keywords)
+   or {:parse-error true :line line :ex ex} on failure."
+  [^String line]
+  (try
+    (json/read-str line :key-fn keyword)
+    (catch Throwable ex
+      {:parse-error true :line line :ex ex})))
+
+(defn- consume-stream!
+  "Read NDJSON events line-by-line from `rdr`, emit `trace/emit` status
+   events through `ctx`, and return the data of the final `result` event
+   (kebab-keyed to match buffered-mode output). Throws if the stream
+   ends without a `result` event."
+  [^BufferedReader rdr ctx]
+  (loop [final nil
+         turn-index 0]
+    (let [line (.readLine rdr)]
+      (if (nil? line)
+        (or final (throw (ex-info "claude stream ended without :result event" {})))
+        (let [parsed (parse-stream-line line)]
+          (cond
+            (:parse-error parsed)
+            (do
+              (when ctx
+                (trace/emit ctx {:phase :stream-parse-error
+                                 :line-preview (truncate-str line text-preview-len)
+                                 :exception-message (ex-message (:ex parsed))}))
+              (recur final turn-index))
+
+            :else
+            (let [next-idx (cond-> turn-index
+                             (= "assistant" (:type parsed)) inc)]
+              (when ctx
+                (doseq [te (project-event parsed turn-index)]
+                  (trace/emit ctx te)))
+              (recur (if (= "result" (:type parsed))
+                       ;; convert snake → kebab to match buffered branch
+                       (json->kebab line)
+                       final)
+                     next-idx))))))))
+
 (defn run!
   "Run `claude -p` with the given opts; return the parsed result map.
    Throws ex-info on non-zero exit. See namespace docstring for the opts
@@ -190,29 +333,51 @@
           stderr-sb (StringBuilder.)
           _stderr-t (drain-stderr! (:err proc) stderr-sb)
           _cancel-t (watch-cancel! cancel (:proc proc))
-          stdout    (slurp (:out proc))
-          exit      (:exit @proc)]
-      (if (zero? exit)
-        (let [result (try (json->kebab stdout)
-                          (catch Throwable ex
-                            (throw (ex-info "claude returned non-JSON on stdout"
-                                            {:exit       exit
-                                             :stderr     (str stderr-sb)
-                                             :raw-stdout stdout
-                                             :args       args}
-                                            ex))))]
+          stream?   (boolean (:stream? opts'))
+          ;; Stream mode: read line-by-line, emit per-event trace events,
+          ;; return the final :result event's data. Buffered: slurp all,
+          ;; parse one JSON document. Either way, we wait for proc exit
+          ;; before checking the exit code.
+          [result raw-stdout]
+          (if stream?
+            (with-open [rdr (io/reader (:out proc))]
+              (let [r (try (consume-stream! rdr ctx)
+                           (catch Throwable _ nil))]
+                ;; Drain any remaining bytes for diagnostics — usually empty in
+                ;; stream mode since we read to EOF, but keeps the error path
+                ;; consistent.
+                [r ""]))
+            (let [stdout (slurp (:out proc))]
+              [(try (json->kebab stdout)
+                    (catch Throwable _ nil))
+               stdout]))
+          exit (:exit @proc)]
+      (cond
+        (not (zero? exit))
+        (throw (ex-info "claude exited non-zero"
+                        {:exit       exit
+                         :stderr     (str stderr-sb)
+                         :raw-stdout raw-stdout
+                         :args       args}))
+
+        (nil? result)
+        (throw (ex-info (if stream?
+                          "claude stream ended without :result event"
+                          "claude returned non-JSON on stdout")
+                        {:exit       exit
+                         :stderr     (str stderr-sb)
+                         :raw-stdout raw-stdout
+                         :args       args}))
+
+        :else
+        (do
           (when ctx
             (trace/emit ctx (cond-> {:phase :run-finished}
                               (contains? result :stop-reason)    (assoc :stop-reason    (:stop-reason result))
                               (contains? result :total-cost-usd) (assoc :total-cost-usd (:total-cost-usd result))
                               (contains? result :num-turns)      (assoc :num-turns      (:num-turns result))
                               (contains? result :is-error)       (assoc :is-error       (:is-error result)))))
-          result)
-        (throw (ex-info "claude exited non-zero"
-                        {:exit       exit
-                         :stderr     (str stderr-sb)
-                         :raw-stdout stdout
-                         :args       args}))))))
+          result)))))
 
 ;; ============================================================================
 ;; Datapotamus step

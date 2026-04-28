@@ -151,24 +151,28 @@
 ;; --- end-to-end with cc-step/run! stubbed -----------------------------------
 
 (deftest extract!-end-to-end-with-stubbed-runs
+  ;; Single-chunk path: extractor-chunk-size larger than the fixture, so
+  ;; the extractor runs once over the whole transcript.
   (with-cache-disabled
     (fn []
-      (let [in-path  (write-fixture-input!)
+      (let [cfg      (assoc cc/local-cfg :extractor-chunk-size 100)
+            in-path  (write-fixture-input!)
             run-dir  (doto (java.io.File/createTempFile "cc-run-" "")
                       (#(io/delete-file % true))
                       .mkdirs)
             calls    (atom [])
             stub-run (fn [opts]
                        (swap! calls conj (select-keys opts [:append-system-prompt :model]))
-                       ;; First call (scout) returns registry; second (extractor) returns records.
-                       (if (zero? (mod (count @calls) 2))
-                         (mock-extractor-result)
-                         (mock-scout-result)))]
+                       ;; First call (scout) returns registry; subsequent calls (extractor chunks) return records.
+                       (if (= 1 (count @calls))
+                         (mock-scout-result)
+                         (mock-extractor-result)))]
         (with-redefs [cc-step/run! stub-run]
-          (let [results (cc/extract! cc/local-cfg in-path :run-dir run-dir)
-                {:keys [registry records rejected]} (:sentiment results)]
-            (testing "scout + extractor each invoked once"
-              (is (= 2 (count @calls))))
+          (let [results (cc/extract! cfg in-path :run-dir run-dir)
+                {:keys [registry records rejected extractor-chunks]} (:sentiment results)]
+            (testing "scout + 1 extractor chunk = 2 calls"
+              (is (= 2 (count @calls)))
+              (is (= 1 (count extractor-chunks))))
             (testing "registry has 3 entities, string-keyed"
               (is (= 3 (count registry)))
               (is (every? string? (keys registry))))
@@ -188,12 +192,61 @@
                 (is (= 2 (:n-records out)))
                 (is (= 3 (:n-rejected out)))
                 (is (= "local" (:flavor out))))))
-          (testing "run.json carries scout/extractor metadata for each task"
+          (testing "run.json carries scout + extractor-chunks metadata"
             (let [f (io/file run-dir "run.json")]
               (is (.exists f))
               (let [meta (json/read-str (slurp f) :key-fn keyword)
                     run  (first (:runs meta))]
                 (is (= "local" (:flavor meta)))
                 (is (= "sentiment" (:task run)))
+                (is (= 1 (:n-chunks run)))
                 (is (= "end_turn" (-> run :scout :stop-reason)))
-                (is (= "end_turn" (-> run :extractor :stop-reason)))))))))))
+                (is (= "end_turn" (-> run :extractor-chunks first :stop-reason)))))))))))
+
+(deftest extract!-chunks-extractor-when-paragraphs-exceed-chunk-size
+  ;; Multi-chunk path: chunk-size 2 against 4-paragraph fixture forces 2
+  ;; extractor calls. Each call's records are validated against ONLY that
+  ;; chunk's focus paragraphs, not the full transcript.
+  (with-cache-disabled
+    (fn []
+      (let [cfg      (assoc cc/local-cfg :extractor-chunk-size 2)
+            in-path  (write-fixture-input!)
+            run-dir  (doto (java.io.File/createTempFile "cc-run-" "")
+                      (#(io/delete-file % true))
+                      .mkdirs)
+            inputs-hashes (atom [])
+            stub-run (fn [opts]
+                       (swap! inputs-hashes conj (or (:prompt opts) ""))
+                       (if (= 1 (count @inputs-hashes))
+                         (mock-scout-result)
+                         (mock-extractor-result)))]
+        (with-redefs [cc-step/run! stub-run]
+          (let [results (cc/extract! cfg in-path :run-dir run-dir)
+                {:keys [extractor-chunks records]} (:sentiment results)
+                chunk0 (first extractor-chunks)
+                chunk1 (second extractor-chunks)]
+            (testing "scout + 2 extractor chunks = 3 calls"
+              (is (= 3 (count @inputs-hashes))))
+            (testing "extractor-chunks vec has 2 entries with distinct chunk-ids"
+              (is (= 2 (count extractor-chunks)))
+              (is (= :x-0 (:chunk-id chunk0)))
+              (is (= :x-1 (:chunk-id chunk1)))
+              (is (not= (:focus-range-label chunk0) (:focus-range-label chunk1))))
+            (testing "chunk 0 focus = first 2 paragraphs"
+              (is (= "t0-0..t10-1" (:focus-range-label chunk0))))
+            (testing "chunk 1 focus = last 2 paragraphs"
+              (is (= "t30-2..t60-3" (:focus-range-label chunk1))))
+            (testing "stub returned same 5 records to each chunk; per-chunk validation"
+              ;; Each chunk validates against its focus only.
+              ;; chunk 0 focus={t0-0,t10-1}: t30-2 invalid (out of focus),
+              ;; t60-3 invalid (out of focus), 3 invalid for other reasons → 0 valid
+              ;; chunk 1 focus={t30-2,t60-3}: t30-2 valid, t60-3 valid → 2 valid
+              (is (= 0 (count (:records chunk0))))
+              (is (= 2 (count (:records chunk1)))))
+            (testing "aggregated records = 0 + 2 = 2"
+              (is (= 2 (count records))))
+            (testing "run.json reports 2 chunks"
+              (let [meta (json/read-str (slurp (io/file run-dir "run.json")) :key-fn keyword)
+                    run  (first (:runs meta))]
+                (is (= 2 (:n-chunks run)))
+                (is (= 2 (count (:extractor-chunks run))))))))))))
