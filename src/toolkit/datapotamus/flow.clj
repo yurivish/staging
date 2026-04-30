@@ -89,29 +89,35 @@
 (defn- run-done
   "Done cascade: track closed-ins in framework state. When all inputs are
    closed, call :on-all-closed (drain hook), then forward (new-done) on
-   every output port."
+   every output port. Closed ports stay closed — a redundant done on an
+   already-closed port is a no-op (matters for cyclic flows where a
+   feedback edge can re-deliver done after on-all-closed has fired)."
   [hmap m ctx s trace-sid ins outs]
-  (let [closed  (conj (::closed-ins s #{}) (:in-port ctx))
-        all-ins (set (keys ins))]
-    (if (= closed all-ins)
-      (try
-        (let [ret                  ((:on-all-closed hmap) ctx s)
-              [s' msgs]            (normalize-return s ret)
-              [synth-pm synth-evs] (msg/synthesize msgs m trace-sid)
-              port-map             (reduce (fn [pm p]
-                                             (update pm p (fnil conj []) (msg/new-done)))
-                                           synth-pm (keys outs))
-              events (vec (concat synth-evs
-                                  (send-out-events trace-sid port-map)
-                                  [(trace/success-event trace-sid m)]))]
-          [(assoc s' ::closed-ins closed) port-map events])
-        (catch Throwable ex
-          [(assoc s ::closed-ins closed)
+  (let [in-port (:in-port ctx)
+        closed  (::closed-ins s #{})]
+    (if (contains? closed in-port)
+      [s {} [(trace/success-event trace-sid m)]]
+      (let [closed' (conj closed in-port)
+            all-ins (set (keys ins))]
+        (if (= closed' all-ins)
+          (try
+            (let [ret                  ((:on-all-closed hmap) ctx s)
+                  [s' msgs]            (normalize-return s ret)
+                  [synth-pm synth-evs] (msg/synthesize msgs m trace-sid)
+                  port-map             (reduce (fn [pm p]
+                                                 (update pm p (fnil conj []) (msg/new-done)))
+                                               synth-pm (keys outs))
+                  events (vec (concat synth-evs
+                                      (send-out-events trace-sid port-map)
+                                      [(trace/success-event trace-sid m)]))]
+              [(assoc s' ::closed-ins closed') port-map events])
+            (catch Throwable ex
+              [(assoc s ::closed-ins closed')
+               {}
+               [(trace/failure-event trace-sid m ex)]]))
+          [(assoc s ::closed-ins closed')
            {}
-           [(trace/failure-event trace-sid m ex)]]))
-      [(assoc s ::closed-ins closed)
-       {}
-       [(trace/success-event trace-sid m)]])))
+           [(trace/success-event trace-sid m)]])))))
 
 (defn run-step
   "Pure dispatch. Returns [new-state port-map events].
