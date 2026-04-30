@@ -67,7 +67,7 @@
 (def ^:private DEFAULTS
   "Filled in by `handler-map` when the user omits the slot. Signal broadcasts
    a signal msg on every output port; all-closed emits nothing (the interpreter
-   cascades `done` onto outs in addition); init is an empty state map; stop
+   cascades `input-done` onto outs in addition); init is an empty state map; stop
    releases nothing."
   {:ports         {:ins {:in ""} :outs {:out ""}}
    :on-signal     (fn [ctx _state]

@@ -1,5 +1,5 @@
-(ns toolkit.datapotamus.close-done-test
-  "Tests for the proc-fn nil-msg → done synthesis behavior in flow.clj.
+(ns toolkit.datapotamus.close-input-done-test
+  "Tests for the proc-fn nil-msg → input-done synthesis behavior in flow.clj.
 
    Two invariants under test:
 
@@ -7,8 +7,8 @@
         declared input port :p, feeding a sequence of envelopes onto :p's
         input channel and then *closing the channel* produces the same trace
         stream / counter deltas / output port-map as feeding the same envelopes
-        followed by (msg/new-done), modulo :msg-id (fresh) and :parent-msg-ids
-        (empty) on the terminating event.
+        followed by (msg/new-input-done), modulo :msg-id (fresh) and
+        :parent-msg-ids (empty) on the terminating event.
 
    I-2. Filter on undeclared inputs. Closing a channel that reaches the proc
         via ::flow/in-ports under a name not in the handler's declared
@@ -201,7 +201,7 @@
 
 (defn- close-scenario [pre-envs] (run-with-terminator pre-envs a/close!))
 (defn- envelope-scenario [pre-envs]
-  (run-with-terminator pre-envs (fn [c] (a/>!! c (msg/new-done)))))
+  (run-with-terminator pre-envs (fn [c] (a/>!! c (msg/new-input-done)))))
 
 (defn- equivalent?
   "True iff the close-scenario and envelope-scenario produced equivalent
@@ -223,15 +223,15 @@
           probe-shapes (shapes-for events :probe)]
       (testing "probe: exactly one :recv (the synthesized done) on :in"
         (is (= 1 (count (:recv probe-shapes))))
-        (is (= {:kind :recv :msg-kind :done :step-id :probe :in-port :in}
+        (is (= {:kind :recv :msg-kind :input-done :step-id :probe :in-port :in}
                (first (:recv probe-shapes)))))
       (testing "probe: exactly one :send-out for the auto-appended done on :out"
         (is (= 1 (count (:send-out probe-shapes))))
-        (is (= {:kind :send-out :msg-kind :done :step-id :probe :port :out}
+        (is (= {:kind :send-out :msg-kind :input-done :step-id :probe :port :out}
                (first (:send-out probe-shapes)))))
       (testing "probe: exactly one :success"
         (is (= 1 (count (:success probe-shapes))))
-        (is (= :done (-> probe-shapes :success first :msg-kind))))
+        (is (= :input-done (-> probe-shapes :success first :msg-kind))))
       (testing "counters: probe (sent +1 send-out, recv +1, completed +1) +
                           sink   (recv +1 done arrival, completed +1, no sent)"
         (is (= {:sent 1 :recv 2 :completed 2} counters)))))
@@ -279,7 +279,7 @@
         (case (first step)
           :write          (a/>!! (chans (second step)) (nth step 2))
           :close          (a/close! (chans (second step)))
-          :done           (a/>!! (chans (second step)) (msg/new-done))
+          :done           (a/>!! (chans (second step)) (msg/new-input-done))
           :wait-success   (success-of h :probe (second step))))
       (let [r (stop! h)]
         (:events r))
@@ -291,14 +291,14 @@
   "Count the number of cascade-completing :success :done events fired."
   [events]
   (count (filterv #(and (= :success (:kind %))
-                        (= :done    (:msg-kind %))
+                        (= :input-done    (:msg-kind %))
                         (= :probe   (:step-id %)))
                   events)))
 
-(defn- count-recv-dones
+(defn- count-recv-input-dones
   [events]
   (count (filterv #(and (= :recv (:kind %))
-                        (= :done (:msg-kind %))
+                        (= :input-done (:msg-kind %))
                         (= :probe (:step-id %)))
                   events)))
 
@@ -313,14 +313,14 @@
       ;; First close: :recv done on :a, :success done (no cascade fires yet
       ;; because b is still open; run-done's else branch emits a :success
       ;; event for the recorded close-tracking)
-      (is (= 2 (count-recv-dones events)))
+      (is (= 2 (count-recv-input-dones events)))
       (is (= 2 (count-cascades  events)))
       (testing "second close: cascade fires (auto-append done on :out)"
         (let [send-outs (filterv #(and (= :send-out (:kind %))
                                        (= :probe (:step-id %)))
                                  events)]
           (is (= 1 (count send-outs)) "exactly one :send-out — the cascade's done")
-          (is (= :done (:msg-kind (first send-outs))))
+          (is (= :input-done (:msg-kind (first send-outs))))
           (is (= :out  (:port     (first send-outs))))))))
   (testing "close :b then :a — same result"
     (let [chans  {:a (a/chan) :b (a/chan)}
@@ -329,7 +329,7 @@
                                    [:wait-success 1]
                                    [:close :a]
                                    [:wait-success 2]])]
-      (is (= 2 (count-recv-dones events)))
+      (is (= 2 (count-recv-input-dones events)))
       (is (= 2 (count-cascades  events)))
       (let [send-outs (filterv #(and (= :send-out (:kind %))
                                      (= :probe (:step-id %)))
@@ -351,7 +351,7 @@
             send-outs (filterv #(and (= :send-out (:kind %))
                                      (= :probe (:step-id %)))
                                events)]
-        (is (= 2 (count-recv-dones events)))
+        (is (= 2 (count-recv-input-dones events)))
         (is (= 1 (count send-outs))
             "exactly one :send-out (the cascade's auto-appended done)")))))
 
@@ -439,7 +439,7 @@
       (try
         (a/close! extra-chan)
         (Thread/sleep 50)
-        (a/>!! decl-chan (msg/new-done))
+        (a/>!! decl-chan (msg/new-input-done))
         (success-of h :probe 1)
         (let [ev (events h)
               sends (filterv #(and (= :send-out (:kind %)) (= :probe (:step-id %))) ev)]
@@ -487,7 +487,7 @@
                       (filterv #(and (= :recv (:kind %)) (= :probe (:step-id %))))
                       first)]
         (is (= :recv (:kind recv)))
-        (is (= :done (:msg-kind recv)))
+        (is (= :input-done (:msg-kind recv)))
         (is (= :in   (:in-port recv)))
         (is (= :probe (:step-id recv)))
         (testing ":msg-id is fresh and well-formed"
@@ -554,7 +554,7 @@
               succs (filterv #(and (= :success (:kind %)) (= :probe (:step-id %))) ev)
               sends (filterv #(and (= :send-out (:kind %)) (= :probe (:step-id %))) ev)]
           (is (= 1 (count fails)))
-          (is (= :done (:msg-kind (first fails))))
+          (is (= :input-done (:msg-kind (first fails))))
           (is (= 0 (count succs)) "no :success on cascade-throw")
           (is (= 0 (count sends)) "no auto-appended done emitted on cascade-throw"))
         (finally (stop! h))))))
@@ -590,7 +590,7 @@
               recv-done-by-sid
               (frequencies (mapv :step-id
                                  (filterv #(and (= :recv (:kind %))
-                                                (= :done (:msg-kind %)))
+                                                (= :input-done (:msg-kind %)))
                                           ev)))]
           (is (= {:head 1 :mid 1 :sink 1} recv-done-by-sid)
               "each step received the cascading done exactly once"))
@@ -630,3 +630,82 @@
 (defspec close-equivalent-to-envelope-done 50
   (prop/for-all [pre gen-pre-envs]
     (equivalent? pre)))
+
+;; ============================================================================
+;; J. msg/drain in :on-all-closed
+;;
+;; Symmetric extension of msg/drain's existing role in run-data-or-signal:
+;; if :on-all-closed returns msg/drain (or [s' msg/drain]), the framework
+;; suppresses the auto-append of new-done envelopes onto every declared
+;; output port. Combinators that gate their own close (closing an internal
+;; channel only after in-flight tokens drain) use this to keep extra dones
+;; out of their internal channel.
+;; ============================================================================
+
+(defn- drained-on-all-closed-probe
+  [test-chan return-shape]
+  (let [hmap (step/handler-map
+              {:ports         {:ins {:in ""} :outs {:out ""}}
+               :on-init       (fn [] {::caf/in-ports {:in test-chan}})
+               :on-data       (fn [ctx _s _d] {:out [(msg/pass ctx)]})
+               :on-all-closed (case return-shape
+                                :bare      (fn [_ _] msg/drain)
+                                :as-vector (fn [_ s] [s msg/drain]))})]
+    {:procs {:probe hmap :sink (absorbing-sink)}
+     :conns [[[:probe :out] [:sink :in]]]
+     :in    :probe
+     :out   :sink}))
+
+(deftest j1-on-all-closed-msg-drain-suppresses-auto-append-bare
+  (let [c (a/chan)
+        h (start-with-events (drained-on-all-closed-probe c :bare))]
+    (try
+      (a/>!! c (msg/new-msg :first))
+      (success-of h :probe 1)
+      (a/close! c)
+      (success-of h :probe 2)
+      (let [evs       (filterv #(= :probe (:step-id %)) (events h))
+            send-outs (filterv #(= :send-out (:kind %)) evs)
+            successes (filterv #(= :success (:kind %)) evs)]
+        (testing "handler ran on the cascade"
+          (is (= 2 (count successes))))
+        (testing "send-out for the data, BUT NO send-out for the cascade done"
+          (is (= 1 (count send-outs)))
+          (is (= :data (:msg-kind (first send-outs))))
+          (is (zero? (count (filterv #(= :input-done (:msg-kind %)) send-outs)))
+              "drain should suppress the :done auto-append")))
+      (finally (stop! h)))))
+
+(deftest j2-on-all-closed-msg-drain-as-vector-also-suppresses
+  (let [c (a/chan)
+        h (start-with-events (drained-on-all-closed-probe c :as-vector))]
+    (try
+      (a/close! c)
+      (success-of h :probe 1)
+      (let [evs       (filterv #(= :probe (:step-id %)) (events h))
+            send-outs (filterv #(= :send-out (:kind %)) evs)]
+        (testing "[s' msg/drain] return shape also suppresses auto-append"
+          (is (zero? (count send-outs)))))
+      (finally (stop! h)))))
+
+(deftest j3-non-drain-return-still-auto-appends
+  (testing "regression: returning anything other than msg/drain still
+            produces the auto-appended done on every output port"
+    (let [c    (a/chan)
+          hmap (step/handler-map
+                {:ports         {:ins {:in ""} :outs {:out ""}}
+                 :on-init       (fn [] {::caf/in-ports {:in c}})
+                 :on-data       (fn [ctx _ _] {:out [(msg/pass ctx)]})
+                 :on-all-closed (fn [_ s] [s {}])})
+          h    (start-with-events
+                {:procs {:probe hmap :sink (absorbing-sink)}
+                 :conns [[[:probe :out] [:sink :in]]]
+                 :in :probe :out :sink})]
+      (try
+        (a/close! c)
+        (success-of h :probe 1)
+        (let [evs       (filterv #(= :probe (:step-id %)) (events h))
+              send-outs (filterv #(= :send-out (:kind %)) evs)]
+          (is (= 1 (count send-outs)) "auto-append still fires for non-drain returns")
+          (is (= :input-done (:msg-kind (first send-outs)))))
+        (finally (stop! h))))))

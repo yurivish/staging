@@ -281,12 +281,13 @@
    Implementation note. K worker procs share a single `core.async`
    channel via `::flow/in-ports`. The feeder declares K output ports,
    all merged onto the shared channel via `::flow/out-ports`, so the
-   framework's done auto-append (one per declared output) writes K
-   done envelopes — one for each worker. Each worker shim takes
-   exactly one done (by setting `::flow/input-filter` after its first
-   close, so subsequent dones are taken by sibling shims). This gives
-   work-stealing for the data path and a clean per-shim cascade for
-   the done path, all within flow's normal counter accounting."
+   framework's input-done auto-append (one per declared output) writes
+   K input-done envelopes — one for each worker. Each worker shim takes
+   exactly one input-done (by setting `::flow/input-filter` after its
+   first close, so subsequent input-dones are taken by sibling shims).
+   This gives work-stealing for the data path and a clean per-shim
+   cascade for the close path, all within flow's normal counter
+   accounting."
   ([k inner]    (stealing-workers (gensym "stealing-workers-") k inner))
   ([id k inner]
    (assert (pos-int? k) "stealing-workers: k must be a positive integer")
@@ -299,7 +300,7 @@
          ;; Feeder: 1 input from upstream, K declared outputs all
          ;; pointing at `shared-q` via the in-ports merge. :on-data
          ;; emits on :q0 (one write per item). :on-all-closed default
-         ;; → auto-append fires on all K outputs → K done envelopes
+         ;; → auto-append fires on all K outputs → K input-done envelopes
          ;; written to `shared-q`, one for each shim to consume.
          feeder    (step/handler-map
                     {:ports {:ins {:in ""} :outs (zipmap q-ports (repeat ""))}
@@ -324,9 +325,9 @@
          ;; Shim: K independent procs all reading from `shared-q` via
          ;; in-ports. Forwards data/signals to its own :to-inner port,
          ;; which is wired by :conns to its inner's :in. On :on-all-closed
-         ;; (fired by an envelope-done arriving on :queue), sets an
+         ;; (fired by an input-done arriving on :queue), sets an
          ;; ::flow/input-filter that excludes :queue so a fast shim
-         ;; can't grab a sibling's done envelope on its next iteration.
+         ;; can't grab a sibling's input-done envelope on its next iteration.
          shim      (step/handler-map
                     {:ports     {:ins {:queue ""} :outs {:to-inner ""}}
                      :on-init   (fn [] {::flow/in-ports {:queue shared-q}})

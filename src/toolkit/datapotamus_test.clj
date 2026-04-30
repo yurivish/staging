@@ -9,7 +9,7 @@
      II   — Linear composition with `serial`
      III  — Beyond linear: explicit graphs
      IV   — Nesting with wrapped `serial` / `beside`
-     V    — Message kinds: data, signal, done
+     V    — Message kinds: data, signal, input-done
      VI   — Derivation helpers + ctx :in-port
      VII  — Provenance & trace events
      VIII — Token conservation: fan-out & fan-in
@@ -284,7 +284,7 @@
                      (let [n (swap! calls inc)]
                        (if (< n 3)
                          [s {:tool-call [:query]}]
-                         [s {:final     [:done]}]))))
+                         [s {:final     [:answer]}]))))
         wf (-> (step/beside
                 agent-step
                 (step/step :tool (constantly :tool-response))
@@ -391,17 +391,20 @@
                (:scope pre-recv)))))))
 
 ;; ============================================================================
-;; Act V — Message kinds: data, signal, done
+;; Act V — Message kinds: data, signal, input-done
 ;;
 ;; Three message kinds flow on the wire. User handlers see only :data —
-;; :signal and :done messages bypass user code but still move through the
-;; graph and drive per-group accounting and port-closure semantics.
+;; :signal and :input-done messages bypass user code but still move through
+;; the graph and drive per-group accounting and port-closure semantics.
 ;;
 ;; Use :signal to ferry tokens / coordination across the graph without a
-;; payload — fan-in closing a group, broadcast under a token key. Use :done
-;; to say "this input is closed, propagate accordingly": on a single-input
-;; step it cascades immediately; on a multi-input step it waits until every
-;; input has been closed before cascading downstream.
+;; payload — fan-in closing a group, broadcast under a token key. Use
+;; :input-done to say "this upstream is exhausted, propagate accordingly":
+;; on a single-input step it cascades immediately; on a multi-input step it
+;; waits until every input has been input-done'd before cascading
+;; downstream. :input-done does NOT prevent further processing — cyclic
+;; feedback edges can keep feeding the port; the system terminates on
+;; counter quiescence, not on input-done.
 ;; ============================================================================
 
 ;; A signal flows through untouched — user handlers aren't invoked, but
@@ -518,9 +521,9 @@
         (is (some? sink-recv))
         (is (= {"g" 777} (:tokens sink-recv)))))))
 
-;; Inject with neither :data nor :tokens routes a :done marker. On a linear
-;; chain, each step sees :done once and cascades it to the next.
-(deftest done-cascades-through-single-input-chain
+;; Inject with neither :data nor :tokens routes a :input-done marker. On a
+;; linear chain, each step sees :input-done once and cascades it to the next.
+(deftest input-done-cascades-through-single-input-chain
   (let [wf (step/serial
            (step/step :a inc)
            (step/step :b #(* 2 %))
@@ -543,17 +546,18 @@
       (is (empty? (events-of result :recv :data))))
     (testing "each mid-chain step cascaded done"
       (doseq [sid [:a :b :c]]
-        (is (= 1 (get (by-kind sid) [:recv :done] 0)))
-        (is (= 1 (get (by-kind sid) [:send-out :done] 0)))
-        (is (= 1 (get (by-kind sid) [:success :done] 0)))))
+        (is (= 1 (get (by-kind sid) [:recv :input-done] 0)))
+        (is (= 1 (get (by-kind sid) [:send-out :input-done] 0)))
+        (is (= 1 (get (by-kind sid) [:success :input-done] 0)))))
     (testing "sink absorbed done"
-      (is (= 1 (get (by-kind :sink) [:recv :done] 0)))
-      (is (zero? (get (by-kind :sink) [:send-out :done] 0)))
-      (is (= 1 (get (by-kind :sink) [:success :done] 0))))))
+      (is (= 1 (get (by-kind :sink) [:recv :input-done] 0)))
+      (is (zero? (get (by-kind :sink) [:send-out :input-done] 0)))
+      (is (= 1 (get (by-kind :sink) [:success :input-done] 0))))))
 
-;; A multi-input step holds its :done cascade until every input port has
-;; received its own :done marker — only then does it close downstream.
-(deftest done-multi-input-holds-until-all-inputs-closed
+;; A multi-input step holds its :input-done cascade until every input port
+;; has received its own :input-done marker — only then does it close
+;; downstream.
+(deftest input-done-multi-input-holds-until-all-inputs-closed
   (let [wf (-> (step/beside
                 (step/step :merge
                            {:ins  {:left "" :right ""}
@@ -573,18 +577,18 @@
     (flow/inject! h {:in :merge :port :left})
     (flow/await-quiescent! h)
     (testing "after first done on :left: :recv done fired, cascade has NOT"
-      (is (= 1 (get (by-kind :merge) [:recv :done] 0)))
-      (is (zero? (get (by-kind :merge) [:send-out :done] 0)))
-      (is (= 1 (get (by-kind :merge) [:success :done] 0)))
+      (is (= 1 (get (by-kind :merge) [:recv :input-done] 0)))
+      (is (zero? (get (by-kind :merge) [:send-out :input-done] 0)))
+      (is (= 1 (get (by-kind :merge) [:success :input-done] 0)))
       (is (empty? (filterv #(= :sink (:step-id %)) (events-after)))))
     (flow/inject! h {:in :merge :port :right})
     (flow/await-quiescent! h)
     (testing "after second done on :right: cascade fires, sink receives done"
-      (is (= 2 (get (by-kind :merge) [:recv :done] 0)))
-      (is (= 1 (get (by-kind :merge) [:send-out :done] 0)))
-      (is (= 2 (get (by-kind :merge) [:success :done] 0)))
-      (is (= 1 (get (by-kind :sink) [:recv :done] 0)))
-      (is (= 1 (get (by-kind :sink) [:success :done] 0))))
+      (is (= 2 (get (by-kind :merge) [:recv :input-done] 0)))
+      (is (= 1 (get (by-kind :merge) [:send-out :input-done] 0)))
+      (is (= 2 (get (by-kind :merge) [:success :input-done] 0)))
+      (is (= 1 (get (by-kind :sink) [:recv :input-done] 0)))
+      (is (= 1 (get (by-kind :sink) [:success :input-done] 0))))
     (testing "user handler was never invoked"
       (is (empty? (events-of (stop! h) :recv :data))))))
 
@@ -1447,8 +1451,9 @@
         (is (= :try (:step-id (first fs))))))))
 
 ;; A drain-style aggregator (stash everything under `msg/drain`, emit at
-;; close) needs the `:on-all-closed` cascade to flush. `run-seq` injects a
-;; `done` envelope after the data so this works transparently — quiescence
+;; close) needs the `:on-all-closed` cascade to flush. `run-seq` injects an
+;; `input-done` envelope after the data so this works transparently —
+;; quiescence
 ;; balance alone would terminate before `:on-all-closed` ever fires.
 (deftest run-seq-fires-on-all-closed-aggregator
   (let [agg (step/handler-map
@@ -1733,7 +1738,7 @@
 
 ;; Done cascade fires exactly once downstream. The join's K distinct input
 ;; ports ensure on-all-closed fires once, not K times.
-(deftest workers-done-cascade-fires-once
+(deftest workers-input-done-cascade-fires-once
   (let [wf (step/serial
            (c/workers :pool 3 (step/passthrough :w))
            (step/sink))
@@ -1743,7 +1748,7 @@
     (let [result (stop! h)
           dones  (filterv #(and (= :sink (:step-id %))
                                 (= :recv (:kind %))
-                                (= :done (:msg-kind %)))
+                                (= :input-done (:msg-kind %)))
                           (:events result))]
       (is (= :completed (:state result)))
       (is (= 1 (count dones))))))
@@ -1766,7 +1771,7 @@
 ;; ::flow/out-ports. K shims read from that shared channel via ::flow/in-ports.
 ;; Multi-taker on a single channel = queue-group dispatch, intrinsic to
 ;; core.async. The feeder's :on-all-closed default fires auto-append on all K
-;; declared outputs, writing K done envelopes onto the shared queue — exactly
+;; declared outputs, writing K input-done envelopes onto the shared queue — exactly
 ;; one for each shim. Each shim sets ::flow/input-filter on cascade so it
 ;; can't grab a sibling's done before the framework's read loop sees its own
 ;; state update.
@@ -1784,7 +1789,7 @@
     ;; :outputs is in input order regardless of dispatch race.)
     (is (= (mapv vector (range 20)) (:outputs res)))))
 
-(deftest stealing-workers-done-cascade-fires-once
+(deftest stealing-workers-input-done-cascade-fires-once
   (let [wf (step/serial
             (c/stealing-workers :pool 3 (step/passthrough :w))
             (step/sink))
@@ -1792,11 +1797,11 @@
     (flow/inject! h {})
     (flow/await-quiescent! h)
     (let [result (stop! h)
-          dones  (events-of result :recv :done)]
+          dones  (events-of result :recv :input-done)]
       (is (= :completed (:state result)))
-      ;; One done arrives at the sink — not K. The K shims each take one
-      ;; auto-appended done from the feeder, cascade independently through
-      ;; their inner, and the join's K-input cascade dedupes to 1.
+      ;; One input-done arrives at the sink — not K. The K shims each take
+      ;; one auto-appended input-done from the feeder, cascade independently
+      ;; through their inner, and the join's K-input cascade dedupes to 1.
       (is (= 1 (count (filter #(= :sink (:step-id %)) dones)))))))
 
 (deftest stealing-workers-k-1-degenerate

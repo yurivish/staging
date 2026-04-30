@@ -3,9 +3,17 @@
 
    A **message envelope** is a plain map with a `:msg-kind` stamp:
 
-     :data    has :data, has :tokens
-     :signal  no  :data, has :tokens
-     :done    no  :data, no  :tokens
+     :data        has :data, has :tokens
+     :signal      no  :data, has :tokens
+     :input-done  no  :data, no  :tokens
+
+   `:input-done` is a per-port lifecycle signal — \"this upstream input
+   has been exhausted.\" It triggers `:on-all-closed` (once all of a
+   proc's input ports have been input-done'd) and cascades to declared
+   outputs. It is NOT a processing barrier: data and signals continue
+   to be processed on a port even after that port has been input-done'd
+   (e.g. via a cyclic feedback edge). System termination is a separate,
+   emergent property detected via counter quiescence.
 
    The absence of :data / :tokens is preserved for structural clarity,
    but `:msg-kind` is the canonical source — dispatch reads the stamp
@@ -45,28 +53,28 @@
   {:msg-id (random-uuid) :data-id (random-uuid) :msg-kind :signal
    :tokens tokens :parent-msg-ids []})
 
-(defn new-done
-  "Done marker: no :data, no :tokens."
+(defn new-input-done
+  "Input-done marker: signals upstream-exhausted on a port. No :data, no :tokens."
   []
-  {:msg-id (random-uuid) :msg-kind :done :parent-msg-ids []})
+  {:msg-id (random-uuid) :msg-kind :input-done :parent-msg-ids []})
 
 (defn from-opts
   "Build a root envelope from {:data ... :tokens ...} opts.
    Presence rules:
      :data given        → data envelope (with :tokens if also given)
      only :tokens given → signal envelope
-     neither            → done marker"
+     neither            → input-done marker"
   [{:keys [data tokens] :as opts}]
   (case [(contains? opts :data) (contains? opts :tokens)]
     [true  true]  (assoc (new-msg data) :tokens tokens)
     [true  false] (new-msg data)
     [false true]  (new-signal tokens)
-    [false false] (new-done)))
+    [false false] (new-input-done)))
 
 (defn envelope-kind [m] (:msg-kind m))
 (defn data?         [m] (= (:msg-kind m) :data))
 (defn signal?       [m] (= (:msg-kind m) :signal))
-(defn done?         [m] (= (:msg-kind m) :done))
+(defn input-done?   [m] (= (:msg-kind m) :input-done))
 
 ;; ============================================================================
 ;; Free-algebra constructors over input messages

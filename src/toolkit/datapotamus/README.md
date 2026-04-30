@@ -169,7 +169,7 @@ Not every agent shape is acyclic. The canonical agent-with-tools is an `:agent` 
       (let [n (inc (:n s 0))]
         (if (< n 3)
           [(assoc s :n n) {:tool-call [:query]}]
-          [(assoc s :n n) {:final     [:done]}])))))
+          [(assoc s :n n) {:final     [:answer]}])))))
 
 (def loop-wf
   (-> (step/beside
@@ -207,7 +207,7 @@ Because `c/parallel` wraps its inner procs under a `[:scope :r1]` or `[:scope :r
 
 ---
 
-*A pointer forward.* The termination story for cyclic agents — "the agent eventually emits on `:final`" — rests on the three envelope shapes (data, signal, done) and the closure cascade that drives the flow to quiescence. See §10 for the envelope table and §11 for the lifecycle that uses it.
+*A pointer forward.* The termination story for cyclic agents — "the agent eventually emits on `:final`" — rests on the three envelope shapes (data, signal, input-done) and the closure cascade that drives the flow to quiescence. See §10 for the envelope table and §11 for the lifecycle that uses it.
 
 ## Peeling back: the handler
 
@@ -294,7 +294,7 @@ Returning `[state {}]` drops the payload. It doesn't drop the *tokens* — the f
 
 *The trade-off.* State lives inside the proc, not in the messages. That means state is per-proc: if you fan out to four workers, each worker has its own dedup set. If you want a *global* dedup, put one `dedup` step in front of the fan-out (single proc, global state) rather than inside each worker. Knowing which you want is now a thing you have to think about.
 
-### Layer 4: custom signals, done, lifecycle
+### Layer 4: custom signals, input-done, lifecycle
 
 There is one more layer. It's where we open our output file. We need two more concepts first — the three envelope shapes (§10) and the full lifecycle (§11) — so we'll come back to it in §12.
 
@@ -341,17 +341,27 @@ It is, however, a thing user code *can* do — see the single-invocation invaria
 
 A message envelope is a plain map. Three shapes, distinguished by which keys are present:
 
-| Kind       | has `:data` | has `:tokens` | Purpose |
+| Kind             | has `:data` | has `:tokens` | Purpose |
 |---|---|---|---|
-| **data**   | yes | yes | The payload you care about. `nil` is valid data. |
-| **signal** | no  | yes | Tokens alone, no payload. Use it to coordinate. |
-| **done**   | no  | no  | End of stream. |
+| **data**         | yes | yes | The payload you care about. `nil` is valid data. |
+| **signal**       | no  | yes | Tokens alone, no payload. Use it to coordinate. |
+| **input-done**   | no  | no  | "This input port's upstream has been exhausted." |
 
 "Signal" is the interesting one. It's a pulse that carries tokens but no data — send it through the graph when you want the token math to happen without anyone having to process a payload. Most coordination patterns use signals. In fact, the common case is so common that the framework does it for you: a data handler that returns an empty port-map (`{}` or `[state' {}]`) gets a signal auto-synthesized on every declared output port, so the input's tokens propagate for downstream closure. That's what filters, dedups, and skips rely on. Two cases want the opposite — suppress the auto-signal by returning `msg/drain` instead: deferred propagation (pair-mergers, batchers — see §8), and the rare genuine drop where you *really* want the tokens to die here. Conservation is optional on your terms; just say so explicitly.
 
 Your handler's `:on-data` doesn't see signals; they arrive at `:on-signal` instead (default: broadcast unchanged to every output port).
 
-"Done" cascades. When all of a step's input ports have reported done, the step's `:on-all-closed` hook fires (your chance to flush buffers or emit a final tail), and then a `done` is sent out every output port. Closure propagates from the edges inward until the whole graph is quiet.
+### `:input-done` is a per-port lifecycle signal, not a processing barrier
+
+Read the name literally: `input-done` says "this upstream input has been exhausted." That's all it says. In particular, it does NOT say:
+
+- "stop processing on this port" — handlers continue to receive data and signals on ports that have been input-done'd. This is load-bearing for cyclic flows where a feedback edge re-feeds a port after its external upstream has closed (e.g. a self-loop that emits N messages back into its own `:in` after `:start`).
+- "the system is done" — system termination is a separate, emergent property. See "lifecycle" below for quiescence-based termination.
+- "the channel is closed" — channels close on `a/close!`; closure is what *triggers* an input-done envelope, but the two concepts are distinct.
+
+What input-done *does* do: cascade the "input exhausted" signal through the graph. When all of a step's declared input ports have received input-done, its `:on-all-closed` hook fires (the place to flush buffers or emit aggregated output), and an `input-done` envelope is auto-appended to every declared output port. That's how aggregator and end-of-pipeline patterns hook a "drain me" event without caring about the actual termination condition.
+
+Combinators that gate their own close (e.g. recursive worker pools that need to keep their internal channel open until in-flight work drains) can return `msg/drain` from `:on-all-closed` to suppress the auto-append — symmetric with `msg/drain`'s role in `:on-data`.
 
 ## Peeling back: the lifecycle
 
@@ -380,7 +390,7 @@ So far we've driven everything with `flow/run-seq`. That's the convenience layer
 
 - `(inject! h {:data v})` — data envelope.
 - `(inject! h {:tokens tm})` — signal envelope (no data, tokens only).
-- `(inject! h {})` — done marker.
+- `(inject! h {})` — input-done marker.
 
 This is the shape for long-running pipelines. You own the outer loop; you decide when to stop.
 
@@ -425,12 +435,12 @@ Back to the running example. We want to open the output file once, write each co
 - `:on-init` runs once before any messages arrive — allocate resources here.
 - `:on-data` is what `step/step` has been installing for us under the hood.
 - `:on-signal` (default: broadcast on every output port) fires on signal envelopes.
-- `:on-all-closed` runs when every input port has reported done — flush tails here.
+- `:on-all-closed` runs when every input port has been input-done'd — flush tails here.
 - `:on-stop` runs exactly once when the flow tears down — release resources here.
 
 `step/step` fills in defaults for every slot except `:on-data`, which is why you can usually ignore them. When you find yourself opening files, seeding buffers, or needing non-trivial startup and shutdown, drop to `handler-map`.
 
-*The trade-off.* You lose `step`'s safety nets. If you override `:on-signal` and forget to propagate the signal, it silently vanishes — the framework doesn't know what "handle the signal" means for your proc. Same for `:on-all-closed` and the done cascade: if you override it, make sure `done` still propagates, or read `run-done` in `flow.clj` to see what the default was doing for you. Power, responsibility, and so on.
+*The trade-off.* You lose `step`'s safety nets. If you override `:on-signal` and forget to propagate the signal, it silently vanishes — the framework doesn't know what "handle the signal" means for your proc. Same for `:on-all-closed` and the input-done cascade: if you override it, make sure `input-done` still propagates (or return `msg/drain` if you mean to gate it), or read `run-input-done` in `flow.clj` to see what the default was doing for you. Power, responsibility, and so on.
 
 ## Escape hatch: explicit token control
 

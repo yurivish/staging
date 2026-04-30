@@ -63,7 +63,13 @@
    Empty port-map from the handler ⇒ auto-signal on every output port
    (preserves tokens). Return `msg/drain` instead to suppress that —
    e.g., when deferring propagation to a later invocation via stashed
-   parent refs and an eventual `msg/merge`."
+   parent refs and an eventual `msg/merge`.
+
+   Note: input-done is a per-port lifecycle signal, not a processing
+   barrier. Data and signals continue to be processed on a port even
+   after that port has been input-done'd (e.g. via a cyclic feedback
+   edge that re-feeds the port). The system terminates on counter
+   quiescence, not on input-done."
   [hmap m s ctx trace-sid outs kind]
   (try
     (let [ret                  (case kind
@@ -86,12 +92,20 @@
     (catch Throwable ex
       [s {} [(trace/failure-event trace-sid m ex)]])))
 
-(defn- run-done
-  "Done cascade: track closed-ins in framework state. When all inputs are
-   closed, call :on-all-closed (drain hook), then forward (new-done) on
-   every output port. Closed ports stay closed — a redundant done on an
-   already-closed port is a no-op (matters for cyclic flows where a
-   feedback edge can re-deliver done after on-all-closed has fired)."
+(defn- run-input-done
+  "Input-done cascade: track closed-ins in framework state. When all
+   declared input ports have been input-done'd, call :on-all-closed
+   (drain hook), then forward (new-input-done) on every output port.
+   Closed ports stay closed — a redundant input-done on an already-closed
+   port is a no-op (matters for cyclic flows where a feedback edge can
+   re-deliver input-done after on-all-closed has fired).
+
+   :on-all-closed may return msg/drain (or [s' msg/drain]) to suppress
+   the auto-append of new-input-done on every output port — symmetric
+   with msg/drain's role in run-data-or-signal. Combinators that gate
+   their own close (closing an internal channel only after in-flight
+   tokens drain) use this to keep the framework from racing extra
+   input-done envelopes into the channel."
   [hmap m ctx s trace-sid ins outs]
   (let [in-port (:in-port ctx)
         closed  (::closed-ins s #{})]
@@ -103,10 +117,14 @@
           (try
             (let [ret                  ((:on-all-closed hmap) ctx s)
                   [s' msgs]            (normalize-return s ret)
-                  [synth-pm synth-evs] (msg/synthesize msgs m trace-sid)
-                  port-map             (reduce (fn [pm p]
-                                                 (update pm p (fnil conj []) (msg/new-done)))
-                                               synth-pm (keys outs))
+                  drain?               (identical? msgs msg/drain)
+                  msgs'                (if drain? {} msgs)
+                  [synth-pm synth-evs] (msg/synthesize msgs' m trace-sid)
+                  port-map             (if drain?
+                                         synth-pm
+                                         (reduce (fn [pm p]
+                                                   (update pm p (fnil conj []) (msg/new-input-done)))
+                                                 synth-pm (keys outs)))
                   events (vec (concat synth-evs
                                       (send-out-events trace-sid port-map)
                                       [(trace/success-event trace-sid m)]))]
@@ -128,9 +146,9 @@
         ctx  {:pubsub step-sp :step-id trace-sid :cancel cancel-p
               :in-port in-port :msg m :ins ins :outs outs}]
     (case (msg/envelope-kind m)
-      :done   (run-done               hmap m ctx s trace-sid ins outs)
-      :signal (run-data-or-signal     hmap m s ctx trace-sid outs :signal)
-      :data   (run-data-or-signal     hmap m s ctx trace-sid outs :data))))
+      :input-done (run-input-done           hmap m ctx s trace-sid ins outs)
+      :signal     (run-data-or-signal       hmap m s ctx trace-sid outs :signal)
+      :data       (run-data-or-signal       hmap m s ctx trace-sid outs :data))))
 
 ;; ============================================================================
 ;; proc-fn — the core.async.flow 4-arity adapter
@@ -170,7 +188,7 @@
          ;; Channel closed on a port not in the handler's declared :ins.
          ;; Happens when ::flow/in-ports injects an input under a name
          ;; the handler doesn't list. Don't dispatch — that would add a
-         ;; non-declared key to ::closed-ins and break run-done's
+         ;; non-declared key to ::closed-ins and break run-input-done's
          ;; (= closed all-ins) test, permanently blocking cascade.
          ;; Framework's read loop already dissocs the chan on the first
          ;; nil read.
@@ -180,12 +198,12 @@
          :else
          ;; `or` branch: when m is nil, the channel was closed and
          ;; core.async.flow has called us once with nil before dropping
-         ;; the chan. Synthesize a fresh done envelope so the rest of
-         ;; the pipeline (recv-event, run-step → run-done, ::closed-ins,
-         ;; cascade, auto-append) runs identically to an envelope-done
-         ;; arrival. Lineage gap is intrinsic — close has no upstream
-         ;; message to attribute to.
-         (let [m (or m (msg/new-done))]
+         ;; the chan. Synthesize a fresh input-done envelope so the rest
+         ;; of the pipeline (recv-event, run-step → run-input-done,
+         ;; ::closed-ins, cascade, auto-append) runs identically to an
+         ;; envelope-input-done arrival. Lineage gap is intrinsic — close
+         ;; has no upstream message to attribute to.
+         (let [m (or m (msg/new-input-done))]
            ;; Publish :recv on arrival, before the handler runs. Emitting it
            ;; alongside :success (as we used to) made every pair atomic in the
            ;; event log, so live consumers couldn't derive in-flight counts.
@@ -411,7 +429,7 @@
      :port  — override the port (when :in is a bare sid)
      :data  — data value; presence ⇒ data envelope
      :tokens — token map; presence without :data ⇒ signal envelope
-     (neither) ⇒ done marker"
+     (neither) ⇒ input-done marker"
   [handle {:keys [in port] :as opts}]
   (let [{::keys [step graph pubsub scope fid counters done-p port-index]} handle
         ref                 (or in (:in step))

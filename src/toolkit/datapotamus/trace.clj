@@ -3,12 +3,12 @@
 
    Events are plain maps keyed on two axes: :kind (lifecycle role —
    :recv :success :failure :send-out :split :merge :inject :flow-error
-   :run-started) × :msg-kind (envelope type — :data :signal :done).
+   :run-started) × :msg-kind (envelope type — :data :signal :input-done).
    Subjects use :kind only. Consumers filter on :msg-kind in the handler.
 
    Every event that references a message carries that message's complete
    envelope (via `msg-envelope`), plus kind-specific extras (e.g. :in-port
-   on a :done recv, :port on a :send-out, :error on a :failure).
+   on a :input-done recv, :port on a :send-out, :error on a :failure).
 
    A scoped pubsub is a plain map `{:raw raw-ps :prefix [[:scope fid] ...]}`.
    `sp-pub` prepends the scope to the subject and stamps `:scope`,
@@ -28,7 +28,7 @@
 
 (defn msg-envelope
   "On-wire envelope fields of `m` as a flat map. Absent keys are skipped so
-   envelope shapes stay distinct (done has no tokens; signal has no data)."
+   envelope shapes stay distinct (input-done has no tokens; signal has no data)."
   [m]
   (cond-> {:msg-id (:msg-id m) :msg-kind (:msg-kind m)}
     (contains? m :data-id)        (assoc :data-id (:data-id m))
@@ -41,11 +41,11 @@
 ;; ============================================================================
 
 (defn recv-event
-  "For :done messages, pass `in-port`."
+  "For :input-done messages, pass `in-port`."
   ([step-id m] (recv-event step-id m nil))
   ([step-id m in-port]
    (cond-> (assoc (msg-envelope m) :kind :recv :step-id step-id)
-     (= :done (:msg-kind m)) (assoc :in-port in-port))))
+     (= :input-done (:msg-kind m)) (assoc :in-port in-port))))
 
 (defn success-event [step-id m]
   (assoc (msg-envelope m) :kind :success :step-id step-id))
