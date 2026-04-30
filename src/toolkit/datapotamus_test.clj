@@ -1446,6 +1446,25 @@
         (is (= 1 (count fs)))
         (is (= :try (:step-id (first fs))))))))
 
+;; A drain-style aggregator (stash everything under `msg/drain`, emit at
+;; close) needs the `:on-all-closed` cascade to flush. `run-seq` injects a
+;; `done` envelope after the data so this works transparently — quiescence
+;; balance alone would terminate before `:on-all-closed` ever fires.
+(deftest run-seq-fires-on-all-closed-aggregator
+  (let [agg (step/handler-map
+             {:ports         {:ins {:in ""} :outs {:out ""}}
+              :on-init       (fn [] {:items []})
+              :on-data       (fn [ctx s _d]
+                               [(update s :items conj (:msg ctx)) msg/drain])
+              :on-all-closed (fn [ctx s]
+                               {:out [(msg/merge ctx (:items s)
+                                                 (mapv :data (:items s)))]})})
+        wf  {:procs {:agg agg} :conns [] :in :agg :out :agg}
+        res (flow/run-seq wf [1 2 3])]
+    (is (= :completed (:state res)))
+    (testing "the merged-on-close output is attributed to all inputs"
+      (is (= [[[1 2 3]] [[1 2 3]] [[1 2 3]]] (:outputs res))))))
+
 ;; ============================================================================
 ;; Act XIV — Observing runs via scoped pubsub
 ;;

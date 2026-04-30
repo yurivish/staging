@@ -519,6 +519,7 @@
            wf        (step/serial stepmap (collector-step ::collector collected))
            handle    (start! wf {:pubsub ps :flow-id fid})]
        (doseq [d coll] (inject! handle {:data d}))
+       (inject! handle {})  ; close boundary input — fires :on-all-closed cascade
        (let [signal    (await-quiescent! handle)
              result    (-> (stop! handle)
                            (assoc :state (if (= :quiescent signal) :completed :failed))
