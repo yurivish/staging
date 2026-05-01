@@ -35,12 +35,15 @@
 (defn- get-json [url]
   (-> @(http/get url) :body (json/read-str :key-fn keyword)))
 
-(defn- fetch-tree [counter id]
-  (let [item (get-json (str base "/item/" id ".json"))
+(defn- fetch-tree [emit-node! counter id]
+  (let [t0   (System/nanoTime)
+        item (get-json (str base "/item/" id ".json"))
+        ms   (long (/ (- (System/nanoTime) t0) 1e6))
         _    (swap! counter inc)
         kids (or (:kids item) [])
+        _    (emit-node! id (count kids) ms)
         futs (mapv #(.submit ^ExecutorService @vt-exec
-                             ^Callable (fn [] (fetch-tree counter %)))
+                             ^Callable (fn [] (fetch-tree emit-node! counter %)))
                    kids)]
     (assoc item :kid-trees (mapv #(.get %) futs))))
 
@@ -127,10 +130,17 @@
   (step/step :fetch-tree nil
              (fn [ctx _s story-id]
                (trace/emit ctx {:event :fetch-start :story-id story-id})
-               (let [t0 (System/nanoTime)
-                     counter (atom 0)
-                     tree    (fetch-tree counter story-id)
-                     ms      (long (/ (- (System/nanoTime) t0) 1e6))]
+               (let [t0         (System/nanoTime)
+                     counter    (atom 0)
+                     emit-node! (fn [id n-kids ms]
+                                  (trace/emit ctx
+                                              {:event    :fetch-node
+                                               :story-id story-id
+                                               :id       id
+                                               :n-kids   n-kids
+                                               :ms       ms}))
+                     tree       (fetch-tree emit-node! counter story-id)
+                     ms         (long (/ (- (System/nanoTime) t0) 1e6))]
                  (trace/emit ctx {:event :fetch-done
                                   :story-id story-id
                                   :n-nodes  @counter :ms ms})

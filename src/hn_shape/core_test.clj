@@ -102,8 +102,9 @@
            "https://hacker-news.firebaseio.com/v0/item/3.json"
            {:id 3 :kids []}}]
     (with-redefs [core/get-json (fixture-lookup m)]
-      (let [counter (atom 0)
-            tree    (#'core/fetch-tree counter 1)]
+      (let [counter    (atom 0)
+            emit-node! (fn [_id _n-kids _ms] nil)
+            tree       (#'core/fetch-tree emit-node! counter 1)]
         (is (= 3 @counter))
         (is (= 1 (:id tree)))
         (is (= 2 (-> tree :kid-trees first :id)))
