@@ -15,3 +15,5 @@ dev
 out
 out copy
 out-cc
+*.duckdb
+*.duckdb.wal

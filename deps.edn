@@ -28,6 +28,7 @@
          com.github.seancorfield/next.jdbc {:mvn/version "1.3.1093"}
          com.github.seancorfield/honeysql  {:mvn/version "2.7.1368"}
          org.xerial/sqlite-jdbc            {:mvn/version "3.53.0.0"}
+         org.duckdb/duckdb_jdbc            {:mvn/version "1.5.2.1"}
          ;; tech.ml.dataset for parquet/arrow/csv. The parquet path pulls in
          ;; hadoop; exclusions follow the set documented at
          ;; techascent.github.io/tech.ml.dataset/tech.v3.libs.parquet.html
@@ -148,6 +149,12 @@
   ;;   clojure -M:podcast -m podcast.core sentiment stumpf.json out/sentiment.json
   :podcast {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
                        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}
+  ;; Mini DuckDB demo: opens target/duckdb-demo.duckdb, inserts rows, queries.
+  ;;   clojure -M:duckdb
+  ;;   clojure -M:duckdb /tmp/scratch.duckdb
+  :duckdb {:jvm-opts  ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                       "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
+           :main-opts ["-m" "toolkit.duckdb"]}
   ;; Check for outdated deps: clojure -M:outdated
   ;; Upgrade in place:        clojure -M:outdated --upgrade
   :outdated {:deps      {com.github.liquidz/antq {:mvn/version "RELEASE"}
