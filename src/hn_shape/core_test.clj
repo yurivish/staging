@@ -53,29 +53,8 @@
   (testing "p100 picks the last element (clamped)"
     (is (= 10 (#'core/percentile (range 1 11) 1.0)))))
 
-(deftest reassemble-tree-builds-nested-structure
-  (testing "linear chain of 3 nodes"
-    (let [nodes [{:id 1 :kids [2]} {:id 2 :kids [3]} {:id 3 :kids []}]
-          tree  (#'core/reassemble-tree 1 nodes)]
-      (is (= 1 (:id tree)))
-      (is (= 2 (-> tree :kid-trees first :id)))
-      (is (= 3 (-> tree :kid-trees first :kid-trees first :id)))
-      (is (= [] (-> tree :kid-trees first :kid-trees first :kid-trees)))))
-  (testing "branching tree"
-    (let [nodes [{:id 1 :kids [2 3]}
-                 {:id 2 :kids [4]}
-                 {:id 3 :kids []}
-                 {:id 4 :kids []}]
-          tree  (#'core/reassemble-tree 1 nodes)]
-      (is (= 2 (count (:kid-trees tree))))
-      (is (= [2 3] (mapv :id (:kid-trees tree))))
-      (is (= 4 (-> tree :kid-trees first :kid-trees first :id)))))
-  (testing "missing kid is silently dropped (e.g., a fetch failure)"
-    (let [nodes [{:id 1 :kids [2 3]}
-                 {:id 2 :kids []}]   ; 3 is referenced but missing
-          tree  (#'core/reassemble-tree 1 nodes)]
-      (is (= 1 (count (:kid-trees tree))))
-      (is (= 2 (-> tree :kid-trees first :id))))))
+;; reassemble-tree moved to toolkit.hn.tree-fetch — see
+;; toolkit/hn/tree_fetch_test.clj for unit tests.
 
 (deftest shape-row-over-fixture
   (let [r (#'core/shape-row fixture-tree)]
