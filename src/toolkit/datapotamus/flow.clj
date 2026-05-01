@@ -93,11 +93,11 @@
       [s {} [(trace/failure-event trace-sid m ex)]])))
 
 (defn- run-input-done
-  "Input-done lifecycle: track closed-ins in framework state, fire two
+  "Input-done lifecycle: track per-port input-done arrivals in framework state, fire two
    user hooks per-port and once-when-all-closed.
 
-   On each new input-done arrival (port not yet in ::closed-ins):
-     1. Track it in ::closed-ins.
+   On each new input-done arrival (port not yet in ::input-dones-seen):
+     1. Track it in ::input-dones-seen.
      2. Call :on-input-done (ctx s port) — per-port hook, fires once per
         port. Default no-op. Use this when a combinator needs to react
         to a specific upstream's exhaustion before all inputs are closed.
@@ -116,7 +116,7 @@
    has fired."
   [hmap m ctx s trace-sid ins outs]
   (let [in-port (:in-port ctx)
-        closed  (::closed-ins s #{})]
+        closed  (::input-dones-seen s #{})]
     (if (contains? closed in-port)
       [s {} [(trace/success-event trace-sid m)]]
       (let [closed' (conj closed in-port)
@@ -148,9 +148,9 @@
                 events  (vec (concat synth-evs
                                      (send-out-events trace-sid port-map)
                                      [(trace/success-event trace-sid m)]))]
-            [(assoc s2 ::closed-ins closed') port-map events])
+            [(assoc s2 ::input-dones-seen closed') port-map events])
           (catch Throwable ex
-            [(assoc s ::closed-ins closed')
+            [(assoc s ::input-dones-seen closed')
              {}
              [(trace/failure-event trace-sid m ex)]]))))))
 
@@ -205,7 +205,7 @@
          ;; Channel closed on a port not in the handler's declared :ins.
          ;; Happens when ::flow/in-ports injects an input under a name
          ;; the handler doesn't list. Don't dispatch — that would add a
-         ;; non-declared key to ::closed-ins and break run-input-done's
+         ;; non-declared key to ::input-dones-seen and break run-input-done's
          ;; (= closed all-ins) test, permanently blocking cascade.
          ;; Framework's read loop already dissocs the chan on the first
          ;; nil read.
@@ -217,7 +217,7 @@
          ;; core.async.flow has called us once with nil before dropping
          ;; the chan. Synthesize a fresh input-done envelope so the rest
          ;; of the pipeline (recv-event, run-step → run-input-done,
-         ;; ::closed-ins, cascade, auto-append) runs identically to an
+         ;; ::input-dones-seen, cascade, auto-append) runs identically to an
          ;; envelope-input-done arrival. Lineage gap is intrinsic — close
          ;; has no upstream message to attribute to.
          (let [m (or m (msg/new-input-done))]

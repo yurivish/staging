@@ -13,7 +13,7 @@
    I-2. Filter on undeclared inputs. Closing a channel that reaches the proc
         via ::flow/in-ports under a name not in the handler's declared
         :ports :ins is a silent no-op at the Datapotamus layer:
-        no event emitted, no ::closed-ins mutation, no run-step dispatch.
+        no event emitted, no ::input-dones-seen mutation, no run-step dispatch.
 
    These tests work by injecting a test-owned channel via ::flow/in-ports.
    We can then write envelopes to that channel directly with `a/>!!` or close
@@ -431,7 +431,7 @@
         (finally (stop! h))))))
 
 (deftest c3-undeclared-close-then-declared-envelope-done-cascades
-  (testing "close on undeclared port doesn't poison ::closed-ins"
+  (testing "close on undeclared port doesn't poison ::input-dones-seen"
     (let [decl-chan  (a/chan)
           extra-chan (a/chan)
           h (start-with-events
