@@ -151,33 +151,58 @@ and emits a tree on output. Built on the cyclic-graph technique
   against more than one use case before committing the API surface;
   risks over-fitting to HN's specific tree shape.
 
-## Recommended sequencing
+## Status (2026-05-01)
 
-1. **Probe Option A on `hn_shape`** — smallest victim (~140 lines,
-   no LLM, no aggregator, output is just shape metrics). Convert
-   the recursive `vt-exec` fetcher into a cyclic-graph fetch-node
-   step plus a tree-reassembly aggregator. No Datapotamus changes
-   required for the probe itself.
+**Option B landed in all 5 pipelines** (commit `382c9fa`). Per-node
+`:fetch-node` events are now visible in the scoped pubsub for
+`hn_shape`, `hn_density`, `hn_drift`, `hn_tempo`, `hn_typing`.
 
-2. **Confirm visualization improves** — compare the event count
-   and the visualizer rendering for one story before/after.
-   Specifically:
-   - Per-node timestamps cluster correctly (concurrent fan-out
-     rather than serial recursion).
-   - Total wall-clock unchanged within noise.
-   - Tree output identical (deep-equality test).
+**Framework changes (commit `b3877e2`)** prepare the ground for the
+deeper Option A/C fix:
+- `:done` envelope renamed to `:input-done` — documents that the
+  signal is "this upstream is exhausted," not a processing barrier.
+- `msg/drain` now works in `:on-all-closed` (symmetric with the
+  data path), so combinators can suppress the input-done auto-append
+  on outputs while gating their own close.
+- README §10 documents `:input-done` as a per-port lifecycle signal,
+  not a processing barrier; quiescence is a separate concept.
 
-3. **Decide on Option C extraction** — based on whether the cyclic
-   shape was natural enough to expose directly, or merits hiding
-   behind a combinator. If two of {hn_density, hn_drift, hn_tempo,
-   hn_typing} would benefit from the same shape, extract.
+**Option A/C deferred — race condition.** A first cut at recursive
+`c/stealing-workers` (auto-detect `:work` output port + in-flight
+counter + `a/close!` on quiescence) was implemented and reverted.
+The implementation has a real race: when concurrent workers run, one
+worker's :out emission (which decrements the counter) can race with
+another worker's :work emission (which increments via the wrapper).
+If counter hits 0 at the wrong moment, `a/close!` fires before the
+in-transit :work emissions land at the re-enqueuer, and they're
+silently dropped to the closed shared-q.
 
-4. **Roll out** to the remaining four pipelines. Each pipeline
-   conversion is mechanical once the pattern is settled.
+The race is structural: the increment for :work happens in the
+worker's wrapper (before the framework writes to channels), but the
+framework's chan writes for :out and :work are concurrent and the
+re-enqueuer's :on-data fires asynchronously. Adding a "busy" counter
+helps but doesn't close the gap because the chan writes happen
+*after* the wrapper's `finally`.
 
-If Option A turns out to be too invasive (e.g., the
-tree-reassembly aggregator is awkward), fall back to Option B
-(cheap, partial visibility) as a stopgap.
+Correct fix needs one of:
+- Closure mechanism that observes the entire framework in flight
+  (sent==recv==completed at the combinator level).
+- Buffered close (a/close! on a small delay after counter=0 to let
+  in-transit chan writes land).
+- Fundamentally different pattern: e.g., a single coordinator proc
+  that owns the cycle and dispatches work to stateless inner steps,
+  removing the cross-proc race.
+
+## Original recommended sequencing (historical)
+
+1. ~~**Probe Option A on `hn_shape`**~~ — superseded by Option B
+   landing across all five pipelines.
+2. ~~**Confirm visualization improves**~~ — pending: validate the
+   per-node firehose against the visualizer.
+3. **Revisit Option C extraction** — once the close-race is solved,
+   the `c/stealing-workers` `:work` port + counter close pattern
+   from the deferred implementation is the natural form.
+4. **Roll out** — already done (Option B in all 5).
 
 ## Verification
 
