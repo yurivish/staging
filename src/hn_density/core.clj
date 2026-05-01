@@ -78,24 +78,20 @@
        (mapv (fn [[user n]] {:user-id user :n-in-top-stories n}))))
 
 (defn- rank-step
-  "Aggregator: stash every tree msg via msg/drain; on the close cascade
-   from the boundary input, emit M user-id msgs each merging from all N
-   tree parents."
+  "Aggregator: on each tree, accumulates it and emits cumulative top-M
+   commenters across all trees seen so far. The last batch of M
+   emissions is the final ranking; quiescence signals no more."
   [m]
   {:procs
    {:rank-commenters
     (step/handler-map
-     {:ports         {:ins {:in ""} :outs {:out ""}}
-      :on-init       (fn [] {:trees []})
-      :on-data       (fn [ctx s _d]
-                       [(update s :trees conj (:msg ctx)) msg/drain])
-      :on-all-closed (fn [ctx s]
-                       (let [parents (:trees s)
-                             ranked  (top-commenters m parents)]
-                         (trace/emit ctx {:event :ranked
-                                          :n-trees (count parents)
-                                          :n-users (count ranked)})
-                         {:out (mapv #(msg/merge ctx parents %) ranked)}))})}
+     {:ports   {:ins {:in ""} :outs {:out ""}}
+      :on-init (fn [] {:trees []})
+      :on-data (fn [ctx s _d]
+                 (let [s'      (update s :trees conj (:msg ctx))
+                       parents (:trees s')
+                       ranked  (top-commenters m parents)]
+                   [s' {:out (mapv #(msg/merge ctx parents %) ranked)}]))})}
    :conns [] :in :rank-commenters :out :rank-commenters})
 
 ;; --- Per-user history fetch -------------------------------------------------
@@ -210,28 +206,7 @@
      :sample_comments          sample}))
 
 (def aggregate-by-user
-  "Aggregator: stash every scored comment under msg/drain. On the close
-   cascade, group by user-id and emit one summary row per user via
-   msg/merge over that user's parent envelopes."
-  {:procs
-   {:agg
-    (step/handler-map
-     {:ports         {:ins {:in ""} :outs {:out ""}}
-      :on-init       (fn [] {:rows []})
-      :on-data       (fn [ctx s _d]
-                       [(update s :rows conj (:msg ctx)) msg/drain])
-      :on-all-closed (fn [ctx s]
-                       (let [grouped (group-by (comp :user-id :data) (:rows s))
-                             out-msgs
-                             (mapv (fn [[user-id par-msgs]]
-                                     (msg/merge ctx par-msgs
-                                                (summarize-user user-id
-                                                                (map :data par-msgs))))
-                                   grouped)]
-                         (trace/emit ctx {:event :aggregated
-                                          :n-users (count out-msgs)})
-                         {:out out-msgs}))})}
-   :conns [] :in :agg :out :agg})
+  (c/cumulative-by-group :user-id summarize-user))
 
 ;; --- Flow -------------------------------------------------------------------
 

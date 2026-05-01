@@ -96,7 +96,8 @@
                                      :workers 2
                                      :min-count 3})
                    [:tick])
-            rows (first (:outputs res))]
+            rows (->> (first (:outputs res))
+                      (group-by :user-id) vals (mapv last))]
         (is (= :completed (:state res)))
         (is (= 1 (count rows)))
         (testing "topics ranked by z-score with javascript on top"
@@ -110,7 +111,8 @@
     (let [res  (flow/run-seq
                  (core/build-flow {:user-ids ["ghost"] :workers 2})
                  [:tick])
-          rows (first (:outputs res))]
+          rows (->> (first (:outputs res))
+                    (group-by :user-id) vals (mapv last))]
       (is (= :completed (:state res)))
       (is (= 1 (count rows)))
       (is (= "ghost" (-> rows first :user-id)))

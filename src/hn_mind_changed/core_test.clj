@@ -126,7 +126,10 @@
                                        :filter-workers 2
                                        :judge-workers 2})
                      [:tick])
-              rows (first (:outputs res))]
+              ;; Aggregator no longer sorts/dedupes; tests do it manually.
+              rows (->> (first (:outputs res))
+                        (group-by :candidate-id) vals (mapv last)
+                        (sort-by (comp #(or % 0) :created_at_i) >))]
           (is (= :completed (:state res)))
           (testing "filter dropped one (200), so 2 rows remain"
             (is (= 2 (count rows))))

@@ -1,5 +1,9 @@
 # Datapotamus TODOs
 
+## Aggregator efficiency
+
+I noticed that Claude just moved the aggregator to emit partial results with every input rather than waiting for on input done. I think we should still wait for on input done while collecting all inputs into a batch and then process that batch once, efficiently. We should explore this when we have things settled down at the end.
+
 ## Replace `::closed-ins` with something honestly-named (and possibly drop it entirely)
 
 The framework's `run-input-done` tracks which input ports of a proc

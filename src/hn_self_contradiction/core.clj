@@ -230,65 +230,55 @@
                    {:out [(msg/child ctx (merge row t))]})))))
 
 (def topic-group-step
-  "Buffer-until-close: stash every tagged comment. On close, group by
-   [:user-id :topic]; drop singletons and non-substantive; emit one msg
-   per non-singleton group via msg/merge."
+  "Cumulative per-row emit: classifies each row into an outgoing msg
+   shape that downstream pair-fanout already understands. On every
+   row, the step emits exactly one msg:
+     - `:empty? true` if the row is the per-user empty-marker, a
+       non-substantive comment, or a substantive comment in a topic
+       group that hasn't yet reached two entries (a 'user seen, no
+       qualifying pair yet' placeholder).
+     - `{:user-id :topic :rows [...]}` cumulative qualifying-group
+       msg when the row pushes a `(user, topic)` group to two-or-more
+       substantive entries (and on each subsequent row in that
+       group). final-collector dedupes by user."
   {:procs
    {:tg
     (step/handler-map
-     {:ports {:ins {:in ""} :outs {:out ""}}
+     {:ports   {:ins {:in ""} :outs {:out ""}}
       :on-init (fn [] {:rows []})
-      :on-data (fn [ctx s row]
-                 [(update s :rows conj {:msg (:msg ctx) :row row}) {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [substantive (filter (fn [{r :row}]
-                                    (and (:is-substantive r)
-                                         (not (str/blank? (:topic r)))
-                                         (not (:empty? r))))
-                                  (:rows s))
-              ;; Always include user-empty markers so empty users still
-              ;; produce a final row.
-              empties     (filter (fn [{r :row}] (:empty? r)) (:rows s))
-              groups      (group-by (fn [{r :row}]
-                                      [(:user-id r)
-                                       (-> r :topic str/lower-case str/trim)])
-                                    substantive)
-              ;; one msg per non-singleton (user, topic) group
-              group-msgs
-              (mapv (fn [[[user-id topic] entries]]
-                      (let [parents (mapv :msg entries)
-                            rows    (mapv :row entries)]
-                        (msg/merge ctx parents
-                                   {:user-id user-id
-                                    :topic   topic
-                                    :rows    rows})))
-                    (filter (fn [[_ es]] (>= (count es) 2)) groups))
-              ;; pass through empty-user markers as their own msg
-              empty-msgs
-              (mapv (fn [{m :msg r :row}]
-                      (msg/merge ctx [m] r))
-                    empties)
-              ;; pass through one marker per user with no qualifying group,
-              ;; so collector sees every user
-              users-with-groups (set (map (comp first first) groups))
-              all-users         (set (map (comp :user-id :row) (:rows s)))
-              missing           (clojure.set/difference all-users
-                                                        users-with-groups
-                                                        (set (map (comp :user-id :row) empties)))
-              missing-msgs
-              (mapv (fn [u]
-                      ;; merge over any one parent for this user
-                      (let [some-msg (some (fn [{r :row m :msg}]
-                                             (when (= u (:user-id r)) m))
-                                           (:rows s))]
-                        (msg/merge ctx [some-msg]
-                                   {:user-id u :empty? true})))
-                    missing)]
-          (trace/emit ctx {:event :grouped
-                           :n-groups (count group-msgs)
-                           :n-users (count all-users)})
-          {:out (vec (concat group-msgs empty-msgs missing-msgs))}))})}
+      :on-data
+      (fn [ctx s row]
+        (let [s'      (update s :rows conj {:msg (:msg ctx) :row row})
+              user-id (:user-id row)
+              empty-marker
+              (msg/merge ctx [(:msg ctx)] {:user-id user-id :empty? true})
+              out
+              (cond
+                (:empty? row)
+                empty-marker
+
+                (and (:is-substantive row)
+                     (not (str/blank? (:topic row))))
+                (let [topic-key (-> row :topic str/lower-case str/trim)
+                      group-key [user-id topic-key]
+                      entries
+                      (filterv (fn [{r :row}]
+                                 (and (:is-substantive r)
+                                      (not (str/blank? (:topic r)))
+                                      (= [(:user-id r)
+                                          (-> r :topic str/lower-case str/trim)]
+                                         group-key)))
+                               (:rows s'))]
+                  (if (>= (count entries) 2)
+                    (msg/merge ctx (mapv :msg entries)
+                               {:user-id user-id
+                                :topic   topic-key
+                                :rows    (mapv :row entries)})
+                    empty-marker))
+
+                :else
+                empty-marker)]
+          [s' {:out [out]}]))})}
    :conns [] :in :tg :out :tg})
 
 (defn- mk-pair-fanout [{:keys [min-time-gap-days]}]
@@ -341,44 +331,21 @@
                    {:out [(msg/child ctx (merge pair j))]})))))
 
 (def final-collector
-  "Buffer all judged pairs (and empty-user markers); emit one msg per
-   user with sorted pairs."
-  {:procs
-   {:final
-    (step/handler-map
-     {:ports {:ins {:in ""} :outs {:out ""}}
-      :on-init (fn [] {:rows []})
-      :on-data (fn [ctx s row]
-                 [(update s :rows conj {:msg (:msg ctx) :row row}) {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [grouped (group-by (comp :user-id :row) (:rows s))
-              out-msgs
-              (mapv (fn [[user-id entries]]
-                      (let [parents (mapv :msg entries)
-                            real    (->> entries
-                                         (map :row)
-                                         (remove :empty?))
-                            sorted  (sort-pairs real)]
-                        (msg/merge ctx parents
-                                   {:user-id user-id
-                                    :n-pairs (count sorted)
-                                    :pairs   (mapv (fn [r]
-                                                     (-> r
-                                                         (dissoc :user-id)
-                                                         (update :a select-keys
-                                                                 [:comment-id :time
-                                                                  :stance-summary
-                                                                  :text])
-                                                         (update :b select-keys
-                                                                 [:comment-id :time
-                                                                  :stance-summary
-                                                                  :text])))
-                                                   sorted)})))
-                    grouped)]
-          (trace/emit ctx {:event :finalized :n-users (count out-msgs)})
-          {:out out-msgs}))})}
-   :conns [] :in :final :out :final})
+  (c/cumulative-by-group
+   :user-id
+   (fn [user-id rows]
+     (let [real   (remove :empty? rows)
+           sorted (sort-pairs real)]
+       {:user-id user-id
+        :n-pairs (count sorted)
+        :pairs   (mapv (fn [r]
+                         (-> r
+                             (dissoc :user-id)
+                             (update :a select-keys
+                                     [:comment-id :time :stance-summary :text])
+                             (update :b select-keys
+                                     [:comment-id :time :stance-summary :text])))
+                       sorted)}))))
 
 ;; --- Flow ----------------------------------------------------------------
 

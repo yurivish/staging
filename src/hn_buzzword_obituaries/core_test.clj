@@ -105,7 +105,8 @@
                                       :scope :both
                                       :workers 4})
                     [:tick])
-              rows (first (:outputs res))]
+              rows (->> (first (:outputs res))
+                        (group-by :term) vals (mapv last))]
           (is (= :completed (:state res)))
           (is (= 2 (count rows)))
           (let [by-term (into {} (map (juxt :term identity)) rows)]
@@ -126,7 +127,8 @@
                                     :bucket :month
                                     :workers 2})
                   [:tick])
-            rows (first (:outputs res))]
+            rows (->> (first (:outputs res))
+                      (group-by :term) vals (mapv last))]
         (is (= :completed (:state res)))
         (is (= 1 (count rows)))
         (is (= [0 0] (mapv :n (-> rows first :series))))))))

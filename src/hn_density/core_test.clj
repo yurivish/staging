@@ -165,7 +165,9 @@
                                                  :k-comments 2 :tree-workers 2
                                                  :user-workers 2 :llm-workers 2})
                                [:tick])
-            rows (vec (sort-by :user_id (first (:outputs res))))]
+            rows (->> (first (:outputs res))
+                      (group-by :user_id) vals (mapv last)
+                      (sort-by :user_id) vec)]
         (is (= :completed (:state res)))
         (testing "aggregator emitted; without the run-seq patch this would be empty"
           (is (= 2 (count rows))))

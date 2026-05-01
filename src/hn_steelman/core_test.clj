@@ -87,7 +87,8 @@
         (let [res  (flow/run-seq
                      (core/build-flow {:n-stories 1 :tree-workers 2 :workers 2})
                      [:tick])
-              rows (first (:outputs res))]
+              ;; Aggregator no longer sorts; tests sort manually.
+              rows (#'core/sort-rows (first (:outputs res)))]
           (is (= :completed (:state res)))
           (testing "only 2 edges (disagree, correct) reached judge → 2 rows"
             (is (= 2 (count rows))))

@@ -130,25 +130,24 @@
                       (into {} (map (fn [[k v]] [(keyword k) v]) byt)))}))
 
 (def aggregate-by-story
-  "Aggregator: stash every classified edge under msg/drain. On close,
-   group by story-id and emit one summary row per story via msg/merge."
+  "Aggregator: on each classified edge, accumulate it and emit the
+   current cumulative summary for that edge's story. Lineage is
+   preserved via msg/merge of all edges seen so far for the story.
+   The last emission per story is the final summary — quiescence
+   (counter balance) is what tells the caller that no more emissions
+   are coming."
   {:procs
    {:agg
     (step/handler-map
-     {:ports         {:ins {:in ""} :outs {:out ""}}
-      :on-init       (fn [] {:rows []})
-      :on-data       (fn [ctx s _d]
-                       [(update s :rows conj (:msg ctx)) msg/drain])
-      :on-all-closed (fn [ctx s]
-                       (let [grouped (group-by (comp :story-id :data) (:rows s))
-                             out-msgs
-                             (mapv (fn [[story-id par-msgs]]
-                                     (msg/merge ctx par-msgs
-                                                (summarize-story story-id par-msgs)))
-                                   grouped)]
-                         (trace/emit ctx {:event :aggregated
-                                          :n-stories (count out-msgs)})
-                         {:out out-msgs}))})}
+     {:ports   {:ins {:in ""} :outs {:out ""}}
+      :on-init (fn [] {:rows []})
+      :on-data (fn [ctx s _d]
+                 (let [s'        (update s :rows conj (:msg ctx))
+                       story-id  (-> ctx :msg :data :story-id)
+                       par-msgs  (filterv #(= story-id (-> % :data :story-id))
+                                          (:rows s'))
+                       summary   (summarize-story story-id par-msgs)]
+                   [s' {:out [(msg/merge ctx par-msgs summary)]}]))})}
    :conns [] :in :agg :out :agg})
 
 (defn build-flow

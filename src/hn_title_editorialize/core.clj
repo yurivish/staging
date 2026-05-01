@@ -359,26 +359,20 @@
                   :flag         (:divergence-flag m)}))))
 
 (defn aggregate
-  "Per-batch aggregator. Stash every row by :flag; on close, emit one
-   summary envelope with rate breakdown + most-divergent samples. Per-
-   tree-emit isn't relevant here (we want one batch-level summary, not
-   per-row), so we use buffer-until-close with auto-signal returns to
-   keep counters flowing."
+  "Cumulative batch aggregator: on each row, emits the current
+   cumulative summary (rate breakdown + most-divergent samples)
+   over all rows seen so far. The last emission is the final summary."
   [{:keys [n-divergent-samples] :or {n-divergent-samples 10}}]
   {:procs
    {:agg
     (step/handler-map
      {:ports {:ins {:in ""} :outs {:out ""}}
       :on-init (fn [] {:rows []})
-      :on-data (fn [ctx s row]
-                 [(update s :rows conj {:msg (:msg ctx) :row row})
-                  ;; Auto-signal keeps tokens flowing — see hn_shape's
-                  ;; commentary for why this matters under run-seq.
-                  {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [rows-data (mapv :row (:rows s))
-              parents   (mapv :msg (:rows s))
+      :on-data
+      (fn [ctx s row]
+        (let [s'        (update s :rows conj {:msg (:msg ctx) :row row})
+              rows-data (mapv :row (:rows s'))
+              parents   (mapv :msg (:rows s'))
               n-total   (count rows-data)
               by-flag   (frequencies (map :flag rows-data))
               with-st   (count (remove (comp :source-title-missing? :metrics) rows-data))
@@ -396,7 +390,7 @@
                                                             [k (double (/ v n-total))])))
                          :most-divergent       divergent
                          :rows                 rows-data}]
-          {:out [(msg/merge ctx parents summary)]}))})}
+          [s' {:out [(msg/merge ctx parents summary)]}]))})}
    :conns [] :in :agg :out :agg})
 
 ;; --- Flow -------------------------------------------------------------------

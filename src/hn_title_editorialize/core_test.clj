@@ -135,7 +135,7 @@
                   core/http-get-text   (stub-http-get-text page-data)]
       (let [res (flow/run-seq (core/build-flow {:n-stories 3 :fetch-workers 2})
                               [:tick])
-            summary (first (first (:outputs res)))]
+            summary (last (first (:outputs res)))]
         (is (= :completed (:state res)))
         (is (= 2 (:n-stories summary))
             "URL-less story was filtered out before metrics")
@@ -160,7 +160,7 @@
                   core/http-get-text (stub-http-get-text page-data)]
       (let [res (flow/run-seq (core/build-flow {:n-stories 1 :fetch-workers 2})
                               [:tick])
-            summary (first (first (:outputs res)))]
+            summary (last (first (:outputs res)))]
         (is (= :completed (:state res)))
         (is (= 1 (:n-stories summary)))
         (is (= 0 (:n-with-source-title summary)))
@@ -183,7 +183,7 @@
                   core/http-get-text (stub-http-get-text page-data)]
       (let [res     (flow/run-seq (core/build-flow {:n-stories 3 :fetch-workers 2})
                                   [:tick])
-            summary (first (first (:outputs res)))
+            summary (last (first (:outputs res)))
             rates   (vals (:flag-rates summary))
             total   (reduce + 0.0 rates)]
         (is (= :completed (:state res)))

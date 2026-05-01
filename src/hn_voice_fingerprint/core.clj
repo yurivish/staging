@@ -310,45 +310,18 @@
                                comments))}))))
 
 (def aggregate-by-user
-  "Buffer-until-close: stash every per-comment row, group by user-id,
-   then within each user group by year-period, compute per-feature
-   mean+stdev per period, and emit one row per user with periods and
-   drift series. msg/merge over each user's per-comment parents.
-
-   :on-data returns {} (empty port-map) so the framework auto-signals
-   to keep counters balanced — same trick as the buzzword aggregator."
-  {:procs
-   {:agg
-    (step/handler-map
-     {:ports {:ins {:in ""} :outs {:out ""}}
-      :on-init (fn [] {:rows []})
-      :on-data (fn [ctx s row]
-                 [(update s :rows conj {:msg (:msg ctx) :row row}) {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [grouped (group-by (comp :user-id :row) (:rows s))
-              out-msgs
-              (mapv (fn [[user-id entries]]
-                      (let [parents (mapv :msg entries)
-                            rows    (mapv :row entries)
-                            ;; If a user has only the empty marker, no real comments.
-                            real    (remove :empty? rows)
-                            by-per  (group-by :year-period real)
-                            periods (->> by-per
-                                         (sort-by key)
-                                         (mapv (fn [[per rs]]
-                                                 (-> (summarize-period
-                                                       (mapv :features rs))
-                                                     (assoc :year-period per)))))
-                            drift   (drift-series periods)]
-                        (msg/merge ctx parents
-                                   {:user-id user-id
-                                    :periods periods
-                                    :drift   drift})))
-                    grouped)]
-          (trace/emit ctx {:event :aggregated :n-users (count out-msgs)})
-          {:out out-msgs}))})}
-   :conns [] :in :agg :out :agg})
+  (c/cumulative-by-group
+   :user-id
+   (fn [user-id rows]
+     (let [real    (remove :empty? rows)
+           by-per  (group-by :year-period real)
+           periods (->> by-per
+                        (sort-by key)
+                        (mapv (fn [[per rs]]
+                                (-> (summarize-period (mapv :features rs))
+                                    (assoc :year-period per)))))
+           drift   (drift-series periods)]
+       {:user-id user-id :periods periods :drift drift}))))
 
 (defn build-flow
   ([] (build-flow {}))

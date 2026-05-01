@@ -212,34 +212,10 @@
                  {:out [(msg/child ctx (assoc cell :n (or n 0)))]}))))
 
 (def aggregate-by-term
-  "Buffer-until-close: stash every (term × bucket) cell. On
-   :on-all-closed, group by :term and emit one summary row per term
-   via msg/merge over the cells' parents. :on-data returns an empty
-   port-map so the framework auto-signals — same trick as hn_shape's
-   tree-fetch aggregator, prevents transient quiescence from racing
-   with the close cascade."
-  {:procs
-   {:agg
-    (step/handler-map
-     {:ports {:ins {:in ""} :outs {:out ""}}
-      :on-init (fn [] {:cells []})
-      :on-data (fn [ctx s cell]
-                 [(update s :cells conj {:msg (:msg ctx) :cell cell})
-                  {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [grouped (group-by (comp :term :cell) (:cells s))
-              out-msgs
-              (mapv (fn [[term entries]]
-                      (let [parents (mapv :msg entries)
-                            cells   (mapv :cell entries)
-                            scope   (:scope (first cells))
-                            row     (summarize-term term scope cells)]
-                        (msg/merge ctx parents row)))
-                    grouped)]
-          (trace/emit ctx {:event :aggregated :n-terms (count out-msgs)})
-          {:out out-msgs}))})}
-   :conns [] :in :agg :out :agg})
+  (c/cumulative-by-group
+   :term
+   (fn [term cells]
+     (summarize-term term (:scope (first cells)) cells))))
 
 (defn build-flow
   ([] (build-flow {}))

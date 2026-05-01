@@ -228,27 +228,10 @@
                    {:out [(msg/child ctx (merge row c))]})))))
 
 (defn- mk-aggregate [{:keys [peak-min silent-quarters] :as cfg}]
-  {:procs
-   {:agg
-    (step/handler-map
-     {:ports {:ins {:in ""} :outs {:out ""}}
-      :on-init (fn [] {:rows []})
-      :on-data (fn [ctx s row]
-                 [(update s :rows conj {:msg (:msg ctx) :row row}) {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [grouped (group-by (comp :user-id :row) (:rows s))
-              out-msgs
-              (mapv (fn [[user-id entries]]
-                      (let [parents (mapv :msg entries)
-                            rows    (mapv :row entries)
-                            real    (remove :empty? rows)]
-                        (msg/merge ctx parents
-                                   (summarize-user user-id real cfg))))
-                    grouped)]
-          (trace/emit ctx {:event :aggregated :n-users (count out-msgs)})
-          {:out out-msgs}))})}
-   :conns [] :in :agg :out :agg})
+  (c/cumulative-by-group
+   :user-id
+   (fn [user-id rows]
+     (summarize-user user-id (remove :empty? rows) cfg))))
 
 ;; --- Flow -----------------------------------------------------------------
 

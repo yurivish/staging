@@ -111,7 +111,8 @@
                                        :min-time-gap-days 90
                                        :filter-threshold 6})
                      [:tick])
-              rows (first (:outputs res))]
+              rows (->> (first (:outputs res))
+                        (group-by :user-id) vals (mapv last))]
           (is (= :completed (:state res)))
           (is (= 1 (count rows)))
           (let [r (first rows)]
@@ -135,7 +136,8 @@
       (let [res  (flow/run-seq
                    (core/build-flow {:user-ids ["u"] :workers 2})
                    [:tick])
-            rows (first (:outputs res))]
+            rows (->> (first (:outputs res))
+                      (group-by :user-id) vals (mapv last))]
         (is (= :completed (:state res)))
         (is (= 1 (count rows)))
         (is (= [] (-> rows first :pairs)))))))

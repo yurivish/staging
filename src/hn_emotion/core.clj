@@ -205,39 +205,18 @@
                    {:out [(msg/child ctx (merge row c))]})))))
 
 (def aggregate-by-user
-  "Buffer-until-close: stash every classified comment. On close,
-   group by :user-id; within each user group by :year-month; emit
-   one msg per user with periods-list nested. msg/merge over each
-   user's classified-comment parents to keep tokens conserved."
-  {:procs
-   {:agg
-    (step/handler-map
-     {:ports {:ins {:in ""} :outs {:out ""}}
-      :on-init (fn [] {:rows []})
-      :on-data (fn [ctx s row]
-                 [(update s :rows conj {:msg (:msg ctx) :row row}) {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [grouped (group-by (comp :user-id :row) (:rows s))
-              out-msgs
-              (mapv (fn [[user-id entries]]
-                      (let [parents (mapv :msg entries)
-                            rows    (mapv :row entries)
-                            real    (remove :empty? rows)
-                            by-mon  (group-by :year-month real)
-                            months  (->> by-mon
-                                         (sort-by key)
-                                         (mapv (fn [[ym rs]]
-                                                 (-> (summarize-bucket rs)
-                                                     (assoc :year-month ym
-                                                            :user-id user-id)))))]
-                        (msg/merge ctx parents
-                                   {:user-id user-id
-                                    :months months})))
-                    grouped)]
-          (trace/emit ctx {:event :aggregated :n-users (count out-msgs)})
-          {:out out-msgs}))})}
-   :conns [] :in :agg :out :agg})
+  (c/cumulative-by-group
+   :user-id
+   (fn [user-id rows]
+     (let [real   (remove :empty? rows)
+           by-mon (group-by :year-month real)
+           months (->> by-mon
+                       (sort-by key)
+                       (mapv (fn [[ym rs]]
+                               (-> (summarize-bucket rs)
+                                   (assoc :year-month ym
+                                          :user-id user-id)))))]
+       {:user-id user-id :months months}))))
 
 ;; --- Flow -----------------------------------------------------------------
 

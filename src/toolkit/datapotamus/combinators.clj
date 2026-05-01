@@ -209,6 +209,42 @@
                      (step/output-at fi-id))]
     (step/serial id bracket)))
 
+(defn cumulative-by-group
+  "Aggregator step. On each input, accumulates the row in its
+   per-group state and emits a cumulative summary for the row's
+   group as a `msg/merge` over all parent msgs seen for that group
+   so far.
+
+   Designed for the new input-done semantics: input-done means
+   external input is exhausted, but in-flight work may still arrive
+   afterward. The last emission per group is the final summary, and
+   quiescence (counter balance, surfaced by `flow/await-quiescent!`)
+   is the actual signal that no more emissions are coming. Tests
+   that previously took `(first (:outputs res))` to get one summary
+   per group should take the last per group, e.g.
+   `(->> outputs (group-by k) vals (mapv last))`.
+
+   - `key-fn`         : (row → group-key) — how to group rows.
+   - `summarize-rows` : (group-key, rows-so-far → summary-data) — the
+                        data emitted via `msg/merge` of all parent
+                        msgs seen for that group."
+  [key-fn summarize-rows]
+  {:procs
+   {:agg
+    (step/handler-map
+     {:ports   {:ins {:in ""} :outs {:out ""}}
+      :on-init (fn [] {:groups {}})
+      :on-data
+      (fn [ctx s row]
+        (let [k       (key-fn row)
+              s'      (update-in s [:groups k] (fnil conj [])
+                                 {:msg (:msg ctx) :row row})
+              entries (get-in s' [:groups k])
+              parents (mapv :msg entries)
+              rows    (mapv :row entries)]
+          [s' {:out [(msg/merge ctx parents (summarize-rows k rows))]}]))})}
+   :conns [] :in :agg :out :agg})
+
 (defn workers
   "K parallel copies of `inner` behind a round-robin router.
 
@@ -436,13 +472,18 @@
    can mark the worker free on :result without any in-flight :work
    race.
 
-   Closure: when external `:in` reports input-done (via the per-port
-   `:on-input-done` hook) AND the queue is empty AND no workers are
-   busy, the coordinator closes the channels feeding worker inputs
-   (which it owns via `::flow/out-ports` on its `:to-wK` ports).
-   Workers then cascade input-done through their wrapped `:to-coord`
-   output, eventually closing all of the coordinator's input ports
-   and triggering `:on-all-closed`'s default auto-append on `:out`.
+   Closure semantics: input-done refers to *external* input being
+   exhausted, not all activity ceasing. When `:in` reports input-done,
+   the coordinator immediately propagates input-done on `:out` (so
+   downstream consumers learn no new external work is coming) and on
+   each `:to-wK` port (so workers know not to expect new dispatches).
+   In-flight worker results that arrive on `:rec` after this point
+   are still forwarded on `:out` as data — downstream consumers
+   should treat input-done as a 'stop generating new external work'
+   marker and rely on quiescence (counter balance) for the actual
+   'pipeline has settled' signal. Aggregators that buffered to
+   `:on-all-closed` in older code should be rewritten to cumulative
+   per-data emission so the last emission is the final summary.
 
    Trace topology: coordinator proc `:coord`, ext-wrap proc
    `:ext`, shim procs `:s0`..`:sK-1`, worker procs `:w0`..`:wK-1`.
@@ -486,13 +527,6 @@
                               (update :busy conj wk))
                           (update dispatch-pm to-port (fnil conj []) dispatched)))))))
 
-         maybe-close-workers!
-         (fn [s]
-           (when (and (:ext-done? s)
-                      (empty? (:queue s))
-                      (empty? (:busy s)))
-             (doseq [c to-w-chans] (a/close! c))))
-
          coord
          (step/handler-map
           {:ports {:ins  {:in "" :rec ""}
@@ -501,8 +535,7 @@
            :on-init       (fn []
                             {::flow/out-ports (zipmap to-w-ports to-w-chans)
                              :queue           clojure.lang.PersistentQueue/EMPTY
-                             :busy            #{}
-                             :ext-done?       false})
+                             :busy            #{}})
            :on-data
            (fn [ctx s _d]
              (let [in-port (:in-port ctx)
@@ -529,7 +562,6 @@
                        s'     (update s :busy disj wk)
                        forward {:out [(msg/pass ctx)]}
                        [s'' dispatch] (try-dispatch s')]
-                   (maybe-close-workers! s'')
                    [s'' (clojure.core/merge forward dispatch)])
 
                  :else
@@ -540,18 +572,24 @@
            (fn [ctx s]
              [s {:out [(msg/signal ctx)]}])
            :on-input-done
+           ;; Input-done = external input exhausted. Propagate through
+           ;; the system immediately (don't wait for in-flight workers
+           ;; to drain): emit input-done on :out so downstream knows
+           ;; "no new external work coming" and on each :to-wK so
+           ;; workers know not to expect new dispatches. Quiescence
+           ;; (counter balance) is the actual indicator that the
+           ;; whole flow has settled.
            (fn [_ s port]
-             (if (= port :in)
-               ;; External input exhausted. (The :rec port also
-               ;; receives input-done eventually — once we close worker
-               ;; chans and they cascade — but that fires
-               ;; :on-all-closed's default auto-append on :out.)
-               (let [s' (assoc s :ext-done? true)]
-                 (maybe-close-workers! s')
-                 [s' {}])
-               [s {}]))
+             (case port
+               :in  [s (clojure.core/merge
+                        {:out [(msg/new-input-done)]}
+                        (zipmap to-w-ports
+                                (repeat [(msg/new-input-done)])))]
+               :rec [s {}]))
+           ;; Suppress framework auto-append: we already emitted
+           ;; input-done on every output port from :on-input-done.
            :on-all-closed
-           (fn [_ s] [s {}])})
+           (fn [_ _] msg/drain)})
 
          ;; ext-wrap: passes external work through to coord :in
          ;; verbatim (no tagging needed since :in identifies it).

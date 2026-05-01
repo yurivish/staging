@@ -232,32 +232,13 @@
                  {:out (msg/children ctx hs)}))))
 
 (def dedup-step
-  "Buffer-until-close: stash every hit. On :on-all-closed, group by
-   :objectID, emit one msg per unique candidate via msg/merge over all
-   parent envelopes that contributed it. :on-data returns {} so the
-   framework auto-signals — same trick as the buzzword aggregator."
-  {:procs
-   {:dedup
-    (step/handler-map
-     {:ports {:ins {:in ""} :outs {:out ""}}
-      :on-init (fn [] {:hits []})
-      :on-data (fn [ctx s hit]
-                 [(update s :hits conj {:msg (:msg ctx) :hit hit}) {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [grouped (group-by (comp :objectID :hit) (:hits s))
-              out-msgs
-              (mapv (fn [[_oid entries]]
-                      (let [parents (mapv :msg entries)
-                            hit     (-> entries first :hit)]
-                        (msg/merge ctx parents
-                                   {:candidate-id (str (:objectID hit))
-                                    :created_at_i (:created_at_i hit)
-                                    :seed-author  (:author hit)})))
-                    grouped)]
-          (trace/emit ctx {:event :deduped :n-unique (count out-msgs)})
-          {:out out-msgs}))})}
-   :conns [] :in :dedup :out :dedup})
+  (c/cumulative-by-group
+   :objectID
+   (fn [oid hits]
+     (let [hit (first hits)]
+       {:candidate-id (str oid)
+        :created_at_i (:created_at_i hit)
+        :seed-author  (:author hit)}))))
 
 (def hydrate-step
   (step/step :hydrate nil
@@ -304,28 +285,11 @@
                  {:out [(msg/child ctx (merge row j))]}))))
 
 (def final-collector
-  "Buffer all judged rows; on close emit them sorted by created-at desc,
-   one msg per row. msg/merge over each row's parents to keep tokens
-   conserved."
-  {:procs
-   {:final
-    (step/handler-map
-     {:ports {:ins {:in ""} :outs {:out ""}}
-      :on-init (fn [] {:rows []})
-      :on-data (fn [ctx s row]
-                 [(update s :rows conj {:msg (:msg ctx) :row row}) {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [sorted (sort-by (comp #(or % 0) :created_at_i :row) > (:rows s))
-              clean  (fn [r]
-                       (-> (:row r)
-                           (dissoc :created_at_i)))
-              out    (mapv (fn [e]
-                             (msg/merge ctx [(:msg e)] (clean e)))
-                           sorted)]
-          (trace/emit ctx {:event :finalized :n-rows (count out)})
-          {:out out}))})}
-   :conns [] :in :final :out :final})
+  "Per-row emit: each judged row passes through as its own emission.
+   Ordering and any final dedup/sort happen downstream of the flow
+   (callers can sort `(first (:outputs res))` by `:created_at_i`)."
+  (step/step :final nil
+             (fn [ctx _s _row] {:out [(msg/pass ctx)]})))
 
 ;; --- Flow ------------------------------------------------------------------
 

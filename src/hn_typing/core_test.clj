@@ -95,7 +95,9 @@
       (let [res  (flow/run-seq (core/build-flow {:n-stories 1 :tree-workers 1
                                                  :max-edges 5 :llm-workers 1})
                                [:tick])
-            row  (-> res :outputs first first)]
+            ;; Aggregator emits a cumulative summary on each classified edge;
+            ;; the last emission per story is the final summary.
+            row  (-> res :outputs first last)]
         (is (= :completed (:state res)))
         (is (= 1 (:story_id row)))
         (is (= 2 (:n_edges_classified row)))

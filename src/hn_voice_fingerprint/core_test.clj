@@ -232,7 +232,8 @@
                                        :bucket :quarter
                                        :workers 2})
                      [:tick])
-              rows (first (:outputs res))
+              rows (->> (first (:outputs res))
+                        (group-by :user-id) vals (mapv last))
               by   (into {} (map (juxt :user-id identity)) rows)]
           (is (= :completed (:state res)))
           (is (= 2 (count rows)))
@@ -255,7 +256,8 @@
       (let [res  (flow/run-seq
                    (core/build-flow {:user-ids ["ghost"] :bucket :month :workers 2})
                    [:tick])
-            rows (first (:outputs res))]
+            rows (->> (first (:outputs res))
+                      (group-by :user-id) vals (mapv last))]
         (is (= :completed (:state res)))
         (is (= 1 (count rows)))
         (is (= "ghost" (-> rows first :user-id)))

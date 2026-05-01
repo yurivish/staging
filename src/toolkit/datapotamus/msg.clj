@@ -7,13 +7,23 @@
      :signal      no  :data, has :tokens
      :input-done  no  :data, no  :tokens
 
-   `:input-done` is a per-port lifecycle signal — \"this upstream input
-   has been exhausted.\" It triggers `:on-all-closed` (once all of a
-   proc's input ports have been input-done'd) and cascades to declared
-   outputs. It is NOT a processing barrier: data and signals continue
-   to be processed on a port even after that port has been input-done'd
-   (e.g. via a cyclic feedback edge). System termination is a separate,
-   emergent property detected via counter quiescence.
+   `:input-done` is a per-port lifecycle signal — \"this external
+   input has been exhausted.\" It triggers `:on-all-closed` (once all
+   of a proc's input ports have been input-done'd) and cascades to
+   declared outputs. It is NOT a processing barrier: data and signals
+   continue to be processed on a port even after that port has been
+   input-done'd (e.g. via a cyclic feedback edge or an upstream that
+   propagates input-done eagerly while still producing in-flight data).
+   System termination — \"the pipeline has actually settled, no more
+   activity\" — is a separate, emergent property detected via counter
+   quiescence (`flow/await-quiescent!`).
+
+   Aggregator pattern: because input-done signals \"no new external
+   input,\" not \"no more data of any kind,\" buffer-and-flush-on-close
+   aggregators race with in-flight data. Prefer cumulative-emit-on-data
+   (`combinators/cumulative-by-group`): on each input, emit the current
+   cumulative summary; the last emission per group is the final answer
+   once quiescence signals settling.
 
    The absence of :data / :tokens is preserved for structural clarity,
    but `:msg-kind` is the canonical source — dispatch reads the stamp

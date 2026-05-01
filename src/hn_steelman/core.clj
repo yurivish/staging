@@ -195,41 +195,27 @@
                  {:out [(msg/child ctx (merge edge j))]}))))
 
 (def final-collector
-  "Buffer all judged rows; on close emit them sorted by engagement
-   priority + confidence."
-  {:procs
-   {:final
-    (step/handler-map
-     {:ports {:ins {:in ""} :outs {:out ""}}
-      :on-init (fn [] {:rows []})
-      :on-data (fn [ctx s row]
-                 [(update s :rows conj {:msg (:msg ctx) :row row}) {}])
-      :on-all-closed
-      (fn [ctx s]
-        (let [sorted (sort-rows (mapv :row (:rows s)))
-              by-row (zipmap (mapv :row (:rows s)) (mapv :msg (:rows s)))
-              clean  (fn [r]
-                       {:story-id      (:story-id r)
-                        :story-title   (:story-title r)
-                        :story-url     (:story-url r)
-                        :parent-id     (:parent-id r)
-                        :reply-id      (:kid-id r)
-                        :parent-author (:parent-author r)
-                        :reply-author  (:kid-author r)
-                        :class         (:class r)
-                        :engagement    (:engagement r)
-                        :confidence    (:confidence r)
-                        :parent-strongest-reading (:parent-strongest-reading r)
-                        :what-reply-addressed (:what-reply-addressed r)
-                        :gap-summary   (:gap-summary r)
-                        :parent-preview (clip (:parent-text r) 200)
-                        :reply-preview  (clip (:kid-text r) 200)})
-              out    (mapv (fn [r]
-                             (msg/merge ctx [(get by-row r)] (clean r)))
-                           sorted)]
-          (trace/emit ctx {:event :finalized :n-rows (count out)})
-          {:out out}))})}
-   :conns [] :in :final :out :final})
+  "Per-row emit: each judged row passes through cleaned of upstream
+   text fields. Final ordering is the caller's responsibility — sort
+   `(first (:outputs res))` with `sort-rows` after the flow returns."
+  (step/step :final nil
+             (fn [ctx _s row]
+               {:out [(msg/child ctx
+                                  {:story-id      (:story-id row)
+                                   :story-title   (:story-title row)
+                                   :story-url     (:story-url row)
+                                   :parent-id     (:parent-id row)
+                                   :reply-id      (:kid-id row)
+                                   :parent-author (:parent-author row)
+                                   :reply-author  (:kid-author row)
+                                   :class         (:class row)
+                                   :engagement    (:engagement row)
+                                   :confidence    (:confidence row)
+                                   :parent-strongest-reading (:parent-strongest-reading row)
+                                   :what-reply-addressed (:what-reply-addressed row)
+                                   :gap-summary   (:gap-summary row)
+                                   :parent-preview (clip (:parent-text row) 200)
+                                   :reply-preview  (clip (:kid-text row) 200)})]})))
 
 ;; --- Flow ----------------------------------------------------------------
 
