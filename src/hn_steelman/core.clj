@@ -24,12 +24,8 @@
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
             [toolkit.hn.tree-fetch :as tree-fetch]
-            [toolkit.pubsub :as pubsub])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
-           [dev.langchain4j.model.chat.request ChatRequest]
-           [dev.langchain4j.model.chat.request.json JsonObjectSchema JsonEnumSchema]
-           [dev.langchain4j.agent.tool ToolSpecification]
-           [dev.langchain4j.data.message UserMessage SystemMessage]))
+            [toolkit.llm.cli :as llm]
+            [toolkit.pubsub :as pubsub]))
 
 (def base "https://hacker-news.firebaseio.com/v0")
 (def haiku  "claude-haiku-4-5")
@@ -71,90 +67,51 @@
               (mapcat walk (:kid-trees n))))
           (:kid-trees tree)))
 
-;; --- LLM clients ----------------------------------------------------------
-
-(defonce ^:private edge-model
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 64))
-             .build)))
-
-(defonce ^:private judge-model
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName sonnet)
-             (.maxTokens (int 384))
-             .build)))
-
 ;; --- Edge classifier (same as hn_typing) ----------------------------------
 
 (def ^:private edge-schema
-  (-> (JsonObjectSchema/builder)
-      (.addStringProperty
-       "edge_type"
-       (str "EXACTLY one of: agree, disagree, correct, extend, tangent, attack, clarify."))
-      (.required ["edge_type"])
-      .build))
+  {:type "object"
+   :properties {:edge_type {:type "string"
+                            :enum edge-types
+                            :description "Pick the dominant relationship the reply has to the parent."}}
+   :required ["edge_type"]})
 
-(def ^:private edge-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_edge_type")
-      (.description "Submit your classification of the reply.")
-      (.parameters edge-schema)
-      .build))
+(def ^:private edge-system
+  "Classify the reply's relationship to the parent comment. Pick exactly one of: agree, disagree, correct, extend, tangent, attack, clarify.")
 
 (defn llm-edge-classify!
   "Classify reply→parent relationship. Returns one of the edge-type
    strings, or nil. Stub-friendly."
   [{:keys [parent-text kid-text]}]
-  (try
-    (let [req (-> (ChatRequest/builder)
-                  (.messages
-                   [(SystemMessage/from
-                     "Classify the reply's relationship to the parent comment. You MUST respond by calling submit_edge_type with one of the seven labels.")
-                    (UserMessage/from
-                     (str "PARENT:\n" (str/trim (or parent-text ""))
-                          "\n\nREPLY:\n" (str/trim (or kid-text ""))))])
-                  (.toolSpecifications [edge-tool])
-                  .build)
-          tcs (-> @edge-model (.chat req) .aiMessage .toolExecutionRequests)]
-      (when (seq tcs)
-        (let [t (-> (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword)
-                    :edge_type str/lower-case str/trim)]
-          (when ((set edge-types) t) t))))
-    (catch Throwable _ nil)))
+  (let [user-msg (str "PARENT:\n" (str/trim (or parent-text ""))
+                      "\n\nREPLY:\n" (str/trim (or kid-text "")))
+        r (llm/call-json! {:system edge-system
+                           :user   user-msg
+                           :schema edge-schema
+                           :model  haiku})]
+    (when r
+      (let [t (some-> r :edge-type str/lower-case str/trim)]
+        (when ((set edge-types) t) t)))))
 
 ;; --- Steelman judge (Sonnet) ----------------------------------------------
 
 (def ^:private judge-schema
-  (-> (JsonObjectSchema/builder)
-      (.addProperty "engagement"
-                    (-> (JsonEnumSchema/builder)
-                        (.enumValues ["steelman" "charitable" "neutral"
-                                      "strawman" "not-applicable"])
-                        .build))
-      (.addNumberProperty "confidence" "[0,1].")
-      (.addStringProperty "parent_strongest_reading" "≤ 25 words.")
-      (.addStringProperty "what_reply_addressed" "≤ 25 words.")
-      (.addStringProperty "gap_summary" "≤ 30 words.")
-      (.required ["engagement" "confidence" "parent_strongest_reading"
-                  "what_reply_addressed" "gap_summary"])
-      .build))
-
-(def ^:private judge-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_engagement")
-      (.description "Submit your engagement assessment.")
-      (.parameters judge-schema)
-      .build))
+  {:type "object"
+   :properties {:engagement {:type "string"
+                             :enum ["steelman" "charitable" "neutral"
+                                    "strawman" "not-applicable"]}
+                :confidence {:type "number" :minimum 0 :maximum 1}
+                :parent_strongest_reading {:type "string"
+                                            :description "≤ 25 words."}
+                :what_reply_addressed {:type "string"
+                                        :description "≤ 25 words."}
+                :gap_summary {:type "string"
+                              :description "≤ 30 words."}}
+   :required ["engagement" "confidence" "parent_strongest_reading"
+              "what_reply_addressed" "gap_summary"]})
 
 (def ^:private judge-system
-  "You are evaluating one HN comment exchange: a parent and a reply that pushes back. Decide whether the reply engages with the STRONGEST reasonable reading of the parent (steelman / charitable), neutrally engages, or attacks a WEAKER reading (strawman). State explicitly the strongest reading of the parent and what specifically the reply addressed; the gap between those is the answer. You MUST respond by calling submit_engagement.")
-
-(defn- ->kw-map [m]
-  (reduce-kv (fn [a k v] (assoc a (keyword (str/replace (name k) #"_" "-")) v))
-             {} m))
+  "You are evaluating one HN comment exchange: a parent and a reply that pushes back. Decide whether the reply engages with the STRONGEST reasonable reading of the parent (steelman / charitable), neutrally engages, or attacks a WEAKER reading (strawman). State explicitly the strongest reading of the parent and what specifically the reply addressed; the gap between those is the answer.")
 
 (defn- clip [s n]
   (if (and s (> (count s) n)) (str (subs s 0 n) "…") s))
@@ -162,25 +119,16 @@
 (defn llm-steelman-judge!
   "Sonnet steelman judge. Returns judgment map. Stub-friendly."
   [{:keys [parent-text kid-text story-title]}]
-  (try
-    (let [user-msg (str (when story-title (str "Story: " story-title "\n\n"))
-                        "PARENT:\n" (clip (or parent-text "") 600)
-                        "\n\nREPLY:\n" (clip (or kid-text "") 600))
-          req (-> (ChatRequest/builder)
-                  (.messages [(SystemMessage/from judge-system)
-                              (UserMessage/from user-msg)])
-                  (.toolSpecifications [judge-tool])
-                  .build)
-          tcs (-> @judge-model (.chat req) .aiMessage .toolExecutionRequests)]
-      (if (seq tcs)
-        (->kw-map (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword))
+  (let [user-msg (str (when story-title (str "Story: " story-title "\n\n"))
+                      "PARENT:\n" (clip (or parent-text "") 600)
+                      "\n\nREPLY:\n" (clip (or kid-text "") 600))]
+    (or (llm/call-json! {:system judge-system
+                         :user   user-msg
+                         :schema judge-schema
+                         :model  sonnet})
         {:engagement "not-applicable" :confidence 0.0
          :parent-strongest-reading "" :what-reply-addressed ""
-         :gap-summary ""}))
-    (catch Throwable _
-      {:engagement "not-applicable" :confidence 0.0
-       :parent-strongest-reading "" :what-reply-addressed ""
-       :gap-summary ""})))
+         :gap-summary ""})))
 
 ;; --- Sorting --------------------------------------------------------------
 

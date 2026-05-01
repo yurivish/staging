@@ -23,13 +23,9 @@
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
+            [toolkit.llm.cli :as llm]
             [toolkit.pubsub :as pubsub])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
-           [dev.langchain4j.model.chat.request ChatRequest]
-           [dev.langchain4j.model.chat.request.json JsonObjectSchema]
-           [dev.langchain4j.agent.tool ToolSpecification]
-           [dev.langchain4j.data.message UserMessage SystemMessage]
-           [java.time LocalDate Instant ZoneOffset]))
+  (:import [java.time LocalDate Instant ZoneOffset]))
 
 (def algolia-base "https://hn.algolia.com/api/v1/search_by_date")
 (def haiku "claude-haiku-4-5")
@@ -92,51 +88,29 @@
 
 ;; --- Haiku classifier (topic + substantiveness gate) ----------------------
 
-(defonce ^:private model
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 96))
-             .build)))
-
 (def ^:private classify-schema
-  (-> (JsonObjectSchema/builder)
-      (.addStringProperty "topic"
-                          "2-5 words, lowercase, about the subject matter.")
-      (.addBooleanProperty "is_substantive"
-                           "True if the comment makes a substantive claim about the topic, false for one-liners, jokes, meta, off-topic.")
-      (.required ["topic" "is_substantive"])
-      .build))
-
-(def ^:private classify-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_classification")
-      (.description "Submit topic and substantiveness.")
-      (.parameters classify-schema)
-      .build))
+  {:type "object"
+   :properties {:topic           {:type "string"
+                                   :description "2-5 words, lowercase, about the subject matter."}
+                :is_substantive  {:type "boolean"
+                                   :description "True if the comment makes a substantive claim about the topic; false for jokes, one-liners, meta, off-topic."}}
+   :required ["topic" "is_substantive"]})
 
 (def ^:private classify-system
-  "Classify a single Hacker News comment. Return TOPIC (2-5 words about the subject matter, lowercase) and IS_SUBSTANTIVE (true if the comment makes a substantive claim, false for jokes/one-liners/meta/off-topic). The story title is provided as context only — classify the COMMENT. You MUST respond by calling the submit_classification tool.")
+  "Classify a single Hacker News comment. Return TOPIC (2-5 words about the subject matter, lowercase) and IS_SUBSTANTIVE (true if the comment makes a substantive claim, false for jokes/one-liners/meta/off-topic). The story title is provided as context only — classify the COMMENT.")
 
 (defn llm-classify!
   "Classify a comment. Returns {:topic s :is-substantive bool}."
   [{:keys [text story-title]}]
-  (try
-    (let [user-msg (str (when story-title (str "Story title: " story-title "\n\n"))
-                        "Comment:\n" (or text ""))
-          req (-> (ChatRequest/builder)
-                  (.messages [(SystemMessage/from classify-system)
-                              (UserMessage/from user-msg)])
-                  (.toolSpecifications [classify-tool])
-                  .build)
-          tcs (-> @model (.chat req) .aiMessage .toolExecutionRequests)
-          raw (if (seq tcs)
-                (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword)
-                {:topic "" :is_substantive false})]
-      {:topic          (:topic raw)
-       :is-substantive (boolean (:is_substantive raw))})
-    (catch Throwable _
-      {:topic "" :is-substantive false})))
+  (let [user-msg (str (when story-title (str "Story title: " story-title "\n\n"))
+                      "Comment:\n" (or text ""))
+        r (or (llm/call-json! {:system classify-system
+                               :user   user-msg
+                               :schema classify-schema
+                               :model  haiku})
+              {:topic "" :is-substantive false})]
+    {:topic          (:topic r)
+     :is-substantive (boolean (:is-substantive r))}))
 
 ;; --- Trajectory classifier ------------------------------------------------
 

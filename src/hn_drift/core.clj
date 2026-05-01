@@ -17,12 +17,8 @@
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
             [toolkit.hn.tree-fetch :as tree-fetch]
-            [toolkit.pubsub :as pubsub])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
-           [dev.langchain4j.model.chat.request ChatRequest]
-           [dev.langchain4j.model.chat.request.json JsonObjectSchema]
-           [dev.langchain4j.agent.tool ToolSpecification]
-           [dev.langchain4j.data.message UserMessage SystemMessage]))
+            [toolkit.llm.cli :as llm]
+            [toolkit.pubsub :as pubsub]))
 
 (def base "https://hacker-news.firebaseio.com/v0")
 (def haiku "claude-haiku-4-5")
@@ -46,48 +42,29 @@
 
 ;; --- LLM ---------------------------------------------------------------------
 
-(defonce ^:private analyzer
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 512))
-             .build)))
-
 (def ^:private drift-schema
-  (-> (JsonObjectSchema/builder)
-      (.addIntegerProperty
-       "drift_score"
-       "0–10. 0 = the discussion is squarely about the submitted title. 10 = the discussion has nothing to do with the title and is debating something completely else.")
-      (.addStringProperty
-       "discussion_summary"
-       "ONE sentence describing what the comments are actually arguing about, regardless of the title.")
-      (.addStringProperty
-       "drift_target"
-       "If drift_score > 3, ONE phrase naming the topic the discussion drifted to. Otherwise the empty string.")
-      (.required ["drift_score" "discussion_summary" "drift_target"])
-      .build))
+  {:type "object"
+   :properties
+   {:drift_score        {:type "integer" :minimum 0 :maximum 10
+                          :description "0 = the discussion is squarely about the submitted title; 10 = the discussion has nothing to do with the title."}
+    :discussion_summary {:type "string"
+                          :description "ONE sentence describing what the comments are actually arguing about, regardless of the title."}
+    :drift_target       {:type "string"
+                          :description "If drift_score > 3, ONE phrase naming the topic the discussion drifted to. Otherwise the empty string."}}
+   :required ["drift_score" "discussion_summary" "drift_target"]})
 
-(def ^:private drift-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_drift")
-      (.description "Submit your assessment of how far the comments drifted from the title.")
-      (.parameters drift-schema)
-      .build))
+(def ^:private drift-system
+  "Compare the submitted title to the actual discussion in the top comments. Score how far the comments drifted from the title's subject.")
 
 (defn- score-drift! [title comments]
-  (let [user (str "TITLE:\n" title "\n\nTOP COMMENTS (one per blank line):\n\n"
-                  (str/join "\n\n" (map #(clip (str/trim %) 800) comments)))
-        req (-> (ChatRequest/builder)
-                (.messages
-                 [(SystemMessage/from
-                   "Compare the submitted title to the actual discussion in the top comments. Score how far the comments drifted from the title's subject. You MUST respond by calling submit_drift.")
-                  (UserMessage/from user)])
-                (.toolSpecifications [drift-tool])
-                .build)
-        tcs (-> @analyzer (.chat req) .aiMessage .toolExecutionRequests)]
-    (if (seq tcs)
-      (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword)
-      {:drift_score nil :discussion_summary nil :drift_target nil})))
+  (let [user-msg (str "TITLE:\n" title "\n\nTOP COMMENTS (one per blank line):\n\n"
+                      (str/join "\n\n" (map #(clip (str/trim %) 800) comments)))]
+    (or (llm/call-json! {:system drift-system
+                         :user   user-msg
+                         :schema drift-schema
+                         :model  haiku
+                         :keys   :snake})
+        {:drift_score nil :discussion_summary nil :drift_target nil})))
 
 ;; --- Steps ------------------------------------------------------------------
 

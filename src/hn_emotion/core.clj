@@ -21,14 +21,9 @@
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
+            [toolkit.llm.cli :as llm]
             [toolkit.pubsub :as pubsub])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
-           [dev.langchain4j.model.chat.request ChatRequest]
-           [dev.langchain4j.model.chat.request.json JsonObjectSchema JsonStringSchema
-            JsonNumberSchema JsonArraySchema JsonEnumSchema]
-           [dev.langchain4j.agent.tool ToolSpecification]
-           [dev.langchain4j.data.message UserMessage SystemMessage]
-           [java.time LocalDate Instant ZoneOffset]))
+  (:import [java.time LocalDate Instant ZoneOffset]))
 
 (def algolia-base "https://hn.algolia.com/api/v1/search_by_date")
 (def haiku "claude-haiku-4-5")
@@ -79,57 +74,35 @@
 
 ;; --- Haiku classifier -----------------------------------------------------
 
-(defonce ^:private model
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 256))
-             .build)))
-
 (def ^:private classify-schema
-  (-> (JsonObjectSchema/builder)
-      (.addProperty "emotions"
-                    (-> (JsonArraySchema/builder)
-                        (.items (-> (JsonEnumSchema/builder)
-                                    (.enumValues emotion-vocab)
-                                    .build))
-                        (.description "Up to 3 emotions from the fixed vocabulary.")
-                        .build))
-      (.addNumberProperty "valence"  "[-1, 1] overall emotional polarity.")
-      (.addNumberProperty "grounding" "[0, 1] claim-support density.")
-      (.addStringProperty "topic"    "2-5 words about the subject matter.")
-      (.required ["emotions" "valence" "grounding" "topic"])
-      .build))
-
-(def ^:private classify-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_classification")
-      (.description "Submit the comment classification.")
-      (.parameters classify-schema)
-      .build))
+  {:type "object"
+   :properties {:emotions   {:type "array"
+                             :items {:type "string" :enum emotion-vocab}
+                             :maxItems 3
+                             :description "Up to 3 emotions from the fixed vocabulary."}
+                :valence    {:type "number" :minimum -1 :maximum 1
+                             :description "[-1, 1] overall emotional polarity."}
+                :grounding  {:type "number" :minimum 0 :maximum 1
+                             :description "[0, 1] claim-support density."}
+                :topic      {:type "string"
+                             :description "2-5 words about the subject matter."}}
+   :required ["emotions" "valence" "grounding" "topic"]})
 
 (def ^:private classify-system
-  "You classify a single Hacker News comment along four axes — EMOTIONS (multi-label, up to 3, from a fixed vocabulary), VALENCE (-1 negative … +1 positive), GROUNDING (0 = pure opinion, 1 = nearly every claim has support), TOPIC (a short phrase, 2-5 words). The story title is provided as context only — classify the COMMENT, not the story. You MUST respond by calling the submit_classification tool.")
+  "You classify a single Hacker News comment along four axes — EMOTIONS (multi-label, up to 3, from a fixed vocabulary), VALENCE (-1 negative … +1 positive), GROUNDING (0 = pure opinion, 1 = nearly every claim has support), TOPIC (a short phrase, 2-5 words). The story title is provided as context only — classify the COMMENT, not the story.")
 
 (defn llm-classify!
   "Classify a comment. Returns
    {:emotions [...] :valence n :grounding n :topic s}.
    Stub-friendly: tests redef this var."
   [{:keys [text story-title]}]
-  (try
-    (let [user-msg (str (when story-title (str "Story title: " story-title "\n\n"))
-                        "Comment:\n" (or text ""))
-          req (-> (ChatRequest/builder)
-                  (.messages [(SystemMessage/from classify-system)
-                              (UserMessage/from user-msg)])
-                  (.toolSpecifications [classify-tool])
-                  .build)
-          tcs (-> @model (.chat req) .aiMessage .toolExecutionRequests)]
-      (if (seq tcs)
-        (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword)
-        {:emotions ["neutral"] :valence 0.0 :grounding 0.5 :topic ""}))
-    (catch Throwable _
-      {:emotions ["neutral"] :valence 0.0 :grounding 0.5 :topic ""})))
+  (let [user-msg (str (when story-title (str "Story title: " story-title "\n\n"))
+                      "Comment:\n" (or text ""))]
+    (or (llm/call-json! {:system classify-system
+                         :user   user-msg
+                         :schema classify-schema
+                         :model  haiku})
+        {:emotions ["neutral"] :valence 0.0 :grounding 0.5 :topic ""})))
 
 ;; --- Per-bucket summarization --------------------------------------------
 

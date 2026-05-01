@@ -27,12 +27,8 @@
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
-            [toolkit.pubsub :as pubsub])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
-           [dev.langchain4j.model.chat.request ChatRequest]
-           [dev.langchain4j.model.chat.request.json JsonObjectSchema JsonEnumSchema]
-           [dev.langchain4j.agent.tool ToolSpecification]
-           [dev.langchain4j.data.message UserMessage SystemMessage]))
+            [toolkit.llm.cli :as llm]
+            [toolkit.pubsub :as pubsub]))
 
 (def algolia-base "https://hn.algolia.com/api/v1/search_by_date")
 (def haiku  "claude-haiku-4-5")
@@ -74,136 +70,74 @@
         (vec (take max-comments all))
         (recur (inc page) all)))))
 
-;; --- LLM clients ---------------------------------------------------------
-
-(defonce ^:private tag-model
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 128))
-             .build)))
-
-(defonce ^:private score-model
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 96))
-             .build)))
-
-(defonce ^:private judge-model
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName sonnet)
-             (.maxTokens (int 512))
-             .build)))
-
 ;; --- Tag step (topic + stance + is-substantive) --------------------------
 
 (def ^:private tag-schema
-  (-> (JsonObjectSchema/builder)
-      (.addStringProperty "topic" "2-5 words, lowercase, canonical phrase.")
-      (.addStringProperty "stance_summary" "≤ 20 words, the user's claim/attitude.")
-      (.addBooleanProperty "is_substantive"
-                           "True if the comment makes a substantive claim about the topic.")
-      (.required ["topic" "stance_summary" "is_substantive"])
-      .build))
-
-(def ^:private tag-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_tag")
-      (.description "Submit topic, stance summary, and substantiveness.")
-      (.parameters tag-schema)
-      .build))
+  {:type "object"
+   :properties {:topic           {:type "string"
+                                   :description "2-5 words, lowercase, canonical phrase."}
+                :stance_summary  {:type "string"
+                                   :description "≤ 20 words, the user's claim/attitude."}
+                :is_substantive  {:type "boolean"
+                                   :description "True if the comment makes a substantive claim about the topic."}}
+   :required ["topic" "stance_summary" "is_substantive"]})
 
 (def ^:private tag-system
-  "Classify a Hacker News comment. Return TOPIC (2-5 words, lowercase, canonical), STANCE_SUMMARY (≤20 words, the author's claim or attitude on that topic), and IS_SUBSTANTIVE (true if the comment makes a substantive claim, false for jokes/one-liners). Use the story title as context only — classify the COMMENT. You MUST respond by calling submit_tag.")
-
-(defn- ->kw-map [m]
-  (reduce-kv (fn [a k v] (assoc a (keyword (str/replace (name k) #"_" "-")) v))
-             {} m))
+  "Classify a Hacker News comment. Return TOPIC (2-5 words, lowercase, canonical), STANCE_SUMMARY (≤20 words, the author's claim or attitude on that topic), and IS_SUBSTANTIVE (true if the comment makes a substantive claim, false for jokes/one-liners). Use the story title as context only — classify the COMMENT.")
 
 (defn llm-tag!
   "Tag a comment. Returns {:topic :stance-summary :is-substantive}.
    Stub-friendly."
   [{:keys [text story-title]}]
-  (try
-    (let [user-msg (str (when story-title (str "Story title: " story-title "\n\n"))
-                        "Comment:\n" (or text ""))
-          req (-> (ChatRequest/builder)
-                  (.messages [(SystemMessage/from tag-system)
-                              (UserMessage/from user-msg)])
-                  (.toolSpecifications [tag-tool])
-                  .build)
-          tcs (-> @tag-model (.chat req) .aiMessage .toolExecutionRequests)]
-      (if (seq tcs)
-        (->kw-map (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword))
-        {:topic "" :stance-summary "" :is-substantive false}))
-    (catch Throwable _
-      {:topic "" :stance-summary "" :is-substantive false})))
+  (let [user-msg (str (when story-title (str "Story title: " story-title "\n\n"))
+                      "Comment:\n" (or text ""))]
+    (or (llm/call-json! {:system tag-system
+                         :user   user-msg
+                         :schema tag-schema
+                         :model  haiku})
+        {:topic "" :stance-summary "" :is-substantive false})))
 
 ;; --- Pair score (cheap Haiku) --------------------------------------------
 
 (def ^:private score-schema
-  (-> (JsonObjectSchema/builder)
-      (.addIntegerProperty "opposed_score" "0-10, how strongly the two stances oppose.")
-      (.addStringProperty "note" "≤ 12 words, why.")
-      (.required ["opposed_score" "note"])
-      .build))
-
-(def ^:private score-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_pair_score")
-      (.description "Submit opposition score for the pair.")
-      (.parameters score-schema)
-      .build))
+  {:type "object"
+   :properties {:opposed_score {:type "integer" :minimum 0 :maximum 10
+                                 :description "How strongly the two stances oppose."}
+                :note          {:type "string" :description "≤ 12 words."}}
+   :required ["opposed_score" "note"]})
 
 (def ^:private score-system
-  "You judge whether two stance summaries by the same author on the same topic OPPOSE each other. Score 0 (fully aligned) to 10 (clearly opposite). Same-author + same-topic + different-time, but you only see the topic + two short stance summaries. You MUST respond by calling submit_pair_score.")
+  "You judge whether two stance summaries by the same author on the same topic OPPOSE each other. Score 0 (fully aligned) to 10 (clearly opposite). Same-author + same-topic + different-time, but you only see the topic + two short stance summaries.")
 
 (defn llm-pair-score!
   "Cheap pair scorer. Returns {:opposed-score n :note s}. Stub-friendly."
   [{:keys [topic a b]}]
-  (try
-    (let [user-msg (str "TOPIC: " topic
-                        "\n\nA stance: " (:stance-summary a)
-                        "\n\nB stance: " (:stance-summary b))
-          req (-> (ChatRequest/builder)
-                  (.messages [(SystemMessage/from score-system)
-                              (UserMessage/from user-msg)])
-                  (.toolSpecifications [score-tool])
-                  .build)
-          tcs (-> @score-model (.chat req) .aiMessage .toolExecutionRequests)]
-      (if (seq tcs)
-        (->kw-map (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword))
-        {:opposed-score 0 :note ""}))
-    (catch Throwable _ {:opposed-score 0 :note ""})))
+  (let [user-msg (str "TOPIC: " topic
+                      "\n\nA stance: " (:stance-summary a)
+                      "\n\nB stance: " (:stance-summary b))]
+    (or (llm/call-json! {:system score-system
+                         :user   user-msg
+                         :schema score-schema
+                         :model  haiku})
+        {:opposed-score 0 :note ""})))
 
 ;; --- Pair judge (Sonnet) -------------------------------------------------
 
 (def ^:private judge-schema
-  (-> (JsonObjectSchema/builder)
-      (.addProperty "verdict"
-                    (-> (JsonEnumSchema/builder)
-                        (.enumValues ["real-contradiction" "scope-shift"
-                                      "world-changed" "genuine-update"
-                                      "not-actually-opposed"])
-                        .build))
-      (.addNumberProperty "confidence" "[0,1].")
-      (.addStringProperty "summary_a" "≤ 25 words.")
-      (.addStringProperty "summary_b" "≤ 25 words.")
-      (.addStringProperty "reconciliation" "≤ 50 words: what would explain both.")
-      (.required ["verdict" "confidence" "summary_a" "summary_b" "reconciliation"])
-      .build))
-
-(def ^:private judge-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_judgment")
-      (.description "Submit your verdict on the pair.")
-      (.parameters judge-schema)
-      .build))
+  {:type "object"
+   :properties {:verdict        {:type "string"
+                                 :enum ["real-contradiction" "scope-shift"
+                                        "world-changed" "genuine-update"
+                                        "not-actually-opposed"]}
+                :confidence     {:type "number" :minimum 0 :maximum 1}
+                :summary_a      {:type "string" :description "≤ 25 words."}
+                :summary_b      {:type "string" :description "≤ 25 words."}
+                :reconciliation {:type "string"
+                                 :description "≤ 50 words: what would explain both."}}
+   :required ["verdict" "confidence" "summary_a" "summary_b" "reconciliation"]})
 
 (def ^:private judge-system
-  "Two comments by the same author at different times on the same topic. Decide whether they actually contradict. Be specific: real-contradiction (clear stance flip), genuine-update (the author updated their view in good faith), world-changed (the underlying facts changed — policy reversed, technology improved), scope-shift (the apparent contradiction is actually about different sub-cases), or not-actually-opposed (false positive). You MUST respond by calling submit_judgment.")
+  "Two comments by the same author at different times on the same topic. Decide whether they actually contradict. Be specific: real-contradiction (clear stance flip), genuine-update (the author updated their view in good faith), world-changed (the underlying facts changed — policy reversed, technology improved), scope-shift (the apparent contradiction is actually about different sub-cases), or not-actually-opposed (false positive).")
 
 (defn- clip [s n]
   (if (and s (> (count s) n)) (str (subs s 0 n) "…") s))
@@ -211,25 +145,17 @@
 (defn llm-pair-judge!
   "Sonnet pair judge. Returns judgment map. Stub-friendly."
   [{:keys [topic a b]}]
-  (try
-    (let [user-msg (str "TOPIC: " topic
-                        "\n\nA (" (or (:created_at a) "earlier") "):\n"
-                        (clip (:text a) 600)
-                        "\n\nB (" (or (:created_at b) "later") "):\n"
-                        (clip (:text b) 600))
-          req (-> (ChatRequest/builder)
-                  (.messages [(SystemMessage/from judge-system)
-                              (UserMessage/from user-msg)])
-                  (.toolSpecifications [judge-tool])
-                  .build)
-          tcs (-> @judge-model (.chat req) .aiMessage .toolExecutionRequests)]
-      (if (seq tcs)
-        (->kw-map (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword))
+  (let [user-msg (str "TOPIC: " topic
+                      "\n\nA (" (or (:created_at a) "earlier") "):\n"
+                      (clip (:text a) 600)
+                      "\n\nB (" (or (:created_at b) "later") "):\n"
+                      (clip (:text b) 600))]
+    (or (llm/call-json! {:system judge-system
+                         :user   user-msg
+                         :schema judge-schema
+                         :model  sonnet})
         {:verdict "not-actually-opposed" :confidence 0.0
-         :summary-a "" :summary-b "" :reconciliation ""}))
-    (catch Throwable _
-      {:verdict "not-actually-opposed" :confidence 0.0
-       :summary-a "" :summary-b "" :reconciliation ""})))
+         :summary-a "" :summary-b "" :reconciliation ""})))
 
 ;; --- Pure helpers ---------------------------------------------------------
 

@@ -25,12 +25,8 @@
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
-            [toolkit.pubsub :as pubsub])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
-           [dev.langchain4j.model.chat.request ChatRequest]
-           [dev.langchain4j.model.chat.request.json JsonObjectSchema]
-           [dev.langchain4j.agent.tool ToolSpecification]
-           [dev.langchain4j.data.message UserMessage SystemMessage]))
+            [toolkit.llm.cli :as llm]
+            [toolkit.pubsub :as pubsub]))
 
 (def algolia-base "https://hn.algolia.com/api/v1/search_by_date")
 (def fb-base      "https://hacker-news.firebaseio.com/v0")
@@ -83,49 +79,29 @@
 
 ;; --- Haiku edge classifier ------------------------------------------------
 
-(defonce ^:private classifier
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 64))
-             .build)))
-
 (def ^:private edge-schema
-  (-> (JsonObjectSchema/builder)
-      (.addStringProperty
-       "edge_type"
-       (str "EXACTLY one of: agree, disagree, correct, extend, tangent, attack, clarify. "
-            "Pick the dominant relationship the reply has to the parent."))
-      (.required ["edge_type"])
-      .build))
+  {:type "object"
+   :properties {:edge_type {:type "string"
+                            :enum edge-types
+                            :description "Pick the dominant relationship the reply has to the parent."}}
+   :required ["edge_type"]})
 
-(def ^:private edge-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_edge_type")
-      (.description "Submit your classification of the reply.")
-      (.parameters edge-schema)
-      .build))
+(def ^:private edge-system
+  "Classify the reply's relationship to the parent comment. Pick exactly one of: agree, disagree, correct, extend, tangent, attack, clarify.")
 
 (defn llm-classify-edge!
   "Classify one parent→reply edge. Returns one of the edge-type
    strings, or nil. Stub-friendly."
   [{:keys [parent-text kid-text]}]
-  (try
-    (let [req (-> (ChatRequest/builder)
-                  (.messages
-                   [(SystemMessage/from
-                     "Classify the reply's relationship to the parent comment. You MUST respond by calling submit_edge_type with one of the seven labels.")
-                    (UserMessage/from
-                     (str "PARENT:\n" (str/trim (or parent-text ""))
-                          "\n\nREPLY:\n" (str/trim (or kid-text ""))))])
-                  (.toolSpecifications [edge-tool])
-                  .build)
-          tcs (-> @classifier (.chat req) .aiMessage .toolExecutionRequests)]
-      (when (seq tcs)
-        (let [t (-> (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword)
-                    :edge_type str/lower-case str/trim)]
-          (when ((set edge-types) t) t))))
-    (catch Throwable _ nil)))
+  (let [user-msg (str "PARENT:\n" (str/trim (or parent-text ""))
+                      "\n\nREPLY:\n" (str/trim (or kid-text "")))
+        r (llm/call-json! {:system edge-system
+                           :user   user-msg
+                           :schema edge-schema
+                           :model  haiku})]
+    (when r
+      (let [t (some-> r :edge-type str/lower-case str/trim)]
+        (when ((set edge-types) t) t)))))
 
 ;; --- Per-user summary -----------------------------------------------------
 

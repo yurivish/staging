@@ -19,13 +19,9 @@
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
             [toolkit.hn.tree-fetch :as tree-fetch]
+            [toolkit.llm.cli :as llm]
             [toolkit.pubsub :as pubsub])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
-           [dev.langchain4j.model.chat.request ChatRequest]
-           [dev.langchain4j.model.chat.request.json JsonObjectSchema]
-           [dev.langchain4j.agent.tool ToolSpecification]
-           [dev.langchain4j.data.message UserMessage SystemMessage]
-           [java.util.concurrent Executors ExecutorService]))
+  (:import [java.util.concurrent Executors ExecutorService]))
 
 (def base "https://hacker-news.firebaseio.com/v0")
 (def haiku "claude-haiku-4-5")
@@ -44,42 +40,24 @@
 
 ;; --- LLM client -------------------------------------------------------------
 
-(defonce ^:private scorer
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 128))
-             .build)))
-
 (def ^:private score-schema
-  (-> (JsonObjectSchema/builder)
-      (.addIntegerProperty "density"
-                           "Information density 0–10. How many specific facts, numbers, named entities, technical claims, or links the comment contains. Independent of emotion.")
-      (.addIntegerProperty "emotion"
-                           "Emotional intensity 0–10. How charged, opinionated, or affective the language is. Independent of density.")
-      (.required ["density" "emotion"])
-      .build))
-
-(def ^:private score-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_scores")
-      (.description "Submit information density and emotional intensity for the comment.")
-      (.parameters score-schema)
-      .build))
+  {:type "object"
+   :properties {:density {:type "integer" :minimum 0 :maximum 10
+                          :description "Information density 0–10. How many specific facts, numbers, named entities, technical claims, or links the comment contains. Independent of emotion."}
+                :emotion {:type "integer" :minimum 0 :maximum 10
+                          :description "Emotional intensity 0–10. How charged, opinionated, or affective the language is. Independent of density."}}
+   :required ["density" "emotion"]})
 
 (def ^:private score-system
-  "Score the HN comment on two independent 0–10 axes — INFO_DENSITY (specific facts, numbers, named entities, technical claims, links) and EMOTIONAL_INTENSITY (how charged or affective the language is). They are independent: a comment can score high on both, low on both, or any mix. You MUST respond by calling the submit_scores tool.")
+  "Score the HN comment on two independent 0–10 axes — INFO_DENSITY (specific facts, numbers, named entities, technical claims, links) and EMOTIONAL_INTENSITY (how charged or affective the language is). They are independent: a comment can score high on both, low on both, or any mix.")
 
 (defn- score-comment! [text]
-  (let [req (-> (ChatRequest/builder)
-                (.messages [(SystemMessage/from score-system)
-                            (UserMessage/from (or text ""))])
-                (.toolSpecifications [score-tool])
-                .build)
-        tcs (-> @scorer (.chat req) .aiMessage .toolExecutionRequests)]
-    (if (seq tcs)
-      (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword)
-      {:density nil :emotion nil})))
+  (or (llm/call-json! {:system score-system
+                       :user   (or text "")
+                       :schema score-schema
+                       :model  haiku
+                       :keys   :snake})
+      {:density nil :emotion nil}))
 
 ;; --- Steps: ingestion ------------------------------------------------------
 

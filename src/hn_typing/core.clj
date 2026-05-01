@@ -18,12 +18,8 @@
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
             [toolkit.hn.tree-fetch :as tree-fetch]
-            [toolkit.pubsub :as pubsub])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
-           [dev.langchain4j.model.chat.request ChatRequest]
-           [dev.langchain4j.model.chat.request.json JsonObjectSchema]
-           [dev.langchain4j.agent.tool ToolSpecification]
-           [dev.langchain4j.data.message UserMessage SystemMessage]))
+            [toolkit.llm.cli :as llm]
+            [toolkit.pubsub :as pubsub]))
 
 (def base "https://hacker-news.firebaseio.com/v0")
 (def haiku "claude-haiku-4-5")
@@ -53,52 +49,34 @@
 
 ;; --- LLM classifier ---------------------------------------------------------
 
-(defonce ^:private classifier
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 64))
-             .build)))
-
 (def ^:private edge-schema
-  (-> (JsonObjectSchema/builder)
-      (.addStringProperty
-       "edge_type"
-       (str "EXACTLY one of: agree, disagree, correct, extend, tangent, attack, clarify. "
-            "Pick the dominant relationship the reply has to the parent. "
-            "agree: confirms or amplifies the parent's view. "
-            "disagree: argues against the parent's view. "
-            "correct: points out a factual error in the parent. "
-            "extend: builds on the parent with additional info or examples. "
-            "tangent: changes the topic. "
-            "attack: ad hominem or hostile rather than substantive. "
-            "clarify: asks the parent to clarify or restates the parent."))
-      (.required ["edge_type"])
-      .build))
+  {:type "object"
+   :properties {:edge_type {:type "string"
+                            :enum edge-types
+                            :description (str "Pick the dominant relationship the reply has to the parent. "
+                                              "agree: confirms or amplifies the parent's view. "
+                                              "disagree: argues against the parent's view. "
+                                              "correct: points out a factual error. "
+                                              "extend: builds on the parent with more info. "
+                                              "tangent: changes the topic. "
+                                              "attack: ad hominem or hostile. "
+                                              "clarify: asks for or offers clarification.")}}
+   :required ["edge_type"]})
 
-(def ^:private edge-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_edge_type")
-      (.description "Submit your classification of the reply.")
-      (.parameters edge-schema)
-      .build))
+(def ^:private edge-system
+  "Classify the reply's relationship to the parent comment. Pick exactly one of: agree, disagree, correct, extend, tangent, attack, clarify.")
 
 (defn- classify-edge! [{:keys [parent-text kid-text]}]
-  (let [req (-> (ChatRequest/builder)
-                (.messages
-                 [(SystemMessage/from
-                   "Classify the reply's relationship to the parent comment. You MUST respond by calling submit_edge_type with one of the seven labels.")
-                  (UserMessage/from
-                   (str "PARENT:\n" (str/trim parent-text)
-                        "\n\nREPLY:\n" (str/trim kid-text)))])
-                (.toolSpecifications [edge-tool])
-                .build)
-        tcs (-> @classifier (.chat req) .aiMessage .toolExecutionRequests)]
-    (if (seq tcs)
-      (let [t (-> (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword)
-                  :edge_type str/lower-case str/trim)]
-        (when ((set edge-types) t) t))
-      nil)))
+  (let [user-msg (str "PARENT:\n" (str/trim parent-text)
+                      "\n\nREPLY:\n" (str/trim kid-text))
+        r (llm/call-json! {:system edge-system
+                           :user   user-msg
+                           :schema edge-schema
+                           :model  haiku
+                           :keys   :snake})]
+    (when r
+      (let [t (some-> r :edge_type str/lower-case str/trim)]
+        (when ((set edge-types) t) t)))))
 
 ;; --- Steps ------------------------------------------------------------------
 

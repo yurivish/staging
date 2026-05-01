@@ -25,14 +25,9 @@
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
+            [toolkit.llm.cli :as llm]
             [toolkit.pubsub :as pubsub])
-  (:import [dev.langchain4j.model.anthropic AnthropicChatModel]
-           [dev.langchain4j.model.chat.request ChatRequest]
-           [dev.langchain4j.model.chat.request.json JsonObjectSchema JsonStringSchema
-            JsonBooleanSchema JsonNumberSchema JsonEnumSchema]
-           [dev.langchain4j.agent.tool ToolSpecification]
-           [dev.langchain4j.data.message UserMessage SystemMessage]
-           [java.time LocalDate ZoneOffset]))
+  (:import [java.time LocalDate ZoneOffset]))
 
 (def algolia-base "https://hn.algolia.com/api/v1/search_by_date")
 (def fb-base      "https://hacker-news.firebaseio.com/v0")
@@ -156,114 +151,65 @@
 
 ;; --- LLM clients -----------------------------------------------------------
 
-(defonce ^:private filter-model
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName haiku)
-             (.maxTokens (int 256))
-             .build)))
-
-(defonce ^:private judge-model
-  (delay (-> (AnthropicChatModel/builder)
-             (.apiKey (str/trim (slurp "claude.key")))
-             (.modelName sonnet)
-             (.maxTokens (int 512))
-             .build)))
-
 (def ^:private filter-schema
-  (-> (JsonObjectSchema/builder)
-      (.addBooleanProperty "is_mind_change"
-                           "True only if the candidate clearly concedes a substantive point in response to the parent.")
-      (.addNumberProperty "confidence" "0..1 confidence.")
-      (.addBooleanProperty "is_sarcasm" "True if the apparent concession is sarcastic / rhetorical.")
-      (.required ["is_mind_change" "confidence" "is_sarcasm"])
-      .build))
-
-(def ^:private filter-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_filter_decision")
-      (.description "Submit the filter decision.")
-      (.parameters filter-schema)
-      .build))
+  {:type "object"
+   :properties {:is_mind_change {:type "boolean"
+                                  :description "True only if the candidate clearly concedes a substantive point in response to the parent."}
+                :confidence     {:type "number" :minimum 0 :maximum 1}
+                :is_sarcasm     {:type "boolean"
+                                  :description "True if the apparent concession is sarcastic or rhetorical."}}
+   :required ["is_mind_change" "confidence" "is_sarcasm"]})
 
 (def ^:private filter-system
-  "Decide whether the candidate comment is a real intellectual concession in response to its parent — i.e. the author publicly updates a substantive position. Mark sarcasm and politeness filler as not-a-mind-change. Use the parent text for context. You MUST respond by calling the submit_filter_decision tool.")
+  "Decide whether the candidate comment is a real intellectual concession in response to its parent — i.e. the author publicly updates a substantive position. Mark sarcasm and politeness filler as not-a-mind-change. Use the parent text for context.")
 
 (def ^:private judge-schema
-  (-> (JsonObjectSchema/builder)
-      (.addProperty "direction"
-                    (-> (JsonEnumSchema/builder)
-                        (.enumValues ["full-reversal" "partial-concession"
-                                      "scope-narrowing" "unclear"])
-                        .build))
-      (.addStringProperty "what_was_conceded" "≤ 25 words.")
-      (.addProperty "trigger_type"
-                    (-> (JsonEnumSchema/builder)
-                        (.enumValues ["data-or-citation" "lived-experience"
-                                      "reframing" "edge-case" "authority"
-                                      "clarifying-question" "emotional-appeal"
-                                      "scope-narrowing" "unclear"])
-                        .build))
-      (.addStringProperty "trigger_excerpt" "≤ 40 words from the parent.")
-      (.addStringProperty "original_position" "≤ 25 words.")
-      (.required ["direction" "what_was_conceded" "trigger_type"
-                  "trigger_excerpt" "original_position"])
-      .build))
-
-(def ^:private judge-tool
-  (-> (ToolSpecification/builder)
-      (.name "submit_judgment")
-      (.description "Submit the mind-change judgment.")
-      (.parameters judge-schema)
-      .build))
+  {:type "object"
+   :properties {:direction         {:type "string"
+                                    :enum ["full-reversal" "partial-concession"
+                                           "scope-narrowing" "unclear"]}
+                :what_was_conceded {:type "string"
+                                    :description "≤ 25 words."}
+                :trigger_type      {:type "string"
+                                    :enum ["data-or-citation" "lived-experience"
+                                           "reframing" "edge-case" "authority"
+                                           "clarifying-question" "emotional-appeal"
+                                           "scope-narrowing" "unclear"]}
+                :trigger_excerpt   {:type "string"
+                                    :description "≤ 40 words from the parent."}
+                :original_position {:type "string"
+                                    :description "≤ 25 words."}}
+   :required ["direction" "what_was_conceded" "trigger_type"
+              "trigger_excerpt" "original_position"]})
 
 (def ^:private judge-system
-  "You are analyzing a 3-message HN exchange (grandparent → parent → candidate). The candidate concedes a point made in the parent. Identify (a) what was conceded, (b) the kind of argumentative move in the parent that triggered the concession (data, lived-experience, reframing, edge-case, authority, etc.), and (c) the original position. You MUST respond by calling the submit_judgment tool.")
+  "You are analyzing a 3-message HN exchange (grandparent → parent → candidate). The candidate concedes a point made in the parent. Identify (a) what was conceded, (b) the kind of argumentative move in the parent that triggered the concession (data, lived-experience, reframing, edge-case, authority, etc.), and (c) the original position.")
 
 (defn- format-context [{:keys [grandparent-text parent-text candidate-text]}]
   (str "GRANDPARENT:\n" (or grandparent-text "(none)")
        "\n\nPARENT:\n" (or parent-text "(none)")
        "\n\nCANDIDATE:\n" (or candidate-text "(none)")))
 
-(defn- ->kw-map [m]
-  (reduce-kv (fn [a k v] (assoc a (keyword (str/replace (name k) #"_" "-")) v))
-             {} m))
-
 (defn llm-filter!
   "Haiku filter call. Returns
    {:is-mind-change boolean :confidence number :is-sarcasm boolean}.
    Stub-friendly: tests redef this var."
   [row]
-  (try
-    (let [req (-> (ChatRequest/builder)
-                  (.messages [(SystemMessage/from filter-system)
-                              (UserMessage/from (format-context row))])
-                  (.toolSpecifications [filter-tool])
-                  .build)
-          tcs (-> @filter-model (.chat req) .aiMessage .toolExecutionRequests)]
-      (if (seq tcs)
-        (->kw-map (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword))
-        {:is-mind-change false :confidence 0.0 :is-sarcasm false}))
-    (catch Throwable _
-      {:is-mind-change false :confidence 0.0 :is-sarcasm false})))
+  (or (llm/call-json! {:system filter-system
+                       :user   (format-context row)
+                       :schema filter-schema
+                       :model  haiku})
+      {:is-mind-change false :confidence 0.0 :is-sarcasm false}))
 
 (defn llm-judge!
   "Sonnet judge call. Returns judgment map. Stub-friendly."
   [row]
-  (try
-    (let [req (-> (ChatRequest/builder)
-                  (.messages [(SystemMessage/from judge-system)
-                              (UserMessage/from (format-context row))])
-                  (.toolSpecifications [judge-tool])
-                  .build)
-          tcs (-> @judge-model (.chat req) .aiMessage .toolExecutionRequests)]
-      (if (seq tcs)
-        (->kw-map (json/read-str (.arguments ^Object (first tcs)) :key-fn keyword))
-        {:direction "unclear" :what-was-conceded "" :trigger-type "unclear"
-         :trigger-excerpt "" :original-position ""}))
-    (catch Throwable _
+  (or (llm/call-json! {:system judge-system
+                       :user   (format-context row)
+                       :schema judge-schema
+                       :model  sonnet})
       {:direction "unclear" :what-was-conceded "" :trigger-type "unclear"
-       :trigger-excerpt "" :original-position ""})))
+       :trigger-excerpt "" :original-position ""}))
 
 ;; --- Steps -----------------------------------------------------------------
 
