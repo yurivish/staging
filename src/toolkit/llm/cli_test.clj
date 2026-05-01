@@ -11,7 +11,8 @@
    :err  ""
    :out  (json/write-str
            {:type "result" :subtype "success" :is_error false
-            :result (json/write-str m)})})
+            :result "Done!"
+            :structured_output m})})
 
 (defn- wrap-failure []
   {:exit 0 :err ""
@@ -67,7 +68,7 @@
       (is (= "tangent" (:drift_target r))))))
 
 (deftest result-can-be-prefixed-with-prose
-  (testing "if the model wraps JSON in prose, we still extract the JSON object"
+  (testing "fallback path — no structured_output, but JSON in result prose"
     (with-redefs [cli/*invoke-claude*
                   (fn [_ _]
                     {:exit 0 :err ""
@@ -80,6 +81,20 @@
                                :schema {:type "object"}
                                :model "claude-haiku-4-5"})]
         (is (= 42 (:answer r)))))))
+
+(deftest structured-output-wins-over-result-prose
+  (testing "with both fields set, structured_output is preferred"
+    (with-redefs [cli/*invoke-claude*
+                  (fn [_ _]
+                    {:exit 0 :err ""
+                     :out (json/write-str
+                            {:type "result" :is_error false
+                             :result "Done!"
+                             :structured_output {:answer 7}})})]
+      (let [r (cli/call-json! {:system "" :user ""
+                               :schema {:type "object"}
+                               :model "claude-haiku-4-5"})]
+        (is (= 7 (:answer r)))))))
 
 ;; --- error paths ----------------------------------------------------------
 

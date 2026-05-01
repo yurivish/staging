@@ -11,9 +11,13 @@
        <user-message via stdin>
 
    `--output-format json` wraps the response in
-   `{:type \"result\" :is_error false :result \"<inner-json-string>\"}`.
-   `--json-schema` constrains `result` to match the given schema. We
-   parse the wrapper, then JSON-parse the inner `result`.
+   `{:type \"result\" :is_error false :result \"<text>\" ...}`.
+   When `--json-schema` is also given, the validated structured output
+   lands in the wrapper's `structured_output` field as a parsed object;
+   `result` is just the model's free-form prose (often \"Done!\").
+   We pull `structured_output` first; we also fall back to scanning
+   `result` for an embedded JSON object so a stray prose-only response
+   still works.
 
    The process invocation is behind `*invoke-claude*` so tests can
    redef it without spawning real subprocesses."
@@ -47,12 +51,17 @@
                  (catch Throwable _ nil)))))))
 
 (defn- parse-result
-  "Take `{:exit :out :err}`, return the inner-result map or nil."
+  "Take `{:exit :out :err}`, return the inner-result map or nil.
+   Prefers the wrapper's `structured_output` field (set when
+   `--json-schema` is honored) over scanning `result` prose."
   [{:keys [exit out]}]
   (when (zero? exit)
     (let [wrap (extract-json-object out)]
       (when (and wrap (not (:is_error wrap)))
-        (extract-json-object (:result wrap))))))
+        (or (let [so (:structured_output wrap)]
+              (cond (map? so)    so
+                    (string? so) (extract-json-object so)))
+            (extract-json-object (:result wrap)))))))
 
 (defn call-json!
   "Run `claude -p` with a system prompt, user message, and JSON schema.
