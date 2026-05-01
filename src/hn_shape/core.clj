@@ -2,8 +2,10 @@
   "HN top stories → full reply tree → per-story shape and timing metrics.
    No LLM. Pure I/O + tree math.
 
-   Demonstrates Datapotamus stealing-workers (story-tree fetch cost varies
-   100x), trace/emit progress events, and named-subflow scoping.
+   Demonstrates Datapotamus c/recursive-pool driving a recursive HN
+   tree fetch via the inner step's :work output port. Each node fetch
+   is a real per-step trace event, so the visualizer sees per-node
+   fan-out and per-node failures.
 
    One-shot:
      clojure -M -e \"(require 'hn-shape.core) (hn-shape.core/run-once! \\\"shape.json\\\" {:trace? true})\""
@@ -13,35 +15,28 @@
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
-            [toolkit.datapotamus.trace :as trace]
-            [toolkit.pubsub :as pubsub])
-  (:import [java.util.concurrent Executors ExecutorService]))
+            [toolkit.pubsub :as pubsub]))
 
 (def base "https://hacker-news.firebaseio.com/v0")
-
-(defonce ^:private vt-exec
-  (delay (Executors/newVirtualThreadPerTaskExecutor)))
 
 (defn- get-json [url]
   (-> @(http/get url) :body (json/read-str :key-fn keyword)))
 
-(defn- fetch-tree
-  "Fetch HN item `id` and recursively all kids in parallel via virtual
-   threads. Each node returned with its `:kid-trees` populated. `counter`
-   is bumped per fetched node, surfacing live progress to the caller.
-   `emit-node!` is invoked per node with [id n-kids fetch-ms] so the
-   caller can publish per-node status events into the scoped pubsub."
-  [emit-node! counter id]
-  (let [t0   (System/nanoTime)
-        item (get-json (str base "/item/" id ".json"))
-        ms   (long (/ (- (System/nanoTime) t0) 1e6))
-        _    (swap! counter inc)
-        kids (or (:kids item) [])
-        _    (emit-node! id (count kids) ms)
-        futs (mapv #(.submit ^ExecutorService @vt-exec
-                             ^Callable (fn [] (fetch-tree emit-node! counter %)))
-                   kids)]
-    (assoc item :kid-trees (mapv #(.get %) futs))))
+;; --- Tree reassembly --------------------------------------------------------
+
+(defn- reassemble-tree
+  "Given a flat collection of HN node maps (each with :id and :kids
+   from upstream) keyed by id, walk from `root-id` down through :kids
+   and return a nested map with `:kid-trees` populated. Nodes missing
+   from the map (e.g., a fetch failure) become an absent slot —
+   reassemble-tree returns nil for that branch, which the caller then
+   filters out at the parent level."
+  [root-id nodes]
+  (let [by-id (into {} (map (juxt :id identity)) nodes)]
+    ((fn rec [id]
+       (when-let [n (by-id id)]
+         (assoc n :kid-trees (vec (keep rec (or (:kids n) []))))))
+     root-id)))
 
 ;; --- Shape metrics ----------------------------------------------------------
 
@@ -97,30 +92,52 @@
              (fn [_tick]
                (vec (take n (get-json (str base "/topstories.json")))))))
 
+;; Per-story split: each top-id becomes a `{:root id :id id}` entry —
+;; the seed for that story's recursive fetch. The :root tag stays with
+;; every recursively-emitted child so the aggregator can group nodes
+;; by their originating story.
 (def split-ids
   (step/step :split-ids nil
-             (fn [ctx _s ids] {:out (msg/children ctx ids)})))
+             (fn [ctx _s ids]
+               {:out (msg/children ctx (mapv (fn [id] {:root id :id id}) ids))})))
 
-(def fetch-tree-step
-  (step/step :fetch-tree nil
-             (fn [ctx _s story-id]
-               (trace/emit ctx {:event :fetch-start :story-id story-id})
-               (let [t0         (System/nanoTime)
-                     counter    (atom 0)
-                     emit-node! (fn [id n-kids ms]
-                                  (trace/emit ctx
-                                              {:event    :fetch-node
-                                               :story-id story-id
-                                               :id       id
-                                               :n-kids   n-kids
-                                               :ms       ms}))
-                     tree       (fetch-tree emit-node! counter story-id)
-                     ms         (long (/ (- (System/nanoTime) t0) 1e6))]
-                 (trace/emit ctx {:event :fetch-done
-                                  :story-id story-id
-                                  :n-nodes  @counter
-                                  :ms       ms})
-                 {:out [tree]}))))
+;; The recursive worker. Receives `{:root story-id :id node-id}`,
+;; fetches the HN item, emits one node-data envelope on :out and one
+;; recursive request per kid on :work. c/recursive-pool routes :work
+;; back into its own queue for any free worker to pick up.
+(def fetch-node
+  (step/handler-map
+   {:ports {:ins {:in ""} :outs {:out "" :work ""}}
+    :on-data
+    (fn [ctx _s {:keys [root id]}]
+      (let [item (get-json (str base "/item/" id ".json"))
+            kids (or (:kids item) [])]
+        {:out  [(msg/child ctx {:root root :node item})]
+         :work (mapv (fn [kid-id]
+                       (msg/child ctx {:root root :id kid-id}))
+                     kids)}))}))
+
+;; Buffer-until-close aggregator. Stash every node by its :root in
+;; state; on `:on-all-closed`, reconstruct each root's tree from the
+;; flat node set and emit one merged envelope per root.
+(def aggregate-trees
+  {:procs
+   {:aggregate-trees
+    (step/handler-map
+     {:ports         {:ins {:in ""} :outs {:out ""}}
+      :on-init       (fn [] {})
+      :on-data       (fn [ctx s {:keys [root node]}]
+                       [(update s root (fnil conj [])
+                                {:msg (:msg ctx) :node node})
+                        msg/drain])
+      :on-all-closed (fn [ctx s]
+                       {:out (vec (for [[root entries] s
+                                        :let [parents (mapv :msg entries)
+                                              nodes   (mapv :node entries)
+                                              tree    (reassemble-tree root nodes)]
+                                        :when tree]
+                                    (msg/merge ctx parents tree)))})})}
+   :conns [] :in :aggregate-trees :out :aggregate-trees})
 
 (def compute-metrics (step/step :compute-metrics shape-row))
 
@@ -131,7 +148,8 @@
    (step/serial :hn-shape
                 (mk-fetch-top-ids n-stories)
                 split-ids
-                (c/stealing-workers :tree-fetchers tree-workers fetch-tree-step)
+                (c/recursive-pool :tree-fetchers tree-workers fetch-node)
+                aggregate-trees
                 compute-metrics)))
 
 ;; --- Trace pretty-printer ---------------------------------------------------
@@ -147,9 +165,6 @@
                      (str (:step-id ev) (when-let [p (:port ev)] (str " → " p)))
                      (cond-> ""
                        (:event ev)            (str "event="   (name (:event ev)) " ")
-                       (:story-id ev)         (str "story="   (:story-id ev) " ")
-                       (:n-nodes ev)          (str "n-nodes=" (:n-nodes ev) " ")
-                       (:ms ev)               (str "ms="      (:ms ev) " ")
                        (contains? ev :data)   (str "data="    (preview (:data ev)) " ")
                        (contains? ev :tokens) (str "tokens="  (preview (:tokens ev))))))))
 

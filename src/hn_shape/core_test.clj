@@ -53,6 +53,30 @@
   (testing "p100 picks the last element (clamped)"
     (is (= 10 (#'core/percentile (range 1 11) 1.0)))))
 
+(deftest reassemble-tree-builds-nested-structure
+  (testing "linear chain of 3 nodes"
+    (let [nodes [{:id 1 :kids [2]} {:id 2 :kids [3]} {:id 3 :kids []}]
+          tree  (#'core/reassemble-tree 1 nodes)]
+      (is (= 1 (:id tree)))
+      (is (= 2 (-> tree :kid-trees first :id)))
+      (is (= 3 (-> tree :kid-trees first :kid-trees first :id)))
+      (is (= [] (-> tree :kid-trees first :kid-trees first :kid-trees)))))
+  (testing "branching tree"
+    (let [nodes [{:id 1 :kids [2 3]}
+                 {:id 2 :kids [4]}
+                 {:id 3 :kids []}
+                 {:id 4 :kids []}]
+          tree  (#'core/reassemble-tree 1 nodes)]
+      (is (= 2 (count (:kid-trees tree))))
+      (is (= [2 3] (mapv :id (:kid-trees tree))))
+      (is (= 4 (-> tree :kid-trees first :kid-trees first :id)))))
+  (testing "missing kid is silently dropped (e.g., a fetch failure)"
+    (let [nodes [{:id 1 :kids [2 3]}
+                 {:id 2 :kids []}]   ; 3 is referenced but missing
+          tree  (#'core/reassemble-tree 1 nodes)]
+      (is (= 1 (count (:kid-trees tree))))
+      (is (= 2 (-> tree :kid-trees first :id))))))
+
 (deftest shape-row-over-fixture
   (let [r (#'core/shape-row fixture-tree)]
     (is (= 1 (:story_id r)))
@@ -94,22 +118,6 @@
     (or (get m url)
         (throw (ex-info (str "test fixture missing url: " url) {:url url})))))
 
-(deftest fetch-tree-counts-all-nodes
-  (let [m {"https://hacker-news.firebaseio.com/v0/item/1.json"
-           {:id 1 :kids [2]}
-           "https://hacker-news.firebaseio.com/v0/item/2.json"
-           {:id 2 :kids [3]}
-           "https://hacker-news.firebaseio.com/v0/item/3.json"
-           {:id 3 :kids []}}]
-    (with-redefs [core/get-json (fixture-lookup m)]
-      (let [counter    (atom 0)
-            emit-node! (fn [_id _n-kids _ms] nil)
-            tree       (#'core/fetch-tree emit-node! counter 1)]
-        (is (= 3 @counter))
-        (is (= 1 (:id tree)))
-        (is (= 2 (-> tree :kid-trees first :id)))
-        (is (= 3 (-> tree :kid-trees first :kid-trees first :id)))))))
-
 (deftest end-to-end-with-stubs
   (let [m {"https://hacker-news.firebaseio.com/v0/topstories.json" [1 2]
            "https://hacker-news.firebaseio.com/v0/item/1.json"
@@ -130,3 +138,20 @@
         (testing "story 2 has zero comments → empty-tree branch"
           (is (= 0 (:n_comments (second rows))))
           (is (= [] (:top_branches (second rows)))))))))
+
+(deftest deeper-tree-end-to-end
+  (testing "8-deep linear chain reassembles correctly"
+    (let [m (into {"https://hacker-news.firebaseio.com/v0/topstories.json" [1]
+                   "https://hacker-news.firebaseio.com/v0/item/1.json"
+                   {:id 1 :time 1000 :title "deep" :url "u" :type "story" :kids [2]}}
+                  (for [i (range 2 10)]
+                    [(str "https://hacker-news.firebaseio.com/v0/item/" i ".json")
+                     {:id i :time (+ 1000 i) :by (str "u" i)
+                      :kids (if (< i 9) [(inc i)] [])}]))]
+      (with-redefs [core/get-json (fixture-lookup m)]
+        (let [res (flow/run-seq (core/build-flow {:n-stories 1 :tree-workers 4})
+                                [:tick])
+              row (first (first (:outputs res)))]
+          (is (= :completed (:state res)))
+          (is (= 8 (:n_comments row)))
+          (is (= 8 (:max_depth row))))))))
