@@ -151,47 +151,90 @@ and emits a tree on output. Built on the cyclic-graph technique
   against more than one use case before committing the API surface;
   risks over-fitting to HN's specific tree shape.
 
-## Status (2026-05-01)
+## Status (2026-05-01) — RESOLVED
 
-**Option B landed in all 5 pipelines** (commit `382c9fa`). Per-node
-`:fetch-node` events are now visible in the scoped pubsub for
-`hn_shape`, `hn_density`, `hn_drift`, `hn_tempo`, `hn_typing`.
+**Option C landed across all 5 pipelines.** A new combinator
+`c/recursive-pool` (`combinators.clj`) provides coordinator-driven
+work-stealing with optional recursive feedback. The recursive HN
+tree fetch is implemented as a shared helper `toolkit.hn.tree-fetch`
+that wraps `c/recursive-pool` with a `fetch-node` step (emits node
+data on `:out`, child-ids on `:work`) and a per-tree-emit aggregator.
 
-**Framework changes (commit `b3877e2`)** prepare the ground for the
-deeper Option A/C fix:
-- `:done` envelope renamed to `:input-done` — documents that the
-  signal is "this upstream is exhausted," not a processing barrier.
-- `msg/drain` now works in `:on-all-closed` (symmetric with the
-  data path), so combinators can suppress the input-done auto-append
-  on outputs while gating their own close.
-- README §10 documents `:input-done` as a per-port lifecycle signal,
-  not a processing barrier; quiescence is a separate concept.
+All five pipelines (`hn_shape`, `hn_density`, `hn_drift`, `hn_tempo`,
+`hn_typing`) now use `tree-fetch/step` and have removed their inline
+`vt-exec` recursive fetchers. Per-node observability is **first-class**:
+each fetch is a real proc invocation under the worker's `:step-id`,
+generating `:recv`, `:send-out`, `:success` events that visualizers
+and recorders see automatically — no Option B status-event hacks.
 
-**Option A/C deferred — race condition.** A first cut at recursive
-`c/stealing-workers` (auto-detect `:work` output port + in-flight
-counter + `a/close!` on quiescence) was implemented and reverted.
-The implementation has a real race: when concurrent workers run, one
-worker's :out emission (which decrements the counter) can race with
-another worker's :work emission (which increments via the wrapper).
-If counter hits 0 at the wrong moment, `a/close!` fires before the
-in-transit :work emissions land at the re-enqueuer, and they're
-silently dropped to the closed shared-q.
+### Key design decisions made in resolving this
 
-The race is structural: the increment for :work happens in the
-worker's wrapper (before the framework writes to channels), but the
-framework's chan writes for :out and :work are concurrent and the
-re-enqueuer's :on-data fires asynchronously. Adding a "busy" counter
-helps but doesn't close the gap because the chan writes happen
-*after* the wrapper's `finally`.
+1. **Coordinator-driven cycle** instead of shared-queue race-prone
+   pattern. The original Option A/C attempt with K shims racing on a
+   shared `core.async` channel had a structural race between
+   `:out` and `:work` emissions arriving at the coord in undefined
+   order. The fix: one coordinator proc owns the work queue as
+   serialized state and dispatches to free workers via per-worker
+   chans. State transitions are serialized by `core.async.flow`'s
+   per-proc `:on-data` invocation, eliminating the cross-proc race
+   entirely.
 
-Correct fix needs one of:
-- Closure mechanism that observes the entire framework in flight
-  (sent==recv==completed at the combinator level).
-- Buffered close (a/close! on a small delay after counter=0 to let
-  in-transit chan writes land).
-- Fundamentally different pattern: e.g., a single coordinator proc
-  that owns the cycle and dispatches work to stateless inner steps,
-  removing the cross-proc race.
+2. **Multiplexed worker output port.** Workers emit both `:result`
+   and `:work` on a single `:to-coord` port with messages tagged
+   `::class :work | :result` and `::worker-id`. Single-port FIFO
+   guarantees within-invocation ordering: all of an invocation's
+   `:work` arrives before its `:result`, so coord can mark the
+   worker free on `:result` without racing in-flight `:work`.
+
+3. **Per-tree emit aggregator.** Tracks per-root expected/received
+   id sets and emits each tree as soon as its set hits empty. This
+   avoids the close-cascade transient-quiescence race that
+   buffer-until-close suffered: msg/drain in :on-data would absorb
+   the data flow, allowing run-seq's `await-quiescent!` to fire on
+   counter balance before the merge had been emitted.
+
+### Framework changes that supported this
+
+- `:done` envelope renamed to `:input-done` (commit `b3877e2`):
+  documents that the signal means "this upstream is exhausted," not
+  "stop processing." Cyclic flows depend on continued processing
+  after lifecycle signals.
+- `msg/drain` now works in `:on-all-closed` (commit `b3877e2`):
+  symmetric with `:on-data`'s drain semantics.
+- Per-port `:on-input-done` hook (commit `f4a10ac`): lets combinators
+  react to a specific port's input-done before all-closed fires.
+- `::closed-ins` renamed to `::input-dones-seen` (commit `512f9c4`):
+  honest naming after the lifecycle-signal reframing.
+
+### Remaining
+
+- **`fetch-user-history` in `hn_density`** still uses raw `vt-exec`
+  for its flat parallel batch (different pattern from recursive tree
+  fetch). It does have per-item `trace/emit` events from the earlier
+  Option B pass — those aren't first-class trace steps, but the
+  pattern doesn't lend itself to `c/recursive-pool` (no recursion).
+  Could be revisited with a `c/stealing-workers` (non-recursive)
+  fanout if needed.
+- **`c/stealing-workers` itself** is still in the codebase alongside
+  `c/recursive-pool`. The non-recursive case of `c/recursive-pool` is
+  a clean drop-in replacement for `c/stealing-workers` — eventual
+  retirement is in `plans/datapotamus-todos.md`.
+- **Per-conn closure tracking in the framework** would let
+  `c/recursive-pool` collapse from two coord input ports to one. See
+  `plans/datapotamus-design-decisions.md` decision #1 for context.
+
+### Discarded paths (history)
+
+A first attempt at recursive `c/stealing-workers` (auto-detect
+`:work` output port + in-flight counter + `a/close!` on quiescence)
+was implemented and reverted. The implementation had a structural
+race: when concurrent workers run, one worker's :out emission
+(decrementing counter) raced with another worker's :work emission
+(incrementing via wrapper). If counter hit 0 at the wrong moment,
+`a/close!` fired before in-transit :work emissions landed at the
+re-enqueuer, dropping them to the closed shared-q. The
+coordinator-driven design (Option C as it exists now) sidesteps
+this race entirely by having a single proc own the queue.
 
 ## Original recommended sequencing (historical)
 
