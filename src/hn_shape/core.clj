@@ -127,9 +127,18 @@
      {:ports         {:ins {:in ""} :outs {:out ""}}
       :on-init       (fn [] {})
       :on-data       (fn [ctx s {:keys [root node]}]
+                       ;; Stash node in state. Return an empty port-map
+                       ;; so the framework auto-signals on every output
+                       ;; (carrying tokens forward). This keeps counters
+                       ;; flowing and prevents transient quiescence
+                       ;; before the close cascade reaches us. Returning
+                       ;; msg/drain here would absorb the data flow and
+                       ;; allow run-seq's await-quiescent! to fire too
+                       ;; early, racing with subsequent :on-all-closed
+                       ;; emission.
                        [(update s root (fnil conj [])
                                 {:msg (:msg ctx) :node node})
-                        msg/drain])
+                        {}])
       :on-all-closed (fn [ctx s]
                        {:out (vec (for [[root entries] s
                                         :let [parents (mapv :msg entries)
