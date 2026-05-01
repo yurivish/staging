@@ -158,14 +158,19 @@
 
 ;; --- Per-user history fetch -------------------------------------------------
 
-(defn- fetch-user-history [{:keys [user-id] :as row} k]
+(defn- fetch-user-history [emit-item! {:keys [user-id] :as row} k]
   (let [submitted (or (:submitted (get-json (str base "/user/" user-id ".json"))) [])
         items     (->> submitted
                        (take (* 4 k))            ; over-sample to filter out non-comments
                        (mapv (fn [iid]
                                (.submit ^ExecutorService @vt-exec
                                         ^Callable
-                                        #(get-json (str base "/item/" iid ".json")))))
+                                        (fn []
+                                          (let [t0   (System/nanoTime)
+                                                item (get-json (str base "/item/" iid ".json"))
+                                                ms   (long (/ (- (System/nanoTime) t0) 1e6))]
+                                            (emit-item! iid (:type item) ms)
+                                            item)))))
                        (mapv #(.get %))
                        (filter #(= "comment" (:type %)))
                        (take k)
@@ -175,9 +180,16 @@
 (defn- mk-fetch-user-step [k]
   (step/step :fetch-user nil
              (fn [ctx _s row]
-               (let [t0  (System/nanoTime)
-                     out (fetch-user-history row k)
-                     ms  (long (/ (- (System/nanoTime) t0) 1e6))]
+               (let [t0         (System/nanoTime)
+                     emit-item! (fn [iid item-type ms]
+                                  (trace/emit ctx
+                                              {:event     :fetch-user-item
+                                               :user-id   (:user-id row)
+                                               :id        iid
+                                               :item-type item-type
+                                               :ms        ms}))
+                     out        (fetch-user-history emit-item! row k)
+                     ms         (long (/ (- (System/nanoTime) t0) 1e6))]
                  (trace/emit ctx {:event :user-fetched
                                   :user-id (:user-id row)
                                   :n-comments (count (:comments out))
