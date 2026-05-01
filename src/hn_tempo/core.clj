@@ -13,32 +13,15 @@
             [org.httpkit.client :as http]
             [toolkit.datapotamus.combinators :as c]
             [toolkit.datapotamus.flow :as flow]
-            [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
-            [toolkit.datapotamus.trace :as trace]
+            [toolkit.hn.tree-fetch :as tree-fetch]
             [toolkit.pubsub :as pubsub])
-  (:import [java.util.concurrent Executors ExecutorService]
-           [java.time Instant ZoneOffset]))
+  (:import [java.time Instant ZoneOffset]))
 
 (def base "https://hacker-news.firebaseio.com/v0")
 
-(defonce ^:private vt-exec
-  (delay (Executors/newVirtualThreadPerTaskExecutor)))
-
 (defn- get-json [url]
   (-> @(http/get url) :body (json/read-str :key-fn keyword)))
-
-(defn- fetch-tree [emit-node! counter id]
-  (let [t0   (System/nanoTime)
-        item (get-json (str base "/item/" id ".json"))
-        ms   (long (/ (- (System/nanoTime) t0) 1e6))
-        _    (swap! counter inc)
-        kids (or (:kids item) [])
-        _    (emit-node! id (count kids) ms)
-        futs (mapv #(.submit ^ExecutorService @vt-exec
-                             ^Callable (fn [] (fetch-tree emit-node! counter %)))
-                   kids)]
-    (assoc item :kid-trees (mapv #(.get %) futs))))
 
 (defn- nodes [tree]
   (cons tree (mapcat nodes (:kid-trees tree))))
@@ -114,30 +97,6 @@
              (fn [_tick]
                (vec (take n (get-json (str base "/topstories.json")))))))
 
-(def split-ids
-  (step/step :split-ids nil
-             (fn [ctx _s ids] {:out (msg/children ctx ids)})))
-
-(def fetch-tree-step
-  (step/step :fetch-tree nil
-             (fn [ctx _s story-id]
-               (trace/emit ctx {:event :fetch-start :story-id story-id})
-               (let [t0         (System/nanoTime)
-                     counter    (atom 0)
-                     emit-node! (fn [id n-kids ms]
-                                  (trace/emit ctx
-                                              {:event    :fetch-node
-                                               :story-id story-id
-                                               :id       id
-                                               :n-kids   n-kids
-                                               :ms       ms}))
-                     tree       (fetch-tree emit-node! counter story-id)
-                     ms         (long (/ (- (System/nanoTime) t0) 1e6))]
-                 (trace/emit ctx {:event :fetch-done
-                                  :story-id story-id
-                                  :n-nodes  @counter :ms ms})
-                 {:out [tree]}))))
-
 (def burst-step (step/step :burst burst-analysis))
 (def tempo-step (step/step :tempo tempo-analysis))
 (def flow-step  (step/step :flow  flow-analysis))
@@ -155,8 +114,7 @@
      :or   {n-stories 30 tree-workers 8}}]
    (step/serial :hn-tempo
                 (mk-fetch-top-ids n-stories)
-                split-ids
-                (c/stealing-workers :tree-fetchers tree-workers fetch-tree-step)
+                (tree-fetch/step {:k tree-workers :get-json get-json})
                 (c/parallel :analyzers
                             {:burst burst-step
                              :tempo tempo-step
