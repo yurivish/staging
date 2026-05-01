@@ -93,49 +93,66 @@
       [s {} [(trace/failure-event trace-sid m ex)]])))
 
 (defn- run-input-done
-  "Input-done cascade: track closed-ins in framework state. When all
-   declared input ports have been input-done'd, call :on-all-closed
-   (drain hook), then forward (new-input-done) on every output port.
-   Closed ports stay closed — a redundant input-done on an already-closed
-   port is a no-op (matters for cyclic flows where a feedback edge can
-   re-deliver input-done after on-all-closed has fired).
+  "Input-done lifecycle: track closed-ins in framework state, fire two
+   user hooks per-port and once-when-all-closed.
 
-   :on-all-closed may return msg/drain (or [s' msg/drain]) to suppress
-   the auto-append of new-input-done on every output port — symmetric
-   with msg/drain's role in run-data-or-signal. Combinators that gate
-   their own close (closing an internal channel only after in-flight
-   tokens drain) use this to keep the framework from racing extra
-   input-done envelopes into the channel."
+   On each new input-done arrival (port not yet in ::closed-ins):
+     1. Track it in ::closed-ins.
+     2. Call :on-input-done (ctx s port) — per-port hook, fires once per
+        port. Default no-op. Use this when a combinator needs to react
+        to a specific upstream's exhaustion before all inputs are closed.
+     3. If all declared ports are now closed, call :on-all-closed
+        (ctx s) — the drain hook.
+     4. Auto-append new-input-done on every output port unless
+        :on-all-closed returned msg/drain.
+
+   Both hooks may return port-maps; their outputs are merged (per-port
+   concat). msg/drain from :on-input-done suppresses just that hook's
+   contribution. msg/drain from :on-all-closed additionally suppresses
+   the auto-append of new-input-done envelopes onto outputs.
+
+   Redundant input-done on an already-closed port is a no-op — matters
+   for cyclic flows where a feedback edge can re-deliver after the hook
+   has fired."
   [hmap m ctx s trace-sid ins outs]
   (let [in-port (:in-port ctx)
         closed  (::closed-ins s #{})]
     (if (contains? closed in-port)
       [s {} [(trace/success-event trace-sid m)]]
       (let [closed' (conj closed in-port)
-            all-ins (set (keys ins))]
-        (if (= closed' all-ins)
-          (try
-            (let [ret                  ((:on-all-closed hmap) ctx s)
-                  [s' msgs]            (normalize-return s ret)
-                  drain?               (identical? msgs msg/drain)
-                  msgs'                (if drain? {} msgs)
-                  [synth-pm synth-evs] (msg/synthesize msgs' m trace-sid)
-                  port-map             (if drain?
-                                         synth-pm
-                                         (reduce (fn [pm p]
-                                                   (update pm p (fnil conj []) (msg/new-input-done)))
-                                                 synth-pm (keys outs)))
-                  events (vec (concat synth-evs
-                                      (send-out-events trace-sid port-map)
-                                      [(trace/success-event trace-sid m)]))]
-              [(assoc s' ::closed-ins closed') port-map events])
-            (catch Throwable ex
-              [(assoc s ::closed-ins closed')
-               {}
-               [(trace/failure-event trace-sid m ex)]]))
-          [(assoc s ::closed-ins closed')
-           {}
-           [(trace/success-event trace-sid m)]])))))
+            all-ins (set (keys ins))
+            all-closed? (= closed' all-ins)]
+        (try
+          (let [;; Per-port hook: always fires for new closures.
+                on-port (:on-input-done hmap (fn [_ s _] [s {}]))
+                [s1 msgs1-raw] (normalize-return s (on-port ctx s in-port))
+                msgs1   (if (identical? msgs1-raw msg/drain) {} msgs1-raw)
+                ;; All-closed hook: only when this is the last port.
+                [s2 msgs2 all-drain?]
+                (if all-closed?
+                  (let [r ((:on-all-closed hmap) ctx s1)
+                        [s' msgs] (normalize-return s1 r)
+                        d? (identical? msgs msg/drain)]
+                    [s' (if d? {} msgs) d?])
+                  [s1 {} false])
+                ;; Merge the two port-maps additively (concat per port).
+                combined (merge-with (fnil into []) msgs1 msgs2)
+                [synth-pm synth-evs] (msg/synthesize combined m trace-sid)
+                ;; Auto-append new-input-done on every output unless
+                ;; the all-closed hook returned msg/drain.
+                port-map (if (and all-closed? (not all-drain?))
+                           (reduce (fn [pm p]
+                                     (update pm p (fnil conj []) (msg/new-input-done)))
+                                   synth-pm (keys outs))
+                           synth-pm)
+                events  (vec (concat synth-evs
+                                     (send-out-events trace-sid port-map)
+                                     [(trace/success-event trace-sid m)]))]
+            [(assoc s2 ::closed-ins closed') port-map events])
+          (catch Throwable ex
+            [(assoc s ::closed-ins closed')
+             {}
+             [(trace/failure-event trace-sid m ex)]]))))))
 
 (defn run-step
   "Pure dispatch. Returns [new-state port-map events].

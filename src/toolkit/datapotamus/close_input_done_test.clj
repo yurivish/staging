@@ -709,3 +709,96 @@
           (is (= 1 (count send-outs)) "auto-append still fires for non-drain returns")
           (is (= :input-done (:msg-kind (first send-outs)))))
         (finally (stop! h))))))
+
+;; ============================================================================
+;; K. :on-input-done per-port hook
+;;
+;; Fires once per declared input port when input-done first arrives on that
+;; port — strictly before :on-all-closed (which only fires when ALL ports
+;; have closed). Lets combinators react to upstream-exhaustion of one
+;; specific port without waiting for the full all-closed cascade. This is
+;; the structural fix for cyclic combinators that need to know "external
+;; input is exhausted" before workers cascade input-done back.
+;; ============================================================================
+
+(deftest k1-on-input-done-fires-per-port
+  (testing ":on-input-done is called once per port as input-done arrives,
+            with the closing port-name as third arg"
+    (let [ca   (a/chan)
+          cb   (a/chan)
+          seen (atom [])
+          hmap (step/handler-map
+                {:ports         {:ins {:a "" :b ""} :outs {:out ""}}
+                 :on-init       (fn [] {::caf/in-ports {:a ca :b cb}})
+                 :on-data       (fn [_ s _] [s {}])
+                 :on-input-done (fn [_ s port]
+                                  (swap! seen conj port)
+                                  [s {}])})
+          h (start-with-events
+             {:procs {:probe hmap :sink (absorbing-sink)}
+              :conns [[[:probe :out] [:sink :in]]]
+              :in :probe :out :sink})]
+      (try
+        (a/close! ca)
+        (success-of h :probe 1)
+        (testing "after closing :a, :on-input-done fired once with :a"
+          (is (= [:a] @seen)))
+        (a/close! cb)
+        (success-of h :probe 2)
+        (testing "after closing :b, :on-input-done fired again with :b"
+          (is (= [:a :b] @seen)))
+        (finally (stop! h))))))
+
+(deftest k2-on-input-done-output-merges-with-on-all-closed
+  (testing "outputs from :on-input-done are merged with :on-all-closed
+            outputs into the proc's port-map"
+    (let [ca (a/chan)
+          cb (a/chan)
+          hmap (step/handler-map
+                 {:ports         {:ins {:a "" :b ""} :outs {:out ""}}
+                  :on-init       (fn [] {::caf/in-ports {:a ca :b cb}})
+                  :on-data       (fn [_ s _] [s {}])
+                  :on-input-done (fn [_ s port]
+                                   [s {:out [[:per-port port]]}])
+                  :on-all-closed (fn [_ s]
+                                   [s {:out [:all-closed]}])})
+          h (start-with-events
+             {:procs {:probe hmap :sink (absorbing-sink)}
+              :conns [[[:probe :out] [:sink :in]]]
+              :in :probe :out :sink})]
+      (try
+        (a/close! ca)
+        (success-of h :probe 1)
+        (a/close! cb)
+        (success-of h :probe 2)
+        (let [send-outs (filterv #(and (= :send-out (:kind %))
+                                       (= :probe (:step-id %))
+                                       (= :data (:msg-kind %)))
+                                 (events h))
+              data-vals (set (map :data send-outs))]
+          (testing "saw both per-port outputs and the all-closed output"
+            (is (contains? data-vals [:per-port :a]) (str "data-vals = " data-vals))
+            (is (contains? data-vals [:per-port :b]) (str "data-vals = " data-vals))
+            (is (contains? data-vals :all-closed) (str "data-vals = " data-vals))))
+        (finally (stop! h))))))
+
+(deftest k3-on-input-done-default-is-noop
+  (testing "handler-maps without :on-input-done still work — default no-op"
+    (let [c (a/chan)
+          hmap (step/handler-map
+                 {:ports   {:ins {:in ""} :outs {:out ""}}
+                  :on-init (fn [] {::caf/in-ports {:in c}})
+                  :on-data (fn [ctx _ _] {:out [(msg/pass ctx)]})})
+          h (start-with-events
+             {:procs {:probe hmap :sink (absorbing-sink)}
+              :conns [[[:probe :out] [:sink :in]]]
+              :in :probe :out :sink})]
+      (try
+        (a/>!! c (msg/new-msg :hello))
+        (success-of h :probe 1)
+        (a/close! c)
+        (success-of h :probe 2)
+        (let [recvs (filterv #(and (= :recv (:kind %)) (= :probe (:step-id %)))
+                             (events h))]
+          (is (= 2 (count recvs))))
+        (finally (stop! h))))))

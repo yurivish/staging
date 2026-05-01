@@ -113,6 +113,17 @@
                :data    (:data parent)
                ::parents [parent]))))
 
+(defn pass-of
+  "Like `pass` but takes the parent envelope explicitly (no ctx needed).
+   Used by combinators that defer dispatch — the message they want to
+   forward isn't (:msg ctx) of the current invocation, e.g. when a worker
+   pool dispatches from an internal queue inside a different invocation."
+  [parent]
+  (-> (derive-skeleton :data [(:msg-id parent)])
+      (assoc :data-id (:data-id parent)
+             :data    (:data parent)
+             ::parents [parent])))
+
 (defn signal
   "Signal child of `(:msg ctx)` — carries lineage but no :data."
   [ctx]
