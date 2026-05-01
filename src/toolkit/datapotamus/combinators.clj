@@ -374,34 +374,82 @@
          pool      {:procs procs :conns conns :in :feeder :out :join}]
      {:procs {id pool} :conns [] :in id :out id})))
 
+(defn- wrap-worker-multiplexed
+  "Wrap an inner handler-map so its :on-data return is rewritten to a
+   single output port `:to-coord`, with messages tagged `::class
+   :work` (recursive) or `::class :result` (forward) and a
+   `::worker-id` pointer. Order is preserved: work msgs come first,
+   then the result msg — within one invocation, all work emissions
+   land at the coordinator before the result, so coord can mark the
+   worker free without racing in-flight :work."
+  [inner worker-id]
+  (let [user-on-data   (:on-data inner)
+        user-on-signal (or (:on-signal inner) (fn [_ s] [s {}]))
+        tag (fn [m cls]
+              (assoc m ::class cls ::worker-id worker-id))]
+    (-> inner
+        (assoc-in [:ports :ins] {:in ""})
+        (assoc-in [:ports :outs] {:to-coord ""})
+        (assoc :on-data
+               (fn [ctx s d]
+                 (let [ret (user-on-data ctx s d)
+                       [s' pm] (if (vector? ret) ret [s ret])
+                       drain?  (identical? pm msg/drain)]
+                   (if drain?
+                     [s' msg/drain]
+                     (let [work-msgs (mapv #(tag % :work)   (get pm :work []))
+                           out-msgs  (mapv #(tag % :result) (get pm :out []))
+                           combined  (vec (concat work-msgs out-msgs))]
+                       [s' {:to-coord combined}])))))
+        (assoc :on-signal
+               (fn [ctx s]
+                 (let [ret (user-on-signal ctx s)
+                       [s' pm] (if (vector? ret) ret [s ret])
+                       drain?  (identical? pm msg/drain)]
+                   (if drain?
+                     [s' msg/drain]
+                     ;; Forward any signal as a tagged-:result so coord
+                     ;; can pass it through to :out.
+                     [s' {:to-coord [(tag (msg/signal ctx) :result)]}])))))))
+
 (defn recursive-pool
   "Coordinator-driven work-stealing pool with optional recursive feedback.
 
    Same conceptual goal as `stealing-workers` (K parallel copies of an
    inner step racing for items from a shared queue), but implemented as
-   1 coordinator proc + K shims + K worker inners. The coordinator owns
-   the queue as state and dispatches to free workers, eliminating the
-   shared-channel race that affects close-cascade interactions.
+   1 coordinator proc + K shims + K wrapped worker inners. The
+   coordinator owns the queue as state and dispatches to free workers,
+   eliminating the shared-channel race that affects close-cascade
+   interactions.
 
    `inner` must be a handler-map. If `inner` declares an output port
    `:work`, items emitted on `:work` are routed back to the
-   coordinator's `:in` port — same port external work arrives on. From
-   the coordinator's perspective, recursive work and external work are
-   indistinguishable; both just go on the queue.
+   coordinator and queued for dispatch — same conceptual queue
+   external work goes on. From the coordinator's perspective,
+   recursive work and external work are indistinguishable.
+
+   Implementation: each worker wrapper rewrites its return as a single
+   `:to-coord` port emission tagged `::class :work` (recursive) or
+   `::class :result` (forward). Tagging on a single output port
+   guarantees within-invocation FIFO at the coordinator: all of an
+   invocation's :work emissions arrive before its :result, so coord
+   can mark the worker free on :result without any in-flight :work
+   race.
 
    Closure: when external `:in` reports input-done (via the per-port
    `:on-input-done` hook) AND the queue is empty AND no workers are
    busy, the coordinator closes the channels feeding worker inputs
-   (which it owns via `::flow/out-ports` on its `:to-wK` ports). Workers
-   then cascade input-done back through the standard channel-close
-   mechanism, eventually closing all of the coordinator's input ports
+   (which it owns via `::flow/out-ports` on its `:to-wK` ports).
+   Workers then cascade input-done through their wrapped `:to-coord`
+   output, eventually closing all of the coordinator's input ports
    and triggering `:on-all-closed`'s default auto-append on `:out`.
 
-   Trace topology: coordinator proc `:coord`, shim procs `:s0`..`:sK-1`,
-   worker procs `:w0`..`:wK-1`. Every dispatch generates a `:send-out`
-   from coordinator and a `:recv` at the corresponding worker (via the
-   shim); every result generates a `:send-out` from the worker and a
-   `:recv` at the coordinator — same observability surface as
+   Trace topology: coordinator proc `:coord`, ext-wrap proc
+   `:ext`, shim procs `:s0`..`:sK-1`, worker procs `:w0`..`:wK-1`.
+   Every dispatch generates a `:send-out` from coordinator and a
+   `:recv` at the corresponding worker (via the shim); every result
+   generates a `:send-out` from the worker and a `:recv` at the
+   coordinator on `:rec` — same observability surface as
    `stealing-workers`.
 
    Backward compat with `stealing-workers`'s step-inner support is NOT
@@ -411,40 +459,11 @@
    (assert (pos-int? k) "recursive-pool: k must be a positive integer")
    (assert (step/handler-map? inner)
            "recursive-pool: inner must be a handler-map (use stealing-workers for multi-proc step inners)")
-   (let [recursive?   (contains? (-> inner :ports :outs) :work)
-         to-w-ports   (mapv #(keyword (str "to-w" %)) (range k))
-         from-w-ports (mapv #(keyword (str "from-w" %)) (range k))
-         shim-ids     (mapv #(keyword (str "s" %)) (range k))
-         worker-ids   (mapv #(keyword (str "w" %)) (range k))
-         port->wk-idx (zipmap from-w-ports (range k))
-         to-w-chans   (vec (repeatedly k #(a/chan 1)))
-         ;; Pending-work counter: incremented in the worker wrapper
-         ;; *before* the framework processes the return port-map, so it
-         ;; counts :work emissions that exist but haven't yet arrived
-         ;; at coord :rec. Coord decrements on each :rec arrival. This
-         ;; closes the race where :out arrives at coord before its
-         ;; co-emitted :work — without the counter, coord could see
-         ;; busy=#{} and queue=∅ and close worker chans while :work is
-         ;; still in transit.
-         pending-work (when recursive? (java.util.concurrent.atomic.LongAdder.))
-
-         ;; Wrap the inner so each :on-data invocation increments
-         ;; pending-work by (count :work emissions) atomically with
-         ;; its return value. Synchronous: happens in the worker's
-         ;; proc-fn before the framework writes :work to chans.
-         inner' (if recursive?
-                  (let [user-on-data (:on-data inner)]
-                    (assoc inner :on-data
-                           (fn [ctx s d]
-                             (let [ret (user-on-data ctx s d)
-                                   pm (if (vector? ret) (second ret) ret)
-                                   n  (if (or (nil? pm) (identical? pm msg/drain))
-                                        0
-                                        (count (get pm :work [])))]
-                               (when (pos? n)
-                                 (.add ^java.util.concurrent.atomic.LongAdder pending-work n))
-                               ret))))
-                  inner)
+   (let [to-w-ports  (mapv #(keyword (str "to-w" %)) (range k))
+         shim-ids    (mapv #(keyword (str "s" %)) (range k))
+         worker-ids  (mapv #(keyword (str "w" %)) (range k))
+         to-w-chans  (vec (repeatedly k #(a/chan 1)))
+         wk->idx     (zipmap worker-ids (range k))
 
          ;; Try-dispatch: pop items from the queue to free workers until
          ;; one of them runs out. Returns [s' port-map] where port-map
@@ -471,16 +490,12 @@
          (fn [s]
            (when (and (:ext-done? s)
                       (empty? (:queue s))
-                      (empty? (:busy s))
-                      (or (nil? pending-work)
-                          (zero? (.sum ^java.util.concurrent.atomic.LongAdder pending-work))))
+                      (empty? (:busy s)))
              (doseq [c to-w-chans] (a/close! c))))
 
          coord
          (step/handler-map
-          {:ports {:ins  (cond-> (clojure.core/merge {:in ""}
-                                                     (zipmap from-w-ports (repeat "")))
-                           recursive? (assoc :rec ""))
+          {:ports {:ins  {:in "" :rec ""}
                    :outs (clojure.core/merge {:out ""}
                                              (zipmap to-w-ports (repeat "")))}
            :on-init       (fn []
@@ -493,50 +508,57 @@
              (let [in-port (:in-port ctx)
                    msg     (:msg ctx)]
                (cond
-                 (or (= in-port :in) (= in-port :rec))
-                 ;; New work (external on :in OR recursive on :rec).
-                 ;; Queue + try dispatch. Two ports because core.async.flow
-                 ;; doesn't reliably merge multiple conns into one input
-                 ;; port — keep them separate, treat them identically.
-                 ;; If on :rec, this is a :work msg that the worker
-                 ;; wrapper pre-counted; decrement now that it's arrived.
-                 (let [_ (when (and (= in-port :rec) pending-work)
-                           (.decrement ^java.util.concurrent.atomic.LongAdder pending-work))
-                       s'             (update s :queue conj msg)
+                 ;; External work — always queue. (No tagging needed;
+                 ;; ext-wrap forwards external msgs verbatim.)
+                 (= in-port :in)
+                 (let [s'             (update s :queue conj msg)
                        [s'' dispatch] (try-dispatch s')]
                    [s'' dispatch])
 
-                 :else
-                 ;; Worker result on :from-wK.
-                 (let [wk-idx (port->wk-idx in-port)
-                       wk     (worker-ids wk-idx)
+                 ;; Worker emission on :rec — dispatch on ::class.
+                 ;; Worker wrapper guarantees within-invocation FIFO:
+                 ;; all :work msgs arrive before the invocation's
+                 ;; :result, so marking busy disj on :result is safe.
+                 (= (::class msg) :work)
+                 (let [s'             (update s :queue conj msg)
+                       [s'' dispatch] (try-dispatch s')]
+                   [s'' dispatch])
+
+                 (= (::class msg) :result)
+                 (let [wk     (::worker-id msg)
                        s'     (update s :busy disj wk)
                        forward {:out [(msg/pass ctx)]}
                        [s'' dispatch] (try-dispatch s')]
                    (maybe-close-workers! s'')
-                   [s'' (clojure.core/merge forward dispatch)]))))
+                   [s'' (clojure.core/merge forward dispatch)])
+
+                 :else
+                 ;; Untagged msg on :rec — shouldn't happen with the
+                 ;; current wrapper, but forward defensively.
+                 [s {:out [(msg/pass ctx)]}])))
            :on-signal
            (fn [ctx s]
-             (let [in-port (:in-port ctx)]
-               (if (= in-port :in)
-                 ;; Signals from external/recursive go straight to :out.
-                 ;; (We don't queue them; signals carry tokens but no
-                 ;; payload, so they don't represent work.)
-                 [s {:out [(msg/signal ctx)]}]
-                 ;; Signals from workers also forward straight through.
-                 [s {:out [(msg/signal ctx)]}])))
+             [s {:out [(msg/signal ctx)]}])
            :on-input-done
            (fn [_ s port]
              (if (= port :in)
-               ;; First input-done on :in is from external (workers'
-               ;; :work feedback only emits input-done after coord has
-               ;; closed their inputs). Mark ext-done? and check terminal.
+               ;; External input exhausted. (The :rec port also
+               ;; receives input-done eventually — once we close worker
+               ;; chans and they cascade — but that fires
+               ;; :on-all-closed's default auto-append on :out.)
                (let [s' (assoc s :ext-done? true)]
                  (maybe-close-workers! s')
                  [s' {}])
                [s {}]))
            :on-all-closed
            (fn [_ s] [s {}])})
+
+         ;; ext-wrap: passes external work through to coord :in
+         ;; verbatim (no tagging needed since :in identifies it).
+         ext-wrap (step/handler-map
+                   {:ports     {:ins {:in ""} :outs {:out ""}}
+                    :on-data   (fn [ctx _ _] {:out [(msg/pass ctx)]})
+                    :on-signal (fn [ctx _]   {:out [(msg/signal ctx)]})})
 
          shims
          (mapv (fn [i]
@@ -557,11 +579,16 @@
                      :on-data   (fn [_ _ _] {})
                      :on-signal (fn [_ _]   {})})
 
-         procs (-> {:coord coord :drop drop-sink}
+         worker-procs (mapv (fn [wk] (wrap-worker-multiplexed inner wk))
+                            worker-ids)
+
+         procs (-> {:coord coord :ext ext-wrap :drop drop-sink}
                    (into (map vector shim-ids shims))
-                   (into (map vector worker-ids (repeat inner'))))
+                   (into (map vector worker-ids worker-procs)))
 
          conns (vec (concat
+                     ;; ext-wrap → coord :in (external work entry)
+                     [[[:ext :out] [:coord :in]]]
                      ;; Stub conns: coord :to-wK → drop. Real writes go
                      ;; to to-w-chans via ::flow/out-ports override.
                      (mapv (fn [tp] [[:coord tp] [:drop :in]]) to-w-ports)
@@ -569,13 +596,16 @@
                      ;; shim can't drain to-w-chan ahead of inner.
                      (mapcat (fn [s w] [[[s :to-inner] [w :in] {:buf-or-n 1}]])
                              shim-ids worker-ids)
-                     ;; Worker :out → coord :from-wK
-                     (mapcat (fn [w fp] [[[w :out] [:coord fp]]])
-                             worker-ids from-w-ports)
-                     ;; Recursive: worker :work → coord :rec
-                     (when recursive?
-                       (mapv (fn [w] [[w :work] [:coord :rec]])
-                             worker-ids))))
+                     ;; Worker (wrapped) :to-coord → coord :rec.
+                     ;; Each invocation can emit up to (1 result + N
+                     ;; work) msgs at once on this single port; buffer
+                     ;; needs to hold at least the largest possible
+                     ;; emission burst so the worker doesn't block on
+                     ;; chan-write while the coord is still busy on
+                     ;; another worker's stream. 1024 is overkill but
+                     ;; cheap.
+                     (mapv (fn [w] [[w :to-coord] [:coord :rec] {:buf-or-n 1024}])
+                           worker-ids)))
 
-         pool {:procs procs :conns conns :in :coord :out :coord}]
+         pool {:procs procs :conns conns :in :ext :out :coord}]
      {:procs {id pool} :conns [] :in id :out id})))

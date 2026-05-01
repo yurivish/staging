@@ -102,6 +102,43 @@
     (is (= :completed (:state res)))
     (is (= 15 (count (first (:outputs res)))))))
 
+(deftest c1b-binary-tree-of-depth-2-k1
+  ;; Depth 2: root + 2 + 4 = 7 nodes. K=1 to remove cross-worker concurrency.
+  (let [tree (letfn [(node [d]
+                       (if (zero? d)
+                         {:n [:leaf d]}
+                         {:n [:branch d]
+                          :kids [(node (dec d)) (node (dec d))]}))]
+               (node 2))
+        wf   (c/recursive-pool :pool 1 (branching-inner))
+        res  (flow/run-seq wf [tree])]
+    (is (= :completed (:state res)))
+    (is (= 7 (count (first (:outputs res)))))))
+
+(deftest c1c-binary-tree-of-depth-2-k2
+  (let [tree (letfn [(node [d]
+                       (if (zero? d)
+                         {:n [:leaf d]}
+                         {:n [:branch d]
+                          :kids [(node (dec d)) (node (dec d))]}))]
+               (node 2))
+        wf   (c/recursive-pool :pool 2 (branching-inner))
+        res  (flow/run-seq wf [tree])]
+    (is (= :completed (:state res)))
+    (is (= 7 (count (first (:outputs res)))))))
+
+(deftest c1d-binary-tree-of-depth-3-k2
+  (let [tree (letfn [(node [d]
+                       (if (zero? d)
+                         {:n [:leaf d]}
+                         {:n [:branch d]
+                          :kids [(node (dec d)) (node (dec d))]}))]
+               (node 3))
+        wf   (c/recursive-pool :pool 2 (branching-inner))
+        res  (flow/run-seq wf [tree])]
+    (is (= :completed (:state res)))
+    (is (= 15 (count (first (:outputs res)))))))
+
 ;; ============================================================================
 ;; D. Multiple roots
 ;; ============================================================================
