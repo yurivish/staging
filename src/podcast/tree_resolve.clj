@@ -21,10 +21,10 @@
      • `explode` mints one child msg per chunk, each carrying the
        per-chunk slice the leaf needs (chunk + chunk-mentions +
        local→global map + forward context).
-     • `leaves` is a `c/workers` pool — k parallel copies of the leaf
+     • `leaves` is a `c/round-robin-workers` pool — k parallel copies of the leaf
        handler; the local llama.cpp slot pool throttles real concurrency.
      • `gather-all` is a handler-map that accumulates leaf outputs and
-       emits the collected vec from `:on-all-closed` via `msg/merge`,
+       emits the collected vec from `:on-all-input-done` via `msg/merge`,
        carrying tokens forward from every leaf parent.
      • `reducer` does one tree level per invocation; its self-loop is
        the recursion. Token mass converges into the final emission."
@@ -679,7 +679,7 @@ Respond with a JSON object conforming to the supplied schema. Output nothing els
 (defn- build-graph [config all-mentions paragraphs k-fwd workers initial-n]
   (-> (step/beside
        (explode-step config all-mentions paragraphs k-fwd)
-       (c/workers :tree-leaves workers leaf-step)
+       (c/round-robin-workers :tree-leaves workers leaf-step)
        (pair-merger-step config initial-n))
       (step/connect [:tree-explode :out]  [:tree-leaves :in])
       (step/connect [:tree-leaves :out]   [:tree-merger :in]

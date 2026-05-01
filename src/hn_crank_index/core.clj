@@ -7,7 +7,7 @@
 
    Same source/classifier shape as `hn-emotion`, with a smaller schema
    (just :topic + :intensity) and a different aggregator that does a
-   two-pass reduction inside :on-all-closed.
+   two-pass reduction inside :on-all-input-done.
 
    Data path:
      emit-users → fetch-history (paginated Algolia)
@@ -180,7 +180,7 @@
                    {:out [(msg/child ctx (merge row c))]})))))
 
 (defn- mk-aggregate [{:keys [min-count]}]
-  (c/cumulative-by-group
+  (c/batch-by-group
    :user-id
    (fn [user-id rows]
      (cranks-of user-id (remove :empty? rows) {:min-count min-count}))))

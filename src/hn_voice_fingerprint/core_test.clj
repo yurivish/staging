@@ -233,7 +233,7 @@
                                        :workers 2})
                      [:tick])
               rows (->> (first (:outputs res))
-                        (group-by :user-id) vals (mapv last))
+                        (sort-by :user-id))
               by   (into {} (map (juxt :user-id identity)) rows)]
           (is (= :completed (:state res)))
           (is (= 2 (count rows)))
@@ -257,7 +257,7 @@
                    (core/build-flow {:user-ids ["ghost"] :bucket :month :workers 2})
                    [:tick])
             rows (->> (first (:outputs res))
-                      (group-by :user-id) vals (mapv last))]
+                      (sort-by :user-id))]
         (is (= :completed (:state res)))
         (is (= 1 (count rows)))
         (is (= "ghost" (-> rows first :user-id)))

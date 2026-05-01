@@ -228,7 +228,7 @@
                    {:out [(msg/child ctx (merge row c))]})))))
 
 (defn- mk-aggregate [{:keys [peak-min silent-quarters] :as cfg}]
-  (c/cumulative-by-group
+  (c/batch-by-group
    :user-id
    (fn [user-id rows]
      (summarize-user user-id (remove :empty? rows) cfg))))

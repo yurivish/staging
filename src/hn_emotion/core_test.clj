@@ -85,10 +85,8 @@
                      (core/build-flow {:user-ids ["alice" "bob"]
                                        :workers 2})
                      [:tick])
-              ;; Aggregator emits a cumulative summary per comment;
-              ;; the last emission per user is the final summary.
               rows (->> (first (:outputs res))
-                        (group-by :user-id) vals (mapv last))
+                        (sort-by :user-id))
               by   (into {} (map (juxt :user-id identity)) rows)]
           (is (= :completed (:state res)))
           (is (= 2 (count rows)))
@@ -111,7 +109,7 @@
                    (core/build-flow {:user-ids ["ghost"] :workers 2})
                    [:tick])
             rows (->> (first (:outputs res))
-                      (group-by :user-id) vals (mapv last))]
+                      (sort-by :user-id))]
         (is (= :completed (:state res)))
         (is (= 1 (count rows)))
         (is (= "ghost" (-> rows first :user-id)))

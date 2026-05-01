@@ -1451,17 +1451,17 @@
         (is (= :try (:step-id (first fs))))))))
 
 ;; A drain-style aggregator (stash everything under `msg/drain`, emit at
-;; close) needs the `:on-all-closed` cascade to flush. `run-seq` injects an
+;; close) needs the `:on-all-input-done` cascade to flush. `run-seq` injects an
 ;; `input-done` envelope after the data so this works transparently —
 ;; quiescence
-;; balance alone would terminate before `:on-all-closed` ever fires.
-(deftest run-seq-fires-on-all-closed-aggregator
+;; balance alone would terminate before `:on-all-input-done` ever fires.
+(deftest run-seq-fires-on-all-input-done-aggregator
   (let [agg (step/handler-map
              {:ports         {:ins {:in ""} :outs {:out ""}}
               :on-init       (fn [] {:items []})
               :on-data       (fn [ctx s _d]
                                [(update s :items conj (:msg ctx)) msg/drain])
-              :on-all-closed (fn [ctx s]
+              :on-all-input-done (fn [ctx s]
                                {:out [(msg/merge ctx (:items s)
                                                  (mapv :data (:items s)))]})})
         wf  {:procs {:agg agg} :conns [] :in :agg :out :agg}
@@ -1650,11 +1650,11 @@
              (first (:outputs result)))))))
 
 ;; ============================================================================
-;; Act XVI — Parallel workers (workers combinator)
+;; Act XVI — Parallel workers (round-robin-workers combinator)
 ;;
-;; `workers` runs K copies of an inner step behind a round-robin router and
-;; merges their outputs through a K-input join. Each worker is a distinct
-;; proc, so core.async.flow gives each its own thread — per-message
+;; `round-robin-workers` runs K copies of an inner step behind a round-robin
+;; router and merges their outputs through a K-input join. Each worker is a
+;; distinct proc, so core.async.flow gives each its own thread — per-message
 ;; parallelism is real, not cooperative. The router/join/workers share an
 ;; outer [:scope id] segment, and each worker adds [:scope wN] below —
 ;; so per-stage aggregation and per-worker distinction are both structural.
@@ -1664,13 +1664,13 @@
 ;; Per-worker distinction lives in the scope path (each worker adds a
 ;; [:scope :wN] segment under the shared [:scope :pool]), so we capture the
 ;; scope vector rather than the (still-shared) :step-id.
-(deftest workers-round-robin-distributes-evenly
+(deftest round-robin-workers-distributes-evenly
   (let [seen   (atom [])
         probe  (step/step :probe {:ins {:in ""} :outs {:out ""}}
                           (fn [ctx _s d]
                             (swap! seen conj [(:prefix (:pubsub ctx)) d])
                             {:out [(msg/pass ctx)]}))
-        wf     (c/workers :pool 3 probe)
+        wf     (c/round-robin-workers :pool 3 probe)
         result (flow/run-seq wf (range 9))]
     (testing "run completes; every input produces exactly one output"
       (is (= :completed (:state result)))
@@ -1681,12 +1681,12 @@
 
 ;; Per-worker state isolation: with K=2, even- and odd-positioned inputs go
 ;; to different workers, each accumulating its own running sum.
-(deftest workers-isolate-state-per-worker
+(deftest round-robin-workers-isolate-state-per-worker
   (let [acc (step/step :acc nil
                        (fn [_ctx s d]
                          (let [s' (update s :sum (fnil + 0) d)]
                            [s' {:out [(:sum s')]}])))
-        wf  (step/serial (c/workers :pool 2 acc))
+        wf  (step/serial (c/round-robin-workers :pool 2 acc))
         res (flow/run-seq wf [10 1 20 2 30 3])]
     (is (= :completed (:state res)))
     (testing "w0 sees 10,20,30 → sums 10,30,60; w1 sees 1,2,3 → sums 1,3,6"
@@ -1695,10 +1695,10 @@
 ;; Token preservation: a data msg carrying tokens traverses the router→worker
 ;; →join path with tokens intact (synthesis's K-way split collapses to 1-way
 ;; at each step, so the group value is preserved end-to-end).
-(deftest workers-preserve-tokens
+(deftest round-robin-workers-preserve-tokens
   (let [wf (step/serial
            (step/step :inc inc)
-           (c/workers :pool 3 (step/step :noop identity))
+           (c/round-robin-workers :pool 3 (step/step :noop identity))
            (step/sink))
         h  (start! wf)]
     (try
@@ -1718,9 +1718,9 @@
 ;; not K. The router's custom :on-signal routes (not broadcasts), so exactly
 ;; one worker sees it, and the join's default broadcast to one :out port
 ;; emits one signal.
-(deftest workers-route-signals-not-broadcast
+(deftest round-robin-workers-route-signals-not-broadcast
   (let [wf (step/serial
-           (c/workers :pool 4 (step/passthrough :w))
+           (c/round-robin-workers :pool 4 (step/passthrough :w))
            (step/sink))
         h  (start! wf)]
     (try
@@ -1737,10 +1737,10 @@
         (when-not (realized? (::flow/cancel h)) (stop! h))))))
 
 ;; Done cascade fires exactly once downstream. The join's K distinct input
-;; ports ensure on-all-closed fires once, not K times.
-(deftest workers-input-done-cascade-fires-once
+;; ports ensure on-all-input-done fires once, not K times.
+(deftest round-robin-workers-input-done-cascade-fires-once
   (let [wf (step/serial
-           (c/workers :pool 3 (step/passthrough :w))
+           (c/round-robin-workers :pool 3 (step/passthrough :w))
            (step/sink))
         h  (start! wf)]
     (flow/inject! h {})
@@ -1756,28 +1756,28 @@
 ;; `inner` may be a composite step, not just a single handler-map — internal
 ;; sids get prefixed per-worker so state is isolated even when inner has
 ;; multiple procs.
-(deftest workers-accepts-composite-step
+(deftest round-robin-workers-accepts-composite-step
   (let [inner (step/serial (step/step :a inc) (step/step :b #(* 2 %)))
-        wf    (step/serial (c/workers :pool 2 inner))
+        wf    (step/serial (c/round-robin-workers :pool 2 inner))
         res   (flow/run-seq wf [1 2 3 4])]
     (is (= :completed (:state res)))
     (is (= [[4] [6] [8] [10]] (:outputs res)))))
 
 ;; ----------------------------------------------------------------------------
-;; stealing-workers — work-stealing sibling of `workers`.
+;; stealing-workers — work-stealing sibling of `round-robin-workers`.
 ;;
-;; The combinator's design: 1 feeder + K shims + K inners + 1 join. The feeder
-;; declares K output ports all merged to a shared core.async channel via
-;; ::flow/out-ports. K shims read from that shared channel via ::flow/in-ports.
-;; Multi-taker on a single channel = queue-group dispatch, intrinsic to
-;; core.async. The feeder's :on-all-closed default fires auto-append on all K
-;; declared outputs, writing K input-done envelopes onto the shared queue — exactly
-;; one for each shim. Each shim sets ::flow/input-filter on cascade so it
-;; can't grab a sibling's done before the framework's read loop sees its own
-;; state update.
+;; The combinator's design: 1 coordinator + 1 ext-wrap + K shims + K worker
+;; inners (+ K exit-wrappers, for step inners). The coordinator owns the queue
+;; as state and dispatches to free workers via ::flow/out-ports overrides on
+;; per-worker channels. Worker emissions arrive at coord :rec tagged
+;; ::class :work (queue + dispatch) or ::class :result (mark worker free +
+;; forward on :out). Recursive feedback (handler-map inners with a :work
+;; output port) and step inners are both supported.
 ;;
-;; Tests below mirror the `workers` suite where they apply, plus a wall-clock
-;; assertion that demonstrates work-stealing actually rebalances skewed load.
+;; Tests below mirror the `round-robin-workers` suite where they apply, plus a
+;; wall-clock assertion that demonstrates work-stealing actually rebalances
+;; skewed load. The recursive-feedback path has its own deeper test file
+;; (stealing_workers_test.clj).
 ;; ----------------------------------------------------------------------------
 
 (deftest stealing-workers-exactly-once-delivery
@@ -1871,18 +1871,17 @@
            (mapv set (:outputs result))))))
 
 (deftest stealing-workers-distributes-skewed-load
-  ;; The point of this combinator. With round-robin (`workers`), items at
+  ;; The point of this combinator. With `round-robin-workers`, items at
   ;; even indices go to w0 and odd to w1. If costs are correlated with
   ;; index parity — e.g., every odd item is slow — round-robin pins all
   ;; the slow work to one worker and gates wall-clock on that. Work-
   ;; stealing rebalances dynamically: idle workers grab the next slow
   ;; item instead of waiting.
   ;;
-  ;; Compare directly to `workers` rather than asserting an absolute
-  ;; bound: timing noise (GC, scheduling, JIT warmup) cancels out in
-  ;; the ratio, giving a stable signal. Optimal ratio = 220/400 ≈ 0.55;
-  ;; bound at 0.75 leaves margin for variance while still falsifying a
-  ;; regression to round-robin behavior.
+  ;; Compare directly to `round-robin-workers` rather than asserting an
+  ;; absolute bound: timing noise (GC, scheduling, JIT warmup) cancels
+  ;; out in the ratio, giving a stable signal. Optimal ratio =
+  ;; 220/400 ≈ 0.55.
   (let [items   [200 10 200 10 200 10 200 10]   ; alternating slow/fast ms
         slow    (step/step :sleep
                            (fn [d] (Thread/sleep (long d)) d))
@@ -1890,16 +1889,17 @@
                   (let [t0 (System/currentTimeMillis)]
                     (flow/run-seq wf items)
                     (- (System/currentTimeMillis) t0)))
-        rr-time (time! (c/workers :pool 2 slow))
+        rr-time (time! (c/round-robin-workers :pool 2 slow))
         ws-time (time! (c/stealing-workers :pool 2 slow))]
     ;; Optimal: rr ≈ 800 ms (slow worker pinned to all four 200s),
     ;; ws ≈ 420 ms (rebalanced). Ratio ≈ 0.53. The ws topology has
-    ;; a few more hops than rr (feeder + shim + inner vs router +
-    ;; inner) so its per-item overhead is higher — bound at 0.85 to
-    ;; leave room for that overhead and JVM/scheduling jitter while
-    ;; still clearly falsifying a regression to round-robin dispatch.
+    ;; a few more hops than rr (coordinator + shim + inner + exit-wrap
+    ;; vs router + inner) so its per-item overhead is higher — bound
+    ;; at 0.85 to leave room for that overhead and JVM/scheduling
+    ;; jitter while still clearly falsifying a regression to
+    ;; round-robin dispatch.
     (is (< ws-time (* 0.85 rr-time))
-        (str "stealing-workers=" ws-time "ms, workers (round-robin)=" rr-time
+        (str "stealing-workers=" ws-time "ms, round-robin-workers=" rr-time
              "ms; expected ws < 0.85 * rr"))))
 
 ;; ============================================================================

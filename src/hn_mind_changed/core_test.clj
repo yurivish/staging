@@ -128,7 +128,7 @@
                      [:tick])
               ;; Aggregator no longer sorts/dedupes; tests do it manually.
               rows (->> (first (:outputs res))
-                        (group-by :candidate-id) vals (mapv last)
+                        (sort-by :candidate-id)
                         (sort-by (comp #(or % 0) :created_at_i) >))]
           (is (= :completed (:state res)))
           (testing "filter dropped one (200), so 2 rows remain"

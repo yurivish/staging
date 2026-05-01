@@ -39,7 +39,7 @@
 
      {:on-data       (fn [ctx state data] → return)
       :on-signal     (fn [ctx state]      → return)   ; default: broadcast
-      :on-all-closed (fn [ctx state]      → return)   ; default: emit nothing
+      :on-all-input-done (fn [ctx state]      → return)   ; default: emit nothing
       :on-init       (fn []               → initial-state)   ; default: {}
       :on-stop       (fn [ctx state]      → any)             ; default: nil
       :ports         {:ins {...} :outs {...}}}
@@ -72,7 +72,7 @@
   {:ports         {:ins {:in ""} :outs {:out ""}}
    :on-signal     (fn [ctx _state]
                     (into {} (map (fn [p] [p [(msg/signal ctx)]])) (keys (:outs ctx))))
-   :on-all-closed (fn [_ctx _state] {})
+   :on-all-input-done (fn [_ctx _state] {})
    :on-init       (fn []            {})
    :on-stop       (fn [_ctx _state] nil)})
 
@@ -80,7 +80,7 @@
   "Build a handler-map from a partial spec, filling in defaults.
 
    Tier-3 escape hatch: use this when you need a custom :on-signal,
-   :on-all-closed, :on-init, or :on-stop. For ordinary handlers prefer
+   :on-all-input-done, :on-init, or :on-stop. For ordinary handlers prefer
    `step`, which wraps a handler-map in a 1-proc step for you."
   [m]
   (reduce-kv (fn [acc k v] (cond-> acc (nil? (acc k)) (assoc k v)))

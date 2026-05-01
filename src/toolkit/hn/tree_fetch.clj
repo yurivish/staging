@@ -3,11 +3,13 @@
 
    Takes incoming story-id collections on `:in` and emits one fully
    reassembled tree per story-id on `:out`. Internally uses
-   `c/recursive-pool` with K parallel workers, each fetching one HN
-   item per invocation and emitting child-ids on `:work` for the
-   pool to dispatch back to itself. A buffer-until-close aggregator
-   reconstructs each story's tree from the flat node stream and
-   emits one merged tree msg per story root.
+   `c/stealing-workers` in recursive-feedback mode (the inner
+   handler-map declares a `:work` output port) with K parallel
+   workers, each fetching one HN item per invocation and emitting
+   child-ids on `:work` for the pool to dispatch back to itself. A
+   buffer-until-close aggregator reconstructs each story's tree
+   from the flat node stream and emits one merged tree msg per
+   story root.
 
    Per-node observability: each fetch is a real proc invocation
    under the worker's `:step-id`, so visualizers and recorders see
@@ -42,7 +44,7 @@
 (defn- mk-fetch-node
   "The recursive worker. Receives `{:root story-id :id node-id}`,
    fetches the HN item, emits one node-data envelope on :out and one
-   recursive request per kid on :work. c/recursive-pool routes :work
+   recursive request per kid on :work. c/stealing-workers routes :work
    back into its own queue for any free worker to pick up."
   [get-json]
   (step/handler-map
@@ -77,14 +79,14 @@
    `msg/merge` per root and drop that root from state.
 
    Per-tree emit avoids the close-cascade race that buffer-until-close
-   suffers under c/recursive-pool: msg/drain'd :on-data invocations
+   suffers under c/stealing-workers in recursive mode: msg/drain'd :on-data invocations
    absorb the data flow, allowing run-seq's await-quiescent! to fire
-   on transient counter balance before :on-all-closed has run.
+   on transient counter balance before :on-all-input-done has run.
    Per-tree emit keeps each tree's emission tied directly to the
    data-flow events that complete it — counter balance moves with
    the merge, not transiently before it.
 
-   :on-all-closed is a fallback flush for incomplete trees (e.g., a
+   :on-all-input-done is a fallback flush for incomplete trees (e.g., a
    fetch failure leaves some kid forever unexpected). It emits any
    partially-reassembled trees so the caller observes the partial
    result rather than silently losing it."
@@ -115,7 +117,7 @@
                  {:out [(msg/merge ctx parents tree)]}
                  {})])
             [s' msg/drain])))
-      :on-all-closed
+      :on-all-input-done
       (fn [ctx s]
         ;; Fallback flush: emit any roots that never completed (e.g.
         ;; due to a missing kid from a fetch failure).
@@ -144,5 +146,5 @@
   (assert (ifn? get-json) "tree-fetch: :get-json must be a function")
   (step/serial id
                (mk-split-roots)
-               (c/recursive-pool :tree-fetchers k (mk-fetch-node get-json))
+               (c/stealing-workers :tree-fetchers k (mk-fetch-node get-json))
                aggregate))

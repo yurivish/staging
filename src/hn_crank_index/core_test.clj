@@ -97,7 +97,7 @@
                                      :min-count 3})
                    [:tick])
             rows (->> (first (:outputs res))
-                      (group-by :user-id) vals (mapv last))]
+                      (sort-by :user-id))]
         (is (= :completed (:state res)))
         (is (= 1 (count rows)))
         (testing "topics ranked by z-score with javascript on top"
@@ -112,7 +112,7 @@
                  (core/build-flow {:user-ids ["ghost"] :workers 2})
                  [:tick])
           rows (->> (first (:outputs res))
-                    (group-by :user-id) vals (mapv last))]
+                    (sort-by :user-id))]
       (is (= :completed (:state res)))
       (is (= 1 (count rows)))
       (is (= "ghost" (-> rows first :user-id)))

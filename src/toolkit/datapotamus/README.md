@@ -96,13 +96,13 @@ Input to `annotate` is one measurement. Output is one message whose `:data` is `
 
 ### Workers: K copies of one thing
 
-Orthogonal axis. `parallel` asks "who should look at this?" `workers` asks "how many copies of one specialist do I need, to keep up with the load?" Suppose conversion involves a network call and we want a batch of measurements handled in parallel:
+Orthogonal axis. `parallel` asks "who should look at this?" `round-robin-workers` asks "how many copies of one specialist do I need, to keep up with the load?" Suppose conversion involves a network call and we want a batch of measurements handled in parallel:
 
 ```clojure
-(def parallel-convert (c/workers 4 slow-convert-step))
+(def parallel-convert (c/round-robin-workers 4 slow-convert-step))
 ```
 
-`workers` gives you `k` parallel copies of an inner step, behind a round-robin router, with a join at the end that puts everything back in one stream. From the outside a `workers` block has one input port and one output port — it looks like a single operation. Internally there are four parallel procs, and the pool lives under a single `[:scope <id>]` segment in the trace with each worker proc carrying a leaf `:step-id` of `:w0`, `:w1`, `:w2`, `:w3` (the port the router chose for it). Filter the event stream by scope to get "everything in the pool," by `:step-id` to get "everything on one worker" — utilization and latency per worker fall out for free. That is the pattern: parallelism is hidden by default and made observable by stepping down into the decomposition.
+`round-robin-workers` gives you `k` parallel copies of an inner step, behind a round-robin router, with a join at the end that puts everything back in one stream. From the outside a `round-robin-workers` block has one input port and one output port — it looks like a single operation. Internally there are four parallel procs, and the pool lives under a single `[:scope <id>]` segment in the trace with each worker proc carrying a leaf `:step-id` of `:w0`, `:w1`, `:w2`, `:w3` (the port the router chose for it). Filter the event stream by scope to get "everything in the pool," by `:step-id` to get "everything on one worker" — utilization and latency per worker fall out for free. That is the pattern: parallelism is hidden by default and made observable by stepping down into the decomposition.
 
 ### Fan-out / fan-in: the algebra underneath
 
@@ -359,9 +359,9 @@ Read the name literally: `input-done` says "this upstream input has been exhaust
 - "the system is done" — system termination is a separate, emergent property. See "lifecycle" below for quiescence-based termination.
 - "the channel is closed" — channels close on `a/close!`; closure is what *triggers* an input-done envelope, but the two concepts are distinct.
 
-What input-done *does* do: cascade the "input exhausted" signal through the graph. When all of a step's declared input ports have received input-done, its `:on-all-closed` hook fires (the place to flush buffers or emit aggregated output), and an `input-done` envelope is auto-appended to every declared output port. That's how aggregator and end-of-pipeline patterns hook a "drain me" event without caring about the actual termination condition.
+What input-done *does* do: cascade the "input exhausted" signal through the graph. When all of a step's declared input ports have received input-done, its `:on-all-input-done` hook fires (the place to flush buffers or emit aggregated output), and an `input-done` envelope is auto-appended to every declared output port. That's how aggregator and end-of-pipeline patterns hook a "drain me" event without caring about the actual termination condition.
 
-Combinators that gate their own close (e.g. recursive worker pools that need to keep their internal channel open until in-flight work drains) can return `msg/drain` from `:on-all-closed` to suppress the auto-append — symmetric with `msg/drain`'s role in `:on-data`.
+Combinators that gate their own close (e.g. recursive worker pools that need to keep their internal channel open until in-flight work drains) can return `msg/drain` from `:on-all-input-done` to suppress the auto-append — symmetric with `msg/drain`'s role in `:on-data`.
 
 ## Peeling back: the lifecycle
 
@@ -424,7 +424,7 @@ Back to the running example. We want to open the output file once, write each co
       :on-data       (fn [_ctx state line]
                        (.write (:writer state) (str line "\n"))
                        [state {}])
-      :on-all-closed (fn [_ctx state]
+      :on-all-input-done (fn [_ctx state]
                        (.write (:writer state) "# end\n")
                        {})
       :on-stop       (fn [_ctx state]
@@ -435,12 +435,12 @@ Back to the running example. We want to open the output file once, write each co
 - `:on-init` runs once before any messages arrive — allocate resources here.
 - `:on-data` is what `step/step` has been installing for us under the hood.
 - `:on-signal` (default: broadcast on every output port) fires on signal envelopes.
-- `:on-all-closed` runs when every input port has been input-done'd — flush tails here.
+- `:on-all-input-done` runs when every input port has been input-done'd — flush tails here.
 - `:on-stop` runs exactly once when the flow tears down — release resources here.
 
 `step/step` fills in defaults for every slot except `:on-data`, which is why you can usually ignore them. When you find yourself opening files, seeding buffers, or needing non-trivial startup and shutdown, drop to `handler-map`.
 
-*The trade-off.* You lose `step`'s safety nets. If you override `:on-signal` and forget to propagate the signal, it silently vanishes — the framework doesn't know what "handle the signal" means for your proc. Same for `:on-all-closed` and the input-done cascade: if you override it, make sure `input-done` still propagates (or return `msg/drain` if you mean to gate it), or read `run-input-done` in `flow.clj` to see what the default was doing for you. Power, responsibility, and so on.
+*The trade-off.* You lose `step`'s safety nets. If you override `:on-signal` and forget to propagate the signal, it silently vanishes — the framework doesn't know what "handle the signal" means for your proc. Same for `:on-all-input-done` and the input-done cascade: if you override it, make sure `input-done` still propagates (or return `msg/drain` if you mean to gate it), or read `run-input-done` in `flow.clj` to see what the default was doing for you. Power, responsibility, and so on.
 
 ## Escape hatch: explicit token control
 

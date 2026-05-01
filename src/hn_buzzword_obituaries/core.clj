@@ -212,7 +212,7 @@
                  {:out [(msg/child ctx (assoc cell :n (or n 0)))]}))))
 
 (def aggregate-by-term
-  (c/cumulative-by-group
+  (c/batch-by-group
    :term
    (fn [term cells]
      (summarize-term term (:scope (first cells)) cells))))

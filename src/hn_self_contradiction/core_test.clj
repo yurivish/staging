@@ -112,7 +112,7 @@
                                        :filter-threshold 6})
                      [:tick])
               rows (->> (first (:outputs res))
-                        (group-by :user-id) vals (mapv last))]
+                        (sort-by :user-id))]
           (is (= :completed (:state res)))
           (is (= 1 (count rows)))
           (let [r (first rows)]
@@ -137,7 +137,7 @@
                    (core/build-flow {:user-ids ["u"] :workers 2})
                    [:tick])
             rows (->> (first (:outputs res))
-                      (group-by :user-id) vals (mapv last))]
+                      (sort-by :user-id))]
         (is (= :completed (:state res)))
         (is (= 1 (count rows)))
         (is (= [] (-> rows first :pairs)))))))

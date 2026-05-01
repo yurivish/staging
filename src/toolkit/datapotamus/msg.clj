@@ -8,7 +8,7 @@
      :input-done  no  :data, no  :tokens
 
    `:input-done` is a per-port lifecycle signal — \"this external
-   input has been exhausted.\" It triggers `:on-all-closed` (once all
+   input has been exhausted.\" It triggers `:on-all-input-done` (once all
    of a proc's input ports have been input-done'd) and cascades to
    declared outputs. It is NOT a processing barrier: data and signals
    continue to be processed on a port even after that port has been
@@ -18,12 +18,19 @@
    activity\" — is a separate, emergent property detected via counter
    quiescence (`flow/await-quiescent!`).
 
-   Aggregator pattern: because input-done signals \"no new external
-   input,\" not \"no more data of any kind,\" buffer-and-flush-on-close
-   aggregators race with in-flight data. Prefer cumulative-emit-on-data
-   (`combinators/cumulative-by-group`): on each input, emit the current
-   cumulative summary; the last emission per group is the final answer
-   once quiescence signals settling.
+   Aggregator pattern: input-done means \"no new external input,\" not
+   \"no more data of any kind.\" When upstream eager-propagates input-
+   done while in-flight work is still arriving (e.g. a `stealing-workers`
+   in recursive-feedback mode), buffer-and-flush-on-close aggregators
+   race with that in-flight data — use cumulative-emit-on-data
+   (`combinators/cumulative-by-group`) and rely on quiescence to spot
+   the final per-group emission. When upstream waits for all data to
+   drain before propagating input-done (the default for
+   `round-robin-workers` / non-recursive `stealing-workers` chains —
+   the join awaits all K worker output ports before cascading),
+   input-done at the aggregator IS a reliable barrier and
+   `combinators/batch-by-group` is the efficient choice (one
+   `summarize-rows` call per group instead of N).
 
    The absence of :data / :tokens is preserved for structural clarity,
    but `:msg-kind` is the canonical source — dispatch reads the stamp
@@ -191,11 +198,23 @@
     (into #{} (mapcat leaves-of) (::parents m))
     #{m}))
 
+(defn- pre-built-msg?
+  "True iff `v` is a complete message envelope (has :msg-kind) but is
+   NOT a pending msg awaiting synthesis. Used to pass raw envelopes
+   like `(msg/new-input-done)` through handler returns so combinators
+   can emit input-done on a subset of output ports."
+  [v]
+  (and (map? v) (:msg-kind v) (not (pending? v))))
+
 (defn- coerce-data
-  "Replace bare data values with `child` msgs of `parent-msg`."
+  "Replace bare data values with `child` msgs of `parent-msg`. Pre-built
+   message envelopes pass through unchanged."
   [outputs parent-msg]
   (mapv (fn [[port v]]
-          (if (pending? v) [port v] [port (child nil parent-msg v)]))
+          (cond
+            (pending? v)       [port v]
+            (pre-built-msg? v) [port v]
+            :else              [port (child nil parent-msg v)]))
         outputs))
 
 (defn- materialize
@@ -226,11 +245,12 @@
      msgs-per-port : {port [concrete-msg ...]}
      events        : [split-or-merge-event ...]"
   [outputs input-msg step-id]
-  (let [pairs       (coerce-data (flatten-outputs outputs) input-msg)
+  (let [pairs        (coerce-data (flatten-outputs outputs) input-msg)
+        pending-pairs (filterv (fn [[_ v]] (pending? v)) pairs)
         ;; msg-id → #{leaf-msgs}
         leaf-sets   (into {}
                           (map (fn [[_ m]] [(:msg-id m) (leaves-of m)]))
-                          pairs)
+                          pending-pairs)
         ;; leaf-msg → [mid ...] — every msg that reaches this leaf
         referrers   (reduce (fn [acc [mid leaves]]
                               (reduce (fn [a l] (update a l (fnil conj []) mid))
@@ -248,15 +268,21 @@
                               (for [leaf (leaf-sets (:msg-id m))]
                                 (get-in leaf-slices [(:msg-id leaf) (:msg-id m)]))))]
     (reduce
-     (fn [[pm evs] [port pending]]
-       (let [t  (tokens-of pending)
-             m  (materialize pending t)
-             ev {:kind           (if (> (count (::parents pending)) 1) :merge :split)
-                 :step-id        step-id
-                 :msg-id         (:msg-id pending)
-                 :data-id        (:data-id pending)
-                 :parent-msg-ids (:parent-msg-ids pending)
-                 :tokens         t}]
-         [(update pm port (fnil conj []) m) (conj evs ev)]))
+     (fn [[pm evs] [port v]]
+       (if (pending? v)
+         (let [t  (tokens-of v)
+               m  (materialize v t)
+               ev {:kind           (if (> (count (::parents v)) 1) :merge :split)
+                   :step-id        step-id
+                   :msg-id         (:msg-id v)
+                   :data-id        (:data-id v)
+                   :parent-msg-ids (:parent-msg-ids v)
+                   :tokens         t}]
+           [(update pm port (fnil conj []) m) (conj evs ev)])
+         ;; Pre-built envelope (e.g. raw new-input-done): pass through
+         ;; with no token synthesis or split/merge event. The framework's
+         ;; per-msg :send-out trace event still fires when port-map is
+         ;; written to channels, so counters stay balanced.
+         [(update pm port (fnil conj []) v) evs]))
      [{} []]
      pairs)))

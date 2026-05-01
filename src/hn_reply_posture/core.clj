@@ -205,7 +205,7 @@
                    {:out [(msg/child ctx (assoc edge :edge_type et))]})))))
 
 (def aggregate-by-user
-  (c/cumulative-by-group
+  (c/batch-by-group
    :user-id
    (fn [user-id rows]
      (summarize-user user-id (remove :empty? rows)))))

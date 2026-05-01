@@ -232,7 +232,7 @@
                  {:out (msg/children ctx hs)}))))
 
 (def dedup-step
-  (c/cumulative-by-group
+  (c/batch-by-group
    :objectID
    (fn [oid hits]
      (let [hit (first hits)]

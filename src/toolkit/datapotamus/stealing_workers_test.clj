@@ -1,13 +1,10 @@
-(ns toolkit.datapotamus.recursive-pool-test
-  "Tests for c/recursive-pool — coordinator-driven work-stealing pool
-   with optional recursive feedback.
-
-   Compare with stealing-workers' shared-queue design: same conceptual
-   surface (K parallel copies of an inner step competing for items),
-   but implementation is single coordinator + K shims + K worker
-   inners. State transitions in the coordinator are serialized by
-   core.async.flow's per-proc invocation, eliminating the close-cascade
-   race that affected the prior recursive-stealing-workers attempt."
+(ns toolkit.datapotamus.stealing-workers-test
+  "Tests for c/stealing-workers — coordinator-driven work-stealing
+   pool with optional recursive feedback. Single coordinator + K
+   shims + K worker inners; state transitions in the coordinator are
+   serialized by core.async.flow's per-proc invocation, eliminating
+   the close-cascade race that affected the prior shared-queue
+   implementation."
   (:refer-clojure :exclude [run!])
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -26,7 +23,7 @@
   (let [inner (step/handler-map
                {:ports   {:ins {:in ""} :outs {:out ""}}
                 :on-data (fn [ctx _ d] {:out [(msg/child ctx (* d d))]})})
-        wf  (c/recursive-pool :pool 4 inner)
+        wf  (c/stealing-workers :pool 4 inner)
         res (flow/run-seq wf [3])]
     (is (= :completed (:state res)))
     (is (= [[9]] (:outputs res)))))
@@ -35,7 +32,7 @@
   (let [inner (step/handler-map
                {:ports   {:ins {:in ""} :outs {:out ""}}
                 :on-data (fn [ctx _ d] {:out [(msg/child ctx (* d 10))]})})
-        wf  (c/recursive-pool :pool 4 inner)
+        wf  (c/stealing-workers :pool 4 inner)
         res (flow/run-seq wf [1 2 3 4 5])]
     (is (= :completed (:state res)))
     (is (= [[10] [20] [30] [40] [50]] (:outputs res)))))
@@ -44,7 +41,7 @@
   (let [inner (step/handler-map
                {:ports   {:ins {:in ""} :outs {:out ""}}
                 :on-data (fn [ctx _ d] {:out [(msg/child ctx (inc d))]})})
-        wf  (c/recursive-pool :pool 1 inner)
+        wf  (c/stealing-workers :pool 1 inner)
         res (flow/run-seq wf [1 2 3])]
     (is (= :completed (:state res)))
     (is (= [[2] [3] [4]] (:outputs res)))))
@@ -63,7 +60,7 @@
                   :work [(msg/child ctx (dec n))]}))}))
 
 (deftest b1-countdown-from-3-emits-4-outs
-  (let [wf  (c/recursive-pool :pool 4 (countdown-inner))
+  (let [wf  (c/stealing-workers :pool 4 (countdown-inner))
         res (flow/run-seq wf [3])]
     (is (= :completed (:state res)))
     (testing "outputs include all four levels (3 internal + 1 leaf)"
@@ -72,7 +69,7 @@
                outs))))))
 
 (deftest b2-countdown-from-50-completes
-  (let [wf  (c/recursive-pool :pool 4 (countdown-inner))
+  (let [wf  (c/stealing-workers :pool 4 (countdown-inner))
         res (flow/run-seq wf [50])]
     (is (= :completed (:state res)))
     (is (= 51 (count (first (:outputs res)))))))
@@ -97,7 +94,7 @@
                          {:n [:branch d]
                           :kids [(node (dec d)) (node (dec d))]}))]
                (node 3))
-        wf   (c/recursive-pool :pool 4 (branching-inner))
+        wf   (c/stealing-workers :pool 4 (branching-inner))
         res  (flow/run-seq wf [tree])]
     (is (= :completed (:state res)))
     (is (= 15 (count (first (:outputs res)))))))
@@ -110,7 +107,7 @@
                          {:n [:branch d]
                           :kids [(node (dec d)) (node (dec d))]}))]
                (node 2))
-        wf   (c/recursive-pool :pool 1 (branching-inner))
+        wf   (c/stealing-workers :pool 1 (branching-inner))
         res  (flow/run-seq wf [tree])]
     (is (= :completed (:state res)))
     (is (= 7 (count (first (:outputs res)))))))
@@ -122,7 +119,7 @@
                          {:n [:branch d]
                           :kids [(node (dec d)) (node (dec d))]}))]
                (node 2))
-        wf   (c/recursive-pool :pool 2 (branching-inner))
+        wf   (c/stealing-workers :pool 2 (branching-inner))
         res  (flow/run-seq wf [tree])]
     (is (= :completed (:state res)))
     (is (= 7 (count (first (:outputs res)))))))
@@ -134,7 +131,7 @@
                          {:n [:branch d]
                           :kids [(node (dec d)) (node (dec d))]}))]
                (node 3))
-        wf   (c/recursive-pool :pool 2 (branching-inner))
+        wf   (c/stealing-workers :pool 2 (branching-inner))
         res  (flow/run-seq wf [tree])]
     (is (= :completed (:state res)))
     (is (= 15 (count (first (:outputs res)))))))
@@ -144,7 +141,7 @@
 ;; ============================================================================
 
 (deftest d1-three-independent-trees
-  (let [wf  (c/recursive-pool :pool 4 (countdown-inner))
+  (let [wf  (c/stealing-workers :pool 4 (countdown-inner))
         res (flow/run-seq wf [2 4 6])]
     (is (= :completed (:state res)))
     (testing "each input gets the right output count via lineage attribution"
@@ -169,14 +166,14 @@
 
 (defspec p1-output-count-equals-tree-node-count 20
   (prop/for-all [tree gen-tree]
-    (let [wf  (c/recursive-pool :pool 4 (branching-inner))
+    (let [wf  (c/stealing-workers :pool 4 (branching-inner))
           res (flow/run-seq wf [tree])]
       (and (= :completed (:state res))
            (= (count-nodes tree) (count (first (:outputs res))))))))
 
 (defspec p2-multiple-trees-each-correct 15
   (prop/for-all [trees (gen/vector gen-tree 1 4)]
-    (let [wf  (c/recursive-pool :pool 4 (branching-inner))
+    (let [wf  (c/stealing-workers :pool 4 (branching-inner))
           res (flow/run-seq wf (vec trees))]
       (and (= :completed (:state res))
            (= (mapv count-nodes trees)

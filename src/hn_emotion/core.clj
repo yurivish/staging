@@ -205,7 +205,7 @@
                    {:out [(msg/child ctx (merge row c))]})))))
 
 (def aggregate-by-user
-  (c/cumulative-by-group
+  (c/batch-by-group
    :user-id
    (fn [user-id rows]
      (let [real   (remove :empty? rows)

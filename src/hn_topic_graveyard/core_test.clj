@@ -142,7 +142,7 @@
                                      :silent-quarters 4})
                    [:tick])
             rows (->> (first (:outputs res))
-                      (group-by :user-id) vals (mapv last))]
+                      (sort-by :user-id))]
         (is (= :completed (:state res)))
         (is (= 1 (count rows)))
         (testing "perl (peak in 2014, silent in subsequent years) is graveyard"
@@ -159,7 +159,7 @@
                  (core/build-flow {:user-ids ["ghost"] :workers 2})
                  [:tick])
           rows (->> (first (:outputs res))
-                    (group-by :user-id) vals (mapv last))]
+                    (sort-by :user-id))]
       (is (= :completed (:state res)))
       (is (= 1 (count rows)))
       (is (= "ghost" (-> rows first :user-id)))

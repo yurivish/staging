@@ -5,7 +5,7 @@
    summarizes each comment with Claude Haiku, and writes a flat JSON array
    of {:story-id :comment-id :comment-rank :comment :summary}.
 
-   All HTTP and LLM work is parallelized via `c/workers` — each stage's
+   All HTTP and LLM work is parallelized via `c/round-robin-workers` — each stage's
    I/O runs in K distinct procs (one thread each), with per-worker trace
    scopes visible in the event stream.
 
@@ -119,10 +119,10 @@
   (step/serial
    fetch-top-ids
    split-ids
-   (c/workers :story-fetchers   fetch-workers fetch-story)
+   (c/round-robin-workers :story-fetchers   fetch-workers fetch-story)
    split-comments
-   (c/workers :comment-fetchers fetch-workers fetch-comment)
-   (c/workers :summarizers      llm-workers   fake-summarize)))
+   (c/round-robin-workers :comment-fetchers fetch-workers fetch-comment)
+   (c/round-robin-workers :summarizers      llm-workers   fake-summarize)))
 
 (defn- preview [v]
   (let [s (pr-str v)] (if (> (count s) 80) (str (subs s 0 77) "...") s)))

@@ -4,7 +4,7 @@
    and aggregate per user.
 
    Demonstrates Datapotamus aggregator nodes (handler-map with
-   :on-all-closed driving a re-fan-out via msg/merge), two fan-out
+   :on-all-input-done driving a re-fan-out via msg/merge), two fan-out
    generations in one flow, and LLM scoring under stealing-workers
    with structured output via langchain4j tool spec.
 
@@ -206,7 +206,7 @@
      :sample_comments          sample}))
 
 (def aggregate-by-user
-  (c/cumulative-by-group :user-id summarize-user))
+  (c/batch-by-group :user-id summarize-user))
 
 ;; --- Flow -------------------------------------------------------------------
 
@@ -224,7 +224,7 @@
                 (mk-fetch-top-ids n-stories)
                 (tree-fetch/step {:k tree-workers :get-json get-json})
                 (rank-step m-commenters)
-                (c/workers :user-fetchers user-workers (mk-fetch-user-step k-comments))
+                (c/round-robin-workers :user-fetchers user-workers (mk-fetch-user-step k-comments))
                 split-comments
                 (c/stealing-workers :scorers llm-workers score-step)
                 aggregate-by-user)))

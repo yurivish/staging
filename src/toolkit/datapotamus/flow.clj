@@ -101,14 +101,14 @@
      2. Call :on-input-done (ctx s port) — per-port hook, fires once per
         port. Default no-op. Use this when a combinator needs to react
         to a specific upstream's exhaustion before all inputs are closed.
-     3. If all declared ports are now closed, call :on-all-closed
+     3. If all declared ports are now closed, call :on-all-input-done
         (ctx s) — the drain hook.
      4. Auto-append new-input-done on every output port unless
-        :on-all-closed returned msg/drain.
+        :on-all-input-done returned msg/drain.
 
    Both hooks may return port-maps; their outputs are merged (per-port
    concat). msg/drain from :on-input-done suppresses just that hook's
-   contribution. msg/drain from :on-all-closed additionally suppresses
+   contribution. msg/drain from :on-all-input-done additionally suppresses
    the auto-append of new-input-done envelopes onto outputs.
 
    Redundant input-done on an already-closed port is a no-op — matters
@@ -130,7 +130,7 @@
                 ;; All-closed hook: only when this is the last port.
                 [s2 msgs2 all-drain?]
                 (if all-closed?
-                  (let [r ((:on-all-closed hmap) ctx s1)
+                  (let [r ((:on-all-input-done hmap) ctx s1)
                         [s' msgs] (normalize-return s1 r)
                         d? (identical? msgs msg/drain)]
                     [s' (if d? {} msgs) d?])
@@ -560,7 +560,7 @@
            wf        (step/serial stepmap (collector-step ::collector collected))
            handle    (start! wf {:pubsub ps :flow-id fid})]
        (doseq [d coll] (inject! handle {:data d}))
-       (inject! handle {})  ; close boundary input — fires :on-all-closed cascade
+       (inject! handle {})  ; close boundary input — fires :on-all-input-done cascade
        (let [signal    (await-quiescent! handle)
              result    (-> (stop! handle)
                            (assoc :state (if (= :quiescent signal) :completed :failed))

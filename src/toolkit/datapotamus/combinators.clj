@@ -23,11 +23,13 @@
    hand it a composed step as a port's value. A fan-out's id doubles
    as its group name; `fan-in` references the fan-out by that id.
 
-   `workers` and `stealing-workers` are a different axis: K parallel
-   copies of one inner step for stream-level throughput parallelism —
-   unrelated to the scatter-gather pair above. `workers` partitions
-   work statically (round-robin); `stealing-workers` lets workers race
-   for a single shared queue (work-stealing)."
+   `round-robin-workers` and `stealing-workers` are a different axis:
+   K parallel copies of one inner step for stream-level throughput
+   parallelism — unrelated to the scatter-gather pair above.
+   `round-robin-workers` partitions work statically (round-robin);
+   `stealing-workers` lets workers race for a coordinator-owned queue
+   (work-stealing) and optionally supports recursive `:work` feedback
+   when the inner is a handler-map declaring a `:work` output port."
   (:require [clojure.core.async :as a]
             [clojure.core.async.flow :as-alias flow]
             [toolkit.datapotamus.msg :as msg]
@@ -209,20 +211,62 @@
                      (step/output-at fi-id))]
     (step/serial id bracket)))
 
+(defn batch-by-group
+  "Aggregator step. Buffers every input row until input is exhausted,
+   then groups by `key-fn` and emits one summary per group as a
+   `msg/merge` over all parent msgs in that group.
+
+   Returns `msg/drain` from :on-data to suppress the framework's
+   auto-signal on :out — required because we stash the parent ref
+   and derive a single `msg/merge` child later in
+   `:on-all-input-done`. Without drain, the auto-signal would
+   double-count parent tokens (see the deferred-derivation pattern
+   in `msg.clj`).
+
+   - `key-fn`         : (row → group-key)
+   - `summarize-rows` : (group-key, rows → summary-data) — called
+                        once per group on input-done."
+  [key-fn summarize-rows]
+  {:procs
+   {:agg
+    (step/handler-map
+     {:ports   {:ins {:in ""} :outs {:out ""}}
+      :on-init (fn [] {:rows []})
+      :on-data
+      (fn [ctx s row]
+        [(update s :rows conj {:msg (:msg ctx) :row row}) msg/drain])
+      :on-all-input-done
+      (fn [ctx s]
+        (let [grouped (group-by (comp key-fn :row) (:rows s))
+              out-msgs (mapv (fn [[k entries]]
+                               (let [parents (mapv :msg entries)
+                                     rows    (mapv :row entries)]
+                                 (msg/merge ctx parents
+                                            (summarize-rows k rows))))
+                             grouped)]
+          {:out out-msgs}))})}
+   :conns [] :in :agg :out :agg})
+
 (defn cumulative-by-group
   "Aggregator step. On each input, accumulates the row in its
    per-group state and emits a cumulative summary for the row's
    group as a `msg/merge` over all parent msgs seen for that group
    so far.
 
-   Designed for the new input-done semantics: input-done means
-   external input is exhausted, but in-flight work may still arrive
-   afterward. The last emission per group is the final summary, and
-   quiescence (counter balance, surfaced by `flow/await-quiescent!`)
-   is the actual signal that no more emissions are coming. Tests
-   that previously took `(first (:outputs res))` to get one summary
-   per group should take the last per group, e.g.
+   Use this when upstream eager-propagates input-done while
+   in-flight work is still arriving — i.e. downstream of a
+   `stealing-workers` whose inner declares `:work` (recursive
+   feedback mode). The last emission per group is the final
+   summary, and quiescence (counter balance, surfaced by
+   `flow/await-quiescent!`) is the signal that no more emissions
+   are coming. Tests should take the last per group, e.g.
    `(->> outputs (group-by k) vals (mapv last))`.
+
+   For the common case (downstream of plain
+   `round-robin-workers` / `stealing-workers` chains, where
+   input-done is a reliable barrier), prefer `batch-by-group`:
+   it calls `summarize-rows` once per group instead of once per
+   input row.
 
    - `key-fn`         : (row → group-key) — how to group rows.
    - `summarize-rows` : (group-key, rows-so-far → summary-data) — the
@@ -245,7 +289,7 @@
           [s' {:out [(msg/merge ctx parents (summarize-rows k rows))]}]))})}
    :conns [] :in :agg :out :agg})
 
-(defn workers
+(defn round-robin-workers
   "K parallel copies of `inner` behind a round-robin router.
 
    Each worker runs in its own proc (core.async.flow gives each proc one
@@ -258,9 +302,9 @@
 
    `inner` may be a handler-map or a step (any shape; internal sids are
    prefixed per-worker so state is isolated)."
-  ([k inner]     (workers (gensym "workers-") k inner))
+  ([k inner]     (round-robin-workers (gensym "round-robin-workers-") k inner))
   ([id k inner]
-   (assert (pos-int? k) "workers: k must be a positive integer")
+   (assert (pos-int? k) "round-robin-workers: k must be a positive integer")
    (let [ws        (mapv #(keyword (str "w" %)) (range k))
          join-ins  (mapv #(keyword (str "in" %)) (range k))
          route     (fn [ctx s msg-fn]
@@ -282,132 +326,6 @@
                                    [[w :out]    [:join (join-ins i)]]])
                                 (range) ws))
          pool      {:procs procs :conns conns :in :router :out :join}]
-     {:procs {id pool} :conns [] :in id :out id})))
-
-(defn stealing-workers
-  "K parallel copies of `inner` sharing a single bounded queue. Workers
-   race for each item — whichever finishes its previous one pulls the
-   next, so slow items don't gate fast ones and overall wall-clock
-   approaches `total-work / k` rather than `max-item × ceil(n/k)`.
-
-   Best fit: I/O-bound stages with embarrassingly-parallel, homogeneous
-   items where per-item cost varies (LLM calls, HTTP fetches, batch
-   jobs).
-
-   Use `workers` instead when:
-     - Workers hold per-worker state (warmed contexts, primed caches,
-       sticky connections) — work-stealing throws away locality.
-     - Each worker has its own rate-limit bucket (one API key per
-       worker) — a free worker can take consecutive items and blow
-       through one bucket while the others sit idle.
-     - Items must route to a specific worker (consistent hashing,
-       sticky-by-key, ordered-by-key).
-     - Items are sub-millisecond (queue contention dominates).
-
-   Order is NOT preserved. Tag items upstream and re-sort downstream
-   if you need order. Same trace topology as `workers`: each worker
-   runs in its own proc inside a nested step named `id`, so events
-   carry `[:scope id]` and per-worker events add `[:scope wN]` below
-   that. Backpressure arrives via the queue's bound: when every
-   worker is busy and the queue is full, the feeder blocks.
-
-   `inner` may be a handler-map or a step; internal sids are prefixed
-   per-worker so state is isolated.
-
-   Implementation note. K worker procs share a single `core.async`
-   channel via `::flow/in-ports`. The feeder declares K output ports,
-   all merged onto the shared channel via `::flow/out-ports`, so the
-   framework's input-done auto-append (one per declared output) writes
-   K input-done envelopes — one for each worker. Each worker shim takes
-   exactly one input-done (by setting `::flow/input-filter` after its
-   first close, so subsequent input-dones are taken by sibling shims).
-   This gives work-stealing for the data path and a clean per-shim
-   cascade for the close path, all within flow's normal counter
-   accounting."
-  ([k inner]    (stealing-workers (gensym "stealing-workers-") k inner))
-  ([id k inner]
-   (assert (pos-int? k) "stealing-workers: k must be a positive integer")
-   (let [shared-q (a/chan k)
-         q-ports  (mapv #(keyword (str "q" %)) (range k))
-         shim-ids (mapv #(keyword (str "s" %)) (range k))
-         ws       (mapv #(keyword (str "w" %)) (range k))
-         join-ins (mapv #(keyword (str "in" %)) (range k))
-
-         ;; Feeder: 1 input from upstream, K declared outputs all
-         ;; pointing at `shared-q` via the in-ports merge. :on-data
-         ;; emits on :q0 (one write per item). :on-all-closed default
-         ;; → auto-append fires on all K outputs → K input-done envelopes
-         ;; written to `shared-q`, one for each shim to consume.
-         feeder    (step/handler-map
-                    {:ports {:ins {:in ""} :outs (zipmap q-ports (repeat ""))}
-                     :on-init (fn []
-                                {::flow/out-ports
-                                 (zipmap q-ports (repeat shared-q))})
-                     :on-data   (fn [ctx _ _]
-                                  {(first q-ports) [(msg/pass ctx)]})
-                     :on-signal (fn [ctx _]
-                                  {(first q-ports) [(msg/signal ctx)]})})
-
-         ;; Idle sink wired to the feeder's K declared output ports so
-         ;; validate-wired-outs! sees them as connected. The actual writes
-         ;; from the feeder go to `shared-q` via the ::flow/out-ports
-         ;; init-time merge override, so the framework-allocated channel
-         ;; behind these conns is never written to and `:drop` never wakes.
-         drop-sink (step/handler-map
-                    {:ports     {:ins {:in ""} :outs {}}
-                     :on-data   (fn [_ _ _] {})
-                     :on-signal (fn [_ _]   {})})
-
-         ;; Shim: K independent procs all reading from `shared-q` via
-         ;; in-ports. Forwards data/signals to its own :to-inner port,
-         ;; which is wired by :conns to its inner's :in. On :on-all-closed
-         ;; (fired by an input-done arriving on :queue), sets an
-         ;; ::flow/input-filter that excludes :queue so a fast shim
-         ;; can't grab a sibling's input-done envelope on its next iteration.
-         shim      (step/handler-map
-                    {:ports     {:ins {:queue ""} :outs {:to-inner ""}}
-                     :on-init   (fn [] {::flow/in-ports {:queue shared-q}})
-                     :on-data   (fn [ctx _ _]   {:to-inner [(msg/pass ctx)]})
-                     :on-signal (fn [ctx _]     {:to-inner [(msg/signal ctx)]})
-                     :on-all-closed
-                     (fn [_ s]
-                       [(assoc s ::flow/input-filter (fn [cid] (not= cid :queue)))
-                        {}])})
-
-         join      (step/handler-map
-                    {:ports {:ins (zipmap join-ins (repeat ""))
-                             :outs {:out ""}}
-                     :on-data (fn [ctx _ _] {:out [(msg/pass ctx)]})})
-
-         procs     (clojure.core/merge
-                    {:feeder feeder :drop drop-sink :join join}
-                    (zipmap shim-ids (repeat shim))
-                    (zipmap ws (repeat inner)))
-
-         conns     (vec (concat
-                         ;; Stub conns to satisfy validate-wired-outs! for
-                         ;; the K declared feeder outputs. The framework
-                         ;; allocates one channel for `[:drop :in]` and
-                         ;; points each `[:feeder :qN]`'s out-chan at it
-                         ;; (1:1 connect → shared chan); the ::flow/out-ports
-                         ;; merge then overrides each cid's write target to
-                         ;; `shared-q`, so nothing actually flows through
-                         ;; the drop chan.
-                         (mapv (fn [q] [[:feeder q] [:drop :in]]) q-ports)
-                         ;; Shim→inner buffer is 1: a shim must block until
-                         ;; its inner has consumed the previous item before
-                         ;; pulling the next from `shared-q`. Without this
-                         ;; (default buf=10), a fast shim drains many items
-                         ;; from shared-q into inner's queue before inner
-                         ;; finishes one, defeating work-stealing — items
-                         ;; end up statically partitioned among the shims
-                         ;; rather than rebalancing on inner-cost variation.
-                         (mapcat (fn [i s w]
-                                   [[[s :to-inner] [w :in] {:buf-or-n 1}]
-                                    [[w :out]      [:join (join-ins i)]]])
-                                 (range) shim-ids ws)))
-
-         pool      {:procs procs :conns conns :in :feeder :out :join}]
      {:procs {id pool} :conns [] :in id :out id})))
 
 (defn- wrap-worker-multiplexed
@@ -448,63 +366,105 @@
                      ;; can pass it through to :out.
                      [s' {:to-coord [(tag (msg/signal ctx) :result)]}])))))))
 
-(defn recursive-pool
-  "Coordinator-driven work-stealing pool with optional recursive feedback.
+(defn- mk-exit-wrap
+  "Per-worker exit-wrapper proc used when the inner is a step (not a
+   handler-map). Tags every msg arriving on its :in as `::class :result`
+   with `::worker-id wk` and forwards on :to-coord so the coordinator
+   can mark the worker free. Step inners only support the result path
+   (no `:work` recursion); for that, use a handler-map inner which
+   bypasses this wrapper and tags emissions atomically inside its
+   own :on-data — the single-port trick that preserves within-
+   invocation FIFO between :work and :result emissions."
+  [wk]
+  (step/handler-map
+   {:ports {:ins {:in ""} :outs {:to-coord ""}}
+    :on-data   (fn [ctx _ _]
+                 {:to-coord [(-> (msg/pass ctx)
+                                 (assoc ::class :result ::worker-id wk))]})
+    :on-signal (fn [ctx _]
+                 {:to-coord [(-> (msg/signal ctx)
+                                 (assoc ::class :result ::worker-id wk))]})}))
 
-   Same conceptual goal as `stealing-workers` (K parallel copies of an
-   inner step racing for items from a shared queue), but implemented as
-   1 coordinator proc + K shims + K wrapped worker inners. The
-   coordinator owns the queue as state and dispatches to free workers,
-   eliminating the shared-channel race that affects close-cascade
-   interactions.
+(defn stealing-workers
+  "K parallel copies of `inner` racing for items from a shared queue,
+   with optional recursive-feedback. Wall-clock approaches `total-work
+   / k` rather than `max-item × ceil(n/k)` because slow items don't
+   gate fast ones — whichever worker finishes its previous item pulls
+   the next.
 
-   `inner` must be a handler-map. If `inner` declares an output port
-   `:work`, items emitted on `:work` are routed back to the
-   coordinator and queued for dispatch — same conceptual queue
-   external work goes on. From the coordinator's perspective,
-   recursive work and external work are indistinguishable.
+   Best fit: I/O-bound stages with embarrassingly-parallel,
+   homogeneous items where per-item cost varies (LLM calls, HTTP
+   fetches, batch jobs).
 
-   Implementation: each worker wrapper rewrites its return as a single
-   `:to-coord` port emission tagged `::class :work` (recursive) or
-   `::class :result` (forward). Tagging on a single output port
-   guarantees within-invocation FIFO at the coordinator: all of an
-   invocation's :work emissions arrive before its :result, so coord
-   can mark the worker free on :result without any in-flight :work
-   race.
+   Use `round-robin-workers` instead when:
+     - Workers hold per-worker state (warmed contexts, primed
+       caches, sticky connections) — work-stealing throws away
+       locality.
+     - Each worker has its own rate-limit bucket (one API key per
+       worker) — a free worker can take consecutive items and blow
+       through one bucket while the others sit idle.
+     - Items must route to a specific worker (consistent hashing,
+       sticky-by-key, ordered-by-key).
+     - Items are sub-millisecond (queue contention dominates).
 
-   Closure semantics: input-done refers to *external* input being
-   exhausted, not all activity ceasing. When `:in` reports input-done,
-   the coordinator immediately propagates input-done on `:out` (so
-   downstream consumers learn no new external work is coming) and on
-   each `:to-wK` port (so workers know not to expect new dispatches).
-   In-flight worker results that arrive on `:rec` after this point
-   are still forwarded on `:out` as data — downstream consumers
-   should treat input-done as a 'stop generating new external work'
-   marker and rely on quiescence (counter balance) for the actual
-   'pipeline has settled' signal. Aggregators that buffered to
-   `:on-all-closed` in older code should be rewritten to cumulative
-   per-data emission so the last emission is the final summary.
+   Order is NOT preserved. Tag items upstream and re-sort downstream
+   if you need order.
 
-   Trace topology: coordinator proc `:coord`, ext-wrap proc
-   `:ext`, shim procs `:s0`..`:sK-1`, worker procs `:w0`..`:wK-1`.
-   Every dispatch generates a `:send-out` from coordinator and a
-   `:recv` at the corresponding worker (via the shim); every result
-   generates a `:send-out` from the worker and a `:recv` at the
-   coordinator on `:rec` — same observability surface as
-   `stealing-workers`.
+   `inner` may be a handler-map or a step.
 
-   Backward compat with `stealing-workers`'s step-inner support is NOT
-   guaranteed — pass a handler-map only."
-  ([k inner] (recursive-pool (gensym "recursive-pool-") k inner))
+   - Handler-map inner: directly multiplexed onto a single
+     :to-coord port via the worker wrapper. May declare a `:work`
+     output port; items emitted on `:work` are routed back to the
+     coordinator's queue, indistinguishable from external work
+     (recursive-feedback mode).
+
+   - Step inner: kept intact and connected through a per-worker
+     exit-wrapper proc that tags `:out` emissions for the
+     coordinator. Step inners do NOT support `:work` recursion in
+     this implementation (the within-invocation FIFO that makes
+     recursion safe relies on a single tagged output port; with a
+     step inner, :work and :out are separate channels with
+     unspecified ordering). If you need recursion, refactor the
+     inner to a handler-map.
+
+   Implementation: 1 coordinator proc + K shims + K worker inners
+   (+ K exit-wrappers, for step inners). The coordinator owns the
+   queue as state and dispatches to free workers, eliminating the
+   shared-channel race that affected the prior shared-queue design.
+   Each worker emission arrives at the coordinator's :rec port
+   tagged `::class :work` (queue + dispatch) or `::class :result`
+   (mark worker free + forward on :out).
+
+   Closure semantics: when `:in` reports input-done, the coordinator
+   sets an `:ext-done?` flag and waits — once the queue is empty
+   AND no workers are busy (and, in recursive mode, no `:work` is in
+   flight), it writes a fresh input-done envelope to each
+   per-worker dispatch channel (which it owns via
+   `::flow/out-ports`) using `a/put!`. Workers cascade input-done
+   back through their outputs (the framework's auto-append on
+   `:on-all-input-done`), eventually closing all of the coordinator's
+   input ports and triggering the coordinator's own auto-append on
+   `:out`. So input-done at the downstream `:out` port is a
+   reliable barrier — by the time it arrives, every dispatched item
+   has been processed and every recursive `:work` emission has been
+   absorbed into a result. Downstream aggregators can therefore use
+   `batch-by-group` even in recursive-feedback mode.
+
+   Trace topology: coordinator proc `:coord`, ext-wrap proc `:ext`,
+   shim procs `:s0`..`:sK-1`, worker procs `:w0`..`:wK-1` (and, for
+   step inners, exit-wrapper procs `:e0`..`:eK-1`)."
+  ([k inner] (stealing-workers (gensym "stealing-workers-") k inner))
   ([id k inner]
-   (assert (pos-int? k) "recursive-pool: k must be a positive integer")
-   (assert (step/handler-map? inner)
-           "recursive-pool: inner must be a handler-map (use stealing-workers for multi-proc step inners)")
-   (let [to-w-ports  (mapv #(keyword (str "to-w" %)) (range k))
+   (assert (pos-int? k) "stealing-workers: k must be a positive integer")
+   (assert (or (step/handler-map? inner) (step/step? inner))
+           "stealing-workers: inner must be a handler-map or step")
+   (let [step-inner? (step/step? inner)
+         to-w-ports  (mapv #(keyword (str "to-w" %)) (range k))
          shim-ids    (mapv #(keyword (str "s" %)) (range k))
          worker-ids  (mapv #(keyword (str "w" %)) (range k))
+         exit-ids    (when step-inner?
+                       (mapv #(keyword (str "e" %)) (range k)))
          to-w-chans  (vec (repeatedly k #(a/chan 1)))
-         wk->idx     (zipmap worker-ids (range k))
 
          ;; Try-dispatch: pop items from the queue to free workers until
          ;; one of them runs out. Returns [s' port-map] where port-map
@@ -527,6 +487,28 @@
                               (update :busy conj wk))
                           (update dispatch-pm to-port (fnil conj []) dispatched)))))))
 
+         ;; When ext is exhausted AND nothing is pending, emit a fresh
+         ;; input-done envelope on each :to-wK port. The framework
+         ;; passes pre-built :input-done envelopes through synthesis
+         ;; unchanged (see msg/coerce-data) and writes them to the
+         ;; per-worker dispatch channels via the ::flow/out-ports
+         ;; override. Workers receive input-done on their :queue
+         ;; port (through the shim's ::flow/in-ports merge) and run
+         ;; the framework's normal input-done lifecycle — auto-append
+         ;; cascades input-done downstream through :to-coord →
+         ;; coord :rec. Once :rec reports input-done, coord's default
+         ;; :on-all-input-done auto-appends input-done on :out.
+         shutdown-pm
+         (fn [s]
+           (if (and (:ext-done? s)
+                    (empty? (:queue s))
+                    (empty? (:busy s))
+                    (not (:shutdown-sent? s)))
+             [(assoc s :shutdown-sent? true)
+              (zipmap to-w-ports
+                      (repeat [(msg/new-input-done)]))]
+             [s {}]))
+
          coord
          (step/handler-map
           {:ports {:ins  {:in "" :rec ""}
@@ -535,7 +517,8 @@
            :on-init       (fn []
                             {::flow/out-ports (zipmap to-w-ports to-w-chans)
                              :queue           clojure.lang.PersistentQueue/EMPTY
-                             :busy            #{}})
+                             :busy            #{}
+                             :ext-done?       false})
            :on-data
            (fn [ctx s _d]
              (let [in-port (:in-port ctx)
@@ -561,8 +544,9 @@
                  (let [wk     (::worker-id msg)
                        s'     (update s :busy disj wk)
                        forward {:out [(msg/pass ctx)]}
-                       [s'' dispatch] (try-dispatch s')]
-                   [s'' (clojure.core/merge forward dispatch)])
+                       [s'' dispatch]    (try-dispatch s')
+                       [s''' shutdown]   (shutdown-pm s'')]
+                   [s''' (clojure.core/merge forward dispatch shutdown)])
 
                  :else
                  ;; Untagged msg on :rec — shouldn't happen with the
@@ -572,24 +556,12 @@
            (fn [ctx s]
              [s {:out [(msg/signal ctx)]}])
            :on-input-done
-           ;; Input-done = external input exhausted. Propagate through
-           ;; the system immediately (don't wait for in-flight workers
-           ;; to drain): emit input-done on :out so downstream knows
-           ;; "no new external work coming" and on each :to-wK so
-           ;; workers know not to expect new dispatches. Quiescence
-           ;; (counter balance) is the actual indicator that the
-           ;; whole flow has settled.
            (fn [_ s port]
              (case port
-               :in  [s (clojure.core/merge
-                        {:out [(msg/new-input-done)]}
-                        (zipmap to-w-ports
-                                (repeat [(msg/new-input-done)])))]
-               :rec [s {}]))
-           ;; Suppress framework auto-append: we already emitted
-           ;; input-done on every output port from :on-input-done.
-           :on-all-closed
-           (fn [_ _] msg/drain)})
+               :in  (let [s'             (assoc s :ext-done? true)
+                          [s'' shutdown] (shutdown-pm s')]
+                      [s'' shutdown])
+               :rec [s {}]))})
 
          ;; ext-wrap: passes external work through to coord :in
          ;; verbatim (no tagging needed since :in identifies it).
@@ -617,12 +589,18 @@
                      :on-data   (fn [_ _ _] {})
                      :on-signal (fn [_ _]   {})})
 
-         worker-procs (mapv (fn [wk] (wrap-worker-multiplexed inner wk))
-                            worker-ids)
+         worker-procs (if step-inner?
+                        (vec (repeat k inner))
+                        (mapv (fn [wk] (wrap-worker-multiplexed inner wk))
+                              worker-ids))
 
-         procs (-> {:coord coord :ext ext-wrap :drop drop-sink}
-                   (into (map vector shim-ids shims))
-                   (into (map vector worker-ids worker-procs)))
+         exit-procs (when step-inner?
+                      (mapv mk-exit-wrap worker-ids))
+
+         procs (cond-> {:coord coord :ext ext-wrap :drop drop-sink}
+                 true        (into (map vector shim-ids shims))
+                 true        (into (map vector worker-ids worker-procs))
+                 step-inner? (into (map vector exit-ids exit-procs)))
 
          conns (vec (concat
                      ;; ext-wrap → coord :in (external work entry)
@@ -634,16 +612,23 @@
                      ;; shim can't drain to-w-chan ahead of inner.
                      (mapcat (fn [s w] [[[s :to-inner] [w :in] {:buf-or-n 1}]])
                              shim-ids worker-ids)
-                     ;; Worker (wrapped) :to-coord → coord :rec.
-                     ;; Each invocation can emit up to (1 result + N
-                     ;; work) msgs at once on this single port; buffer
-                     ;; needs to hold at least the largest possible
-                     ;; emission burst so the worker doesn't block on
-                     ;; chan-write while the coord is still busy on
-                     ;; another worker's stream. 1024 is overkill but
-                     ;; cheap.
-                     (mapv (fn [w] [[w :to-coord] [:coord :rec] {:buf-or-n 1024}])
-                           worker-ids)))
+                     ;; Worker → coord :rec routing differs by inner type.
+                     ;; Handler-map workers: their wrapped :to-coord
+                     ;; port carries tagged emissions; one channel per
+                     ;; worker into coord :rec. Buffer 1024 holds bursts
+                     ;; (1 result + N work msgs) so the worker doesn't
+                     ;; block on chan-write while coord is still busy.
+                     ;; Step workers: their unmodified :out goes to a
+                     ;; per-worker exit-wrapper, which then writes
+                     ;; tagged :result msgs onto :to-coord → coord :rec.
+                     (if step-inner?
+                       (concat
+                        (mapcat (fn [w e] [[[w :out] [e :in]]])
+                                worker-ids exit-ids)
+                        (mapv (fn [e] [[e :to-coord] [:coord :rec] {:buf-or-n 1024}])
+                              exit-ids))
+                       (mapv (fn [w] [[w :to-coord] [:coord :rec] {:buf-or-n 1024}])
+                             worker-ids))))
 
          pool {:procs procs :conns conns :in :ext :out :coord}]
      {:procs {id pool} :conns [] :in id :out id})))

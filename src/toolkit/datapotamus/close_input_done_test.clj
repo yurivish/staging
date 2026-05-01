@@ -534,14 +534,14 @@
           (is (= 1 (count sends))))
         (finally (stop! h))))))
 
-(deftest f3-on-all-closed-throwing-is-recorded-as-failure
+(deftest f3-on-all-input-done-throwing-is-recorded-as-failure
   (testing "user handler exception on cascade emits :failure, not :success"
     (let [c (a/chan)
           hmap (step/handler-map
                 {:ports         {:ins {:in ""} :outs {:out ""}}
                  :on-init       (fn [] {::caf/in-ports {:in c}})
                  :on-data       (fn [_ s _] [s {}])
-                 :on-all-closed (fn [_ _] (throw (ex-info "boom" {})))})
+                 :on-all-input-done (fn [_ _] (throw (ex-info "boom" {})))})
           h (start-with-events
              {:procs {:probe hmap :sink (absorbing-sink)}
               :conns [[[:probe :out] [:sink :in]]]
@@ -632,23 +632,23 @@
     (equivalent? pre)))
 
 ;; ============================================================================
-;; J. msg/drain in :on-all-closed
+;; J. msg/drain in :on-all-input-done
 ;;
 ;; Symmetric extension of msg/drain's existing role in run-data-or-signal:
-;; if :on-all-closed returns msg/drain (or [s' msg/drain]), the framework
+;; if :on-all-input-done returns msg/drain (or [s' msg/drain]), the framework
 ;; suppresses the auto-append of new-done envelopes onto every declared
 ;; output port. Combinators that gate their own close (closing an internal
 ;; channel only after in-flight tokens drain) use this to keep extra dones
 ;; out of their internal channel.
 ;; ============================================================================
 
-(defn- drained-on-all-closed-probe
+(defn- drained-on-all-input-done-probe
   [test-chan return-shape]
   (let [hmap (step/handler-map
               {:ports         {:ins {:in ""} :outs {:out ""}}
                :on-init       (fn [] {::caf/in-ports {:in test-chan}})
                :on-data       (fn [ctx _s _d] {:out [(msg/pass ctx)]})
-               :on-all-closed (case return-shape
+               :on-all-input-done (case return-shape
                                 :bare      (fn [_ _] msg/drain)
                                 :as-vector (fn [_ s] [s msg/drain]))})]
     {:procs {:probe hmap :sink (absorbing-sink)}
@@ -656,9 +656,9 @@
      :in    :probe
      :out   :sink}))
 
-(deftest j1-on-all-closed-msg-drain-suppresses-auto-append-bare
+(deftest j1-on-all-input-done-msg-drain-suppresses-auto-append-bare
   (let [c (a/chan)
-        h (start-with-events (drained-on-all-closed-probe c :bare))]
+        h (start-with-events (drained-on-all-input-done-probe c :bare))]
     (try
       (a/>!! c (msg/new-msg :first))
       (success-of h :probe 1)
@@ -676,9 +676,9 @@
               "drain should suppress the :done auto-append")))
       (finally (stop! h)))))
 
-(deftest j2-on-all-closed-msg-drain-as-vector-also-suppresses
+(deftest j2-on-all-input-done-msg-drain-as-vector-also-suppresses
   (let [c (a/chan)
-        h (start-with-events (drained-on-all-closed-probe c :as-vector))]
+        h (start-with-events (drained-on-all-input-done-probe c :as-vector))]
     (try
       (a/close! c)
       (success-of h :probe 1)
@@ -696,7 +696,7 @@
                 {:ports         {:ins {:in ""} :outs {:out ""}}
                  :on-init       (fn [] {::caf/in-ports {:in c}})
                  :on-data       (fn [ctx _ _] {:out [(msg/pass ctx)]})
-                 :on-all-closed (fn [_ s] [s {}])})
+                 :on-all-input-done (fn [_ s] [s {}])})
           h    (start-with-events
                 {:procs {:probe hmap :sink (absorbing-sink)}
                  :conns [[[:probe :out] [:sink :in]]]
@@ -714,7 +714,7 @@
 ;; K. :on-input-done per-port hook
 ;;
 ;; Fires once per declared input port when input-done first arrives on that
-;; port — strictly before :on-all-closed (which only fires when ALL ports
+;; port — strictly before :on-all-input-done (which only fires when ALL ports
 ;; have closed). Lets combinators react to upstream-exhaustion of one
 ;; specific port without waiting for the full all-closed cascade. This is
 ;; the structural fix for cyclic combinators that need to know "external
@@ -749,8 +749,8 @@
           (is (= [:a :b] @seen)))
         (finally (stop! h))))))
 
-(deftest k2-on-input-done-output-merges-with-on-all-closed
-  (testing "outputs from :on-input-done are merged with :on-all-closed
+(deftest k2-on-input-done-output-merges-with-on-all-input-done
+  (testing "outputs from :on-input-done are merged with :on-all-input-done
             outputs into the proc's port-map"
     (let [ca (a/chan)
           cb (a/chan)
@@ -760,7 +760,7 @@
                   :on-data       (fn [_ s _] [s {}])
                   :on-input-done (fn [_ s port]
                                    [s {:out [[:per-port port]]}])
-                  :on-all-closed (fn [_ s]
+                  :on-all-input-done (fn [_ s]
                                    [s {:out [:all-closed]}])})
           h (start-with-events
              {:procs {:probe hmap :sink (absorbing-sink)}
