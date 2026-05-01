@@ -23,7 +23,8 @@
    redef it without spawning real subprocesses."
   (:require [clojure.data.json :as json]
             [clojure.java.shell :as shell]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [toolkit.llm.cache :as cache]))
 
 (def ^:dynamic *invoke-claude*
   "Run claude with argv and stdin; return `{:exit n :out s :err s}`.
@@ -63,19 +64,10 @@
                     (string? so) (extract-json-object so)))
             (extract-json-object (:result wrap)))))))
 
-(defn call-json!
-  "Run `claude -p` with a system prompt, user message, and JSON schema.
-   Returns the parsed JSON response as a map, or `nil` on transport /
-   auth / parse failure.
-
-   Opts:
-     :system     system prompt (default \"\")
-     :user       user message (default \"\"), passed via stdin
-     :schema     JSON Schema map for the response (required)
-     :model      model name (default \"claude-haiku-4-5\")
-     :keys       :kebab (default — `is_mind_change` → `:is-mind-change`)
-                 or :snake (`:is_mind_change` left as-is)
-     :extra-argv extra CLI flags as a vector (advanced)"
+(defn- call-json-uncached!
+  "The bare subprocess call: build argv, invoke `claude -p`, parse the
+   wrapper, normalize keys. Returns the parsed map or nil on
+   failure. No caching."
   [{:keys [system user schema model keys extra-argv]
     :or   {system "" user "" model "claude-haiku-4-5" keys :kebab}}]
   (let [argv (vec
@@ -92,3 +84,52 @@
       (case keys
         :kebab (->kw-map parsed)
         :snake parsed))))
+
+(defn- cache-key-string
+  "Stable key derivation for cache lookups. Inputs joined with
+   `\\n--\\n` separators (the `podcast.llm/cache-key` convention).
+   `keys` (`:kebab` vs `:snake`) is included because identical raw
+   responses produce different return shapes; mixing them would serve
+   a kebab map to a `:keys :snake` caller."
+  [{:keys [cache-tag system user schema model keys extra-argv]
+    :or   {system "" user "" model "claude-haiku-4-5" keys :kebab}}]
+  (str "claude-cli"      "\n--\n"
+       (or cache-tag "default") "\n--\n"
+       model             "\n--\n"
+       (name keys)       "\n--\n"
+       system            "\n--\n"
+       user              "\n--\n"
+       (pr-str schema)   "\n--\n"
+       (pr-str (or extra-argv []))))
+
+(defn call-json!
+  "Run `claude -p` with a system prompt, user message, and JSON schema.
+   Returns the parsed JSON response as a map, or `nil` on transport /
+   auth / parse failure.
+
+   Caching is on by default (LMDB at `cache/llm/lmdb` via
+   `toolkit.llm.cache`). Identical opts are served from cache without
+   spawning a subprocess. Pass `:bypass? true` to skip the cache for
+   one call (the result is also not written to the cache, so a
+   subsequent default call still misses).
+
+   Opts:
+     :system     system prompt (default \"\")
+     :user       user message (default \"\"), passed via stdin
+     :schema     JSON Schema map for the response (required)
+     :model      model name (default \"claude-haiku-4-5\")
+     :keys       :kebab (default — `is_mind_change` → `:is-mind-change`)
+                 or :snake (`:is_mind_change` left as-is)
+     :bypass?    bool — default false; set true to skip the cache
+                 entirely for this one call (no read, no write).
+     :cache-tag  string — namespace within the shared cache (default
+                 \"default\"). Different tags hash to different keys
+                 so identical (system, user, schema, model) tuples
+                 from different pipelines don't share entries unless
+                 you want them to.
+     :extra-argv extra CLI flags as a vector (advanced)"
+  [{:keys [bypass?] :as opts}]
+  (if bypass?
+    (call-json-uncached! opts)
+    (:value (cache/through! (cache-key-string opts)
+                            (fn [] (call-json-uncached! opts))))))

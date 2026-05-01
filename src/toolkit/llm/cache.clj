@@ -105,3 +105,43 @@
     (let [v (produce)]
       (put-json! cache key-bytes v)
       {:value v :cache :miss})))
+
+;; --- shared default store + simple bypass arg --------------------------------
+;;
+;; All LLM callers (`toolkit.llm.cli`, `podcast.llm`, `podcast.cc`, …)
+;; route through the same on-disk LMDB at `cache/llm/lmdb`. One env, one
+;; shutdown hook, one accessor. Caching is on by default. Public-facing
+;; transports take an explicit `:bypass? true` opt to skip the cache for
+;; one call. There is no global toggle: disabling caching everywhere is
+;; just `rm -rf cache/llm/lmdb` followed by re-running.
+
+(def ^:private default-store-delay
+  (delay
+    (let [c (open "cache/llm/lmdb")]
+      (.addShutdownHook (Runtime/getRuntime)
+                        (Thread. ^Runnable (fn [] (close c))))
+      c)))
+
+(defn default-store
+  "The shared LLM cache. All transports route through this."
+  []
+  @default-store-delay)
+
+(defn through!
+  "Run `(produce)` through the default cache. Returns
+   `{:value v :cache :hit|:miss}`. On hit, `v` is the cached JSON
+   value and `produce` is not called. Nil results from `produce` are
+   NOT cached so transient errors retry on the next run.
+
+   `key-string` is what gets SHA-256'd into the LMDB key. Callers
+   stitch their inputs with `\\n--\\n` separators (the
+   `podcast.llm/cache-key` convention)."
+  [^String key-string produce]
+  (let [k (key-bytes-of key-string)
+        s (default-store)]
+    (if-let [v (get-json s k)]
+      {:value v :cache :hit}
+      (let [v (produce)]
+        (when v
+          (put-json! s k v))
+        {:value v :cache :miss}))))

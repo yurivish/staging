@@ -82,15 +82,11 @@
         (catch Throwable _ nil)))))
 
 ;; ============================================================================
-;; 2. Cache. Separate LMDB store from podcast.llm so they never collide.
+;; 2. Cache. Routes through `toolkit.llm.cache/through!` against the
+;;    shared default store at `cache/llm/lmdb`. The previous private
+;;    store at `cache/podcast-cc/lmdb` is no longer written; existing
+;;    entries can be `rm -rf`'d once the migration is confirmed.
 ;; ============================================================================
-
-(def ^:private cache-store
-  (delay
-    (let [c (cache/open "cache/podcast-cc/lmdb")]
-      (.addShutdownHook (Runtime/getRuntime)
-                        (Thread. ^Runnable #(cache/close c)))
-      c)))
 
 (defn- sha256-hex [^String s]
   (let [b (.digest (MessageDigest/getInstance "SHA-256")
@@ -99,15 +95,14 @@
     (doseq [^Byte by b] (.append sb (format "%02x" (bit-and by 0xff))))
     (str sb)))
 
-(defn- cc-cache-key [call-tag opts inputs-hash]
-  (cache/key-bytes-of
-    (str (name call-tag) "\n--\n"
-         (or (:model opts) "")                  "\n--\n"
-         (or (:append-system-prompt opts) "")   "\n--\n"
-         (pr-str (or (:json-schema opts) {}))   "\n--\n"
-         (pr-str (or (:allowed-tools opts) [])) "\n--\n"
-         inputs-hash                            "\n--\n"
-         (or (:prompt opts) ""))))
+(defn- cc-cache-key-string [call-tag opts inputs-hash]
+  (str (name call-tag) "\n--\n"
+       (or (:model opts) "")                  "\n--\n"
+       (or (:append-system-prompt opts) "")   "\n--\n"
+       (pr-str (or (:json-schema opts) {}))   "\n--\n"
+       (pr-str (or (:allowed-tools opts) [])) "\n--\n"
+       inputs-hash                            "\n--\n"
+       (or (:prompt opts) "")))
 
 (defn cached-cc-run!
   "Run cc-step/run! with LMDB caching keyed on call-tag + opts + inputs-hash.
@@ -115,7 +110,11 @@
    scout it's the transcript hash; for extractor it's transcript+registry
    so that a re-run with a different registry.json doesn't hit a stale
    miss from the previous registry. Returns the result map with
-   `:cache :hit|:miss` added.
+   `:cache :hit|:miss|:disabled` added.
+
+   Caching routes through the shared `toolkit.llm.cache` default store.
+   Bypass with `(binding [cache/*disabled* true] ...)` for force-rerun
+   semantics.
 
    `ctx` (optional) is a handler context that cc-step/run! uses to publish
    :run-started/:run-finished and (when :stream? true) per-turn events on
@@ -123,9 +122,9 @@
    subprocess to observe."
   ([call-tag inputs-hash opts] (cached-cc-run! call-tag inputs-hash opts nil))
   ([call-tag inputs-hash opts ctx]
-   (let [k (cc-cache-key call-tag opts inputs-hash)
+   (let [k (cc-cache-key-string call-tag opts inputs-hash)
          {:keys [value cache]}
-         (cache/compute! @cache-store k
+         (cache/through! k
                          (fn [] (cc-step/run! (assoc opts :ctx ctx))))]
      (assoc value :cache cache))))
 

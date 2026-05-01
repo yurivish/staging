@@ -84,18 +84,16 @@
       :polarity "neutral" :emotion "calm" :rationale "..."}]}})
 
 (defn- with-cache-disabled
-  "Run f with podcast-cc cache opened in a fresh temp dir so prior runs
-   don't pollute. cc.clj's @cache-store delay is captured at load time, so
-   we redef it for the duration of f."
+  "Run f against a fresh temp-dir cache so prior runs don't pollute.
+   cc.clj now routes through `toolkit.llm.cache/through!` against the
+   shared default store; we redirect that accessor for the duration."
   [f]
   (let [tmp  (str (java.io.File/createTempFile "cc-cache-" ""))
         _    (io/delete-file tmp true)
-        c    (cache/open tmp)
-        orig @#'cc/cache-store]
-    (try
-      (with-redefs [cc/cache-store (delay c)]
-        (f))
-      (finally (cache/close c)))))
+        c    (cache/open tmp)]
+    (with-redefs [cache/default-store (constantly c)]
+      (try (f)
+           (finally (cache/close c))))))
 
 ;; --- prepare-agent-cwd! ------------------------------------------------------
 

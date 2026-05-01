@@ -43,14 +43,12 @@
 
 ;; ============================================================================
 ;; 1. Cache + provider client.
+;;
+;; Caching now routes through `toolkit.llm.cache/through!` against the
+;; shared default store at `cache/llm/lmdb`. The previous private store
+;; at `cache/podcast/lmdb` is no longer written; existing entries there
+;; can be `rm -rf`'d once the migration is confirmed.
 ;; ============================================================================
-
-(def ^:private cache-store
-  (delay
-    (let [c (cache/open "cache/podcast/lmdb")]
-      (.addShutdownHook (Runtime/getRuntime)
-                        (Thread. ^Runnable (fn [] (cache/close c))))
-      c)))
 
 (def ^:private anthropic-client
   (delay (anthropic/client (str/trim (slurp "claude.key")))))
@@ -103,15 +101,17 @@
 ;; goes through whichever value is selected here.
 (def ^:private llm-client local-client)
 
-(defn- cache-key [stage model system content-parts schema]
-  ;; Per-task cache isolation is implicit: `system` (prompt) and `schema`
-  ;; differ between tasks at every stage, so the same chunk under sentiment
-  ;; vs. conspiracy hashes to distinct keys without `:task` in the mix. If a
-  ;; future change deduplicates prompts/schemas across tasks, add :task here.
-  (cache/key-bytes-of (str (name stage) "\n--\n" model
-                           "\n--\n" system
-                           "\n--\n" (pr-str content-parts)
-                           "\n--\n" (pr-str schema))))
+(defn- cache-key-string
+  "Stable key for `cache/through!`. Per-task cache isolation is
+   implicit: `system` (prompt) and `schema` differ between tasks at
+   every stage, so the same chunk under sentiment vs. conspiracy
+   hashes to distinct keys without `:task` in the mix. If a future
+   change deduplicates prompts/schemas across tasks, add :task here."
+  [stage model system content-parts schema]
+  (str (name stage) "\n--\n" model
+       "\n--\n" system
+       "\n--\n" (pr-str content-parts)
+       "\n--\n" (pr-str schema)))
 
 ;; ============================================================================
 ;; 2. Structured-output call. Provider is fixed to Anthropic for now;
@@ -144,12 +144,14 @@
 
 (defn cached-chat!
   "Cache-wrapped structured chat call. Returns
-   `{:value <parsed-json> :tokens n :cache :hit|:miss}`. On a hit,
-   `:tokens` is reported as 0 so per-run sums reflect actual spend."
+   `{:value <parsed-json> :tokens n :cache :hit|:miss|:disabled}`. On
+   a hit, `:tokens` is reported as 0 so per-run sums reflect actual
+   spend. Caching routes through the shared `toolkit.llm.cache`
+   default store; bypass with `(binding [cache/*disabled* true] ...)`."
   [stage {:keys [model] :as model-cfg} system content-parts schema]
-  (let [k (cache-key stage model system content-parts schema)
+  (let [k     (cache-key-string stage model system content-parts schema)
         {:keys [value cache]}
-        (cache/compute! @cache-store k
+        (cache/through! k
                         (fn []
                           (chat-structured!* model-cfg system content-parts schema)))]
     {:value  (:value value)
