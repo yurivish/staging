@@ -14,6 +14,7 @@
             [clojure.string :as str]
             [clojure.walk :as walk]
             [toolkit.datapotamus.obs.viz :as viz]
+            [toolkit.datapotamus.shape :as shape]
             [toolkit.datapotamus.step :as step]))
 
 ;; Every pipeline whose stepmap we can build without real domain inputs.
@@ -82,11 +83,13 @@
     {:name (str ns) :skipped true :reason skip}
     (try
       (let [stepmap (build-stepmap spec)
-            {:keys [nodes edges]} (step/topology stepmap)]
+            topo    (step/topology stepmap)
+            {:keys [nodes edges]} topo]
         {:name        (str ns)
          :description (or (ns-docstring ns) "TODO: add ns docstring")
          :topology    {:nodes (enrich-leaves stepmap nodes) :edges edges}
-         :tree        (viz/from-step stepmap)})
+         :tree        (viz/from-step stepmap)
+         :shape       (shape/decompose topo)})
       (catch Throwable t
         {:name (str ns) :error (.getMessage t)}))))
 

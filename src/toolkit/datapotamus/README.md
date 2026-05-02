@@ -527,19 +527,30 @@ self-explanatory.
 ## TODO: custom visualizer over the static-topology dump
 
 `clojure -X:export-pipelines` (see `/work/src/datapotamus_export.clj`)
-walks every pipeline namespace in the repo, calls its `build-flow`, and
-writes a single JSON file at `dev/pipelines.json` (gitignored). Each
-entry has `:name`, `:description` (the ns-form docstring),
-`:topology` (`step/topology` flat `{:nodes :edges}` with port specs
-spliced onto each leaf), and `:tree` (`viz/from-step` hierarchy).
+walks every pipeline namespace in the repo, calls its `build-flow`,
+and writes a single JSON file at `dev/pipelines.json` (gitignored).
+Each entry has:
+
+- `:name`, `:description` (ns-form docstring)
+- `:topology` — flat `{:nodes :edges}` from `step/topology`, with
+  port specs spliced onto each leaf
+- `:tree` — `viz/from-step` combinator hierarchy
+- `:shape` — recursive shape classification from
+  `toolkit.datapotamus.shape/decompose`. Each container carries one
+  of: `:chain` (with `:order`), `:scatter-gather` (with `:branches`),
+  `:cycle` (with `:members` and `:back-edges`), `:prime` (irreducible
+  fallback), or `:empty`. Cycles inside chains/scatter-gathers nest as
+  `{:kind :cycle ...}` records inside `:order`/`:branches`, so the
+  same vocabulary covers any directed graph at any level.
 
 The point is to iterate on a custom web visualization separately from
 the live `obs/viz` event-sourced viewer — `obs/viz` shows runtime
-queue depth and busy counts on a topology; this dump is the static
-structural picture, ready to feed a frontend layout/diagram tool.
-Build a small renderer (D3? Datastar component? something else?) that
-consumes the JSON and lets us play with layouts before deciding what
-to integrate.
+queue depth and busy counts; this dump is the static structural
+picture. The `:shape` field gives the renderer enough hints to draw
+chains as horizontal strips, scatter-gathers as fans, and only fall
+back to generic graph layout for `:prime` regions. Build a small
+renderer (D3? Datastar component? something else?) that consumes the
+JSON and plays with layouts before we decide what to integrate.
 
 ---
 
