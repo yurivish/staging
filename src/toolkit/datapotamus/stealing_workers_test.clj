@@ -137,6 +137,87 @@
     (is (= 15 (count (first (:outputs res)))))))
 
 ;; ============================================================================
+;; C2. Recursive — work-only intermediate iterations (no :out emit)
+;;     Regression: prior to the :ack class, an inner that emitted only
+;;     :work on intermediate iterations would leave the worker marked
+;;     :busy in the coord and the pool would deadlock once K consecutive
+;;     work-only invocations occurred.
+;; ============================================================================
+
+(defn- countdown-work-only-inner
+  "Same arithmetic as countdown-inner, but emits NOTHING on :out for
+   intermediate steps — only the final leaf goes to :out. Each
+   intermediate iteration emits only :work."
+  []
+  (step/handler-map
+   {:ports {:ins {:in ""} :outs {:out "" :work ""}}
+    :on-data (fn [ctx _s n]
+               (if (zero? n)
+                 {:out [(msg/child ctx [:leaf n])]}
+                 {:work [(msg/child ctx (dec n))]}))}))
+
+(deftest c2a-work-only-countdown-no-deadlock
+  ;; Single input, K=1 so deadlock is most likely if the worker isn't freed.
+  (let [wf  (c/stealing-workers :pool 1 (countdown-work-only-inner))
+        res (flow/run-seq wf [3])]
+    (is (= :completed (:state res)))
+    (is (= [[[:leaf 0]]] (:outputs res)))))
+
+(deftest c2b-work-only-many-inputs-deeper
+  ;; Three inputs, K=2 — even with multiple workers all in work-only mode,
+  ;; the pool must drain.
+  (let [wf  (c/stealing-workers :pool 2 (countdown-work-only-inner))
+        res (flow/run-seq wf [5 7 4])]
+    (is (= :completed (:state res)))
+    (testing "each input contributes exactly its leaf"
+      (is (= [[[:leaf 0]] [[:leaf 0]] [[:leaf 0]]] (:outputs res))))))
+
+(deftest c2c-work-only-deeper-than-pool
+  ;; Recursion depth (10) > K (3). If the worker freeing was tied to :out,
+  ;; depth-3 in is enough to wedge all workers — this verifies it isn't.
+  (let [wf  (c/stealing-workers :pool 3 (countdown-work-only-inner))
+        res (flow/run-seq wf [10])]
+    (is (= :completed (:state res)))
+    (is (= [[[:leaf 0]]] (:outputs res)))))
+
+;; ============================================================================
+;; C3. Empty inner return (drop) — the wrapper synthesizes a tagged :ack
+;;     signal so the worker is freed AND tokens flow forward. Without this,
+;;     the framework's auto-signal would carry tokens but never free the
+;;     worker, deadlocking the pool once K consecutive drops occur.
+;; ============================================================================
+
+(defn- mixed-inner
+  "Emits :out for ids in `out-ids`, returns `{}` (drop) for the rest."
+  [out-ids]
+  (step/handler-map
+   {:ports {:ins {:in ""} :outs {:out ""}}
+    :on-data (fn [ctx _ id]
+               (if (out-ids id)
+                 {:out [(msg/child ctx (str "OUT:" id))]}
+                 {}))}))
+
+(deftest c3a-all-drops-completes
+  (let [wf  (c/stealing-workers :pool 2 (mixed-inner #{}))
+        res (flow/run-seq wf [1 2 3 4 5])]
+    (is (= :completed (:state res)))
+    (is (= [[] [] [] [] []] (:outputs res)))))
+
+(deftest c3b-last-only-out-K1
+  ;; K=1 forces strict ordering — earlier drops can't be processed in
+  ;; parallel. Each drop must free the worker for the next.
+  (let [wf  (c/stealing-workers :pool 1 (mixed-inner #{5}))
+        res (flow/run-seq wf [1 2 3 4 5])]
+    (is (= :completed (:state res)))
+    (is (= [[] [] [] [] ["OUT:5"]] (:outputs res)))))
+
+(deftest c3c-mixed-K2
+  (let [wf  (c/stealing-workers :pool 2 (mixed-inner #{1 3 5}))
+        res (flow/run-seq wf [1 2 3 4 5])]
+    (is (= :completed (:state res)))
+    (is (= [["OUT:1"] [] ["OUT:3"] [] ["OUT:5"]] (:outputs res)))))
+
+;; ============================================================================
 ;; D. Multiple roots
 ;; ============================================================================
 

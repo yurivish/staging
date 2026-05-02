@@ -331,11 +331,23 @@
 (defn- wrap-worker-multiplexed
   "Wrap an inner handler-map so its :on-data return is rewritten to a
    single output port `:to-coord`, with messages tagged `::class
-   :work` (recursive) or `::class :result` (forward) and a
-   `::worker-id` pointer. Order is preserved: work msgs come first,
-   then the result msg — within one invocation, all work emissions
-   land at the coordinator before the result, so coord can mark the
-   worker free without racing in-flight :work."
+   :work` (recursive) or `::class :result` (forward + free worker)
+   and a `::worker-id` pointer. Order is preserved: work msgs come
+   first, then the result msg — within one invocation, all work
+   emissions land at the coordinator before the terminator, so coord
+   can mark the worker free without racing in-flight :work.
+
+   Terminator invariant: every invocation must produce a terminator
+   so the coord frees the worker. The wrapper guarantees this by:
+     1. If `:out` is non-empty: each :result IS a terminator.
+     2. Else if `:work` is non-empty: flag the LAST work msg with
+        `::terminates? true` so coord frees on its arrival. Avoids
+        minting a synthetic msg that would split the parent's tokens.
+     3. Else (empty / drop case): synthesize a `:result`-tagged
+        signal so the coord frees the worker AND a signal flows
+        downstream to keep XOR-balance for the parent's tokens (the
+        same role the framework's auto-signal would play, but routed
+        through the worker-pool's tag protocol)."
   [inner worker-id]
   (let [user-on-data   (:on-data inner)
         user-on-signal (or (:on-signal inner) (fn [_ s] [s {}]))
@@ -353,7 +365,23 @@
                      [s' msg/drain]
                      (let [work-msgs (mapv #(tag % :work)   (get pm :work []))
                            out-msgs  (mapv #(tag % :result) (get pm :out []))
-                           combined  (vec (concat work-msgs out-msgs))]
+                           work-msgs (if (and (seq work-msgs)
+                                              (empty? out-msgs))
+                                       (update work-msgs
+                                               (dec (count work-msgs))
+                                               assoc ::terminates? true)
+                                       work-msgs)
+                           ;; Empty case (inner returned {} or equivalent):
+                           ;; emit a tagged :ack signal so the coord's
+                           ;; :on-signal can free the worker AND forward
+                           ;; a plain signal downstream for token
+                           ;; balance. Without this, the framework's
+                           ;; auto-signal would carry the tokens forward
+                           ;; but never free the worker → deadlock.
+                           ack       (when (and (empty? work-msgs)
+                                                (empty? out-msgs))
+                                       [(tag (msg/signal ctx) :ack)])
+                           combined  (vec (concat work-msgs out-msgs ack))]
                        [s' {:to-coord combined}])))))
         (assoc :on-signal
                (fn [ctx s]
@@ -434,6 +462,18 @@
    Each worker emission arrives at the coordinator's :rec port
    tagged `::class :work` (queue + dispatch) or `::class :result`
    (mark worker free + forward on :out).
+
+   Worker-free invariants (every invocation must produce exactly one
+   terminator so the coord frees the worker):
+     - :out non-empty → each :result is a terminator (existing path).
+     - :work-only      → wrapper flags the LAST work msg with
+                         `::terminates? true`; coord frees on it.
+     - empty / drop    → wrapper emits a tagged :ack signal; coord's
+                         :on-signal frees the worker AND forwards a
+                         plain signal downstream for token balance.
+   Without these, work-only or empty invocations would deadlock the
+   pool — the worker would stay in `:busy` forever and the K-th
+   consecutive non-:result invocation would stall dispatch.
 
    Closure semantics: when `:in` reports input-done, the coordinator
    sets an `:ext-done?` flag and waits — once the queue is empty
@@ -534,11 +574,18 @@
                  ;; Worker emission on :rec — dispatch on ::class.
                  ;; Worker wrapper guarantees within-invocation FIFO:
                  ;; all :work msgs arrive before the invocation's
-                 ;; :result, so marking busy disj on :result is safe.
+                 ;; terminator (a :result OR the LAST :work flagged
+                 ;; ::terminates? for work-only invocations), so
+                 ;; freeing the worker on either is safe.
                  (= (::class msg) :work)
-                 (let [s'             (update s :queue conj msg)
-                       [s'' dispatch] (try-dispatch s')]
-                   [s'' dispatch])
+                 (let [s'             (cond-> (update s :queue conj msg)
+                                        (::terminates? msg)
+                                        (update :busy disj (::worker-id msg)))
+                       [s'' dispatch]  (try-dispatch s')
+                       [s''' shutdown] (if (::terminates? msg)
+                                         (shutdown-pm s'')
+                                         [s'' {}])]
+                   [s''' (clojure.core/merge dispatch shutdown)])
 
                  (= (::class msg) :result)
                  (let [wk     (::worker-id msg)
@@ -554,7 +601,18 @@
                  [s {:out [(msg/pass ctx)]}])))
            :on-signal
            (fn [ctx s]
-             [s {:out [(msg/signal ctx)]}])
+             (let [msg (:msg ctx)]
+               (if (= (::class msg) :ack)
+                 ;; Worker-pool internal: a worker emitted nothing, so the
+                 ;; wrapper sent us a tagged :ack signal. Free the worker;
+                 ;; forward a plain signal for token-balance.
+                 (let [wk     (::worker-id msg)
+                       s'     (update s :busy disj wk)
+                       [s'' dispatch]  (try-dispatch s')
+                       [s''' shutdown] (shutdown-pm s'')]
+                   [s''' (clojure.core/merge {:out [(msg/signal ctx)]}
+                                             dispatch shutdown)])
+                 [s {:out [(msg/signal ctx)]}])))
            :on-input-done
            (fn [_ s port]
              (case port
@@ -616,8 +674,9 @@
                      ;; Handler-map workers: their wrapped :to-coord
                      ;; port carries tagged emissions; one channel per
                      ;; worker into coord :rec. Buffer 1024 holds bursts
-                     ;; (1 result + N work msgs) so the worker doesn't
-                     ;; block on chan-write while coord is still busy.
+                     ;; (1 terminator — :result or :ack — plus N work
+                     ;; msgs) so the worker doesn't block on chan-write
+                     ;; while coord is still busy.
                      ;; Step workers: their unmodified :out goes to a
                      ;; per-worker exit-wrapper, which then writes
                      ;; tagged :result msgs onto :to-coord → coord :rec.
@@ -632,3 +691,355 @@
 
          pool {:procs procs :conns conns :in :ext :out :coord}]
      {:procs {id pool} :conns [] :in id :out id})))
+
+;; ============================================================================
+;; Rate limiting — shared token bucket gate
+;; ============================================================================
+
+(defn- acquire-blocking!
+  "Atomically refill and consume one token from `bucket` (an atom over
+   `{:tokens d :last-ms long}`), blocking until a token is available.
+   Refill rate `rps` (tokens/sec); cap at `burst`."
+  [bucket rps burst]
+  (loop []
+    (let [now      (System/currentTimeMillis)
+          old      @bucket
+          elapsed  (max 0.0 (/ (- now (:last-ms old)) 1000.0))
+          refill   (* elapsed (double rps))
+          tokens'  (min (+ (:tokens old) refill) (double burst))]
+      (if (>= tokens' 1.0)
+        (if (compare-and-set! bucket old {:tokens (- tokens' 1.0) :last-ms now})
+          true
+          (recur))
+        (let [need     (- 1.0 tokens')
+              wait-ms  (max 1 (long (Math/ceil (* (/ need (double rps)) 1000))))]
+          (Thread/sleep wait-ms)
+          (recur))))))
+
+(defn rate-limited
+  "Passthrough step that paces messages through a shared token bucket.
+   Insert it before a worker pool to bound the pool's effective RPS
+   regardless of K. Each `:on-data` invocation consumes 1 token; the
+   step blocks (Thread/sleep) until a token is available.
+
+   Because all dispatched messages flow through the single proc that
+   owns this step, the bucket is naturally shared — there is no
+   per-worker subdivision. This is the missing piece called out at
+   `combinators.clj:403`: a free worker can no longer 'blow through'
+   its own bucket because there are no per-worker buckets.
+
+   Config:
+     :rps   — refill rate in tokens per second
+     :burst — bucket capacity (max immediate tokens)
+     :id    — sid for this step (default :rate-limited)
+
+   Usage:
+     (step/serial
+       upstream
+       (c/rate-limited {:rps 10 :burst 5})
+       (c/stealing-workers k expensive-step))"
+  [{:keys [rps burst id]
+    :or   {id :rate-limited}}]
+  (assert (pos? rps) "rate-limited: :rps must be positive")
+  (assert (pos? burst) "rate-limited: :burst must be positive")
+  (let [bucket (atom {:tokens (double burst)
+                      :last-ms (System/currentTimeMillis)})]
+    (step/step id nil
+               (fn [ctx _s _d]
+                 (acquire-blocking! bucket rps burst)
+                 {:out [(msg/pass ctx)]}))))
+
+;; ============================================================================
+;; Keyed join — N-input batch join on a per-port key
+;; ============================================================================
+
+(defn join-by-key
+  "Step that joins N input ports by a per-port key extractor. Each
+   incoming msg is buffered under (port, key); on `:on-all-input-done`
+   (after every declared input port has reported done), `on-match` is
+   called once per key with the per-port items.
+
+   Config:
+     :ports        — vector of input port keywords (required, ≥2)
+     :key-fns      — `{port-kw key-fn}` per declared port (required)
+     :on-match     — `(key port→items → summary)` where `port→items` is
+                     a map `{port-kw [item ...]}` (required)
+     :require-all? — when true, only emit keys whose `port→items` has a
+                     non-empty entry under EVERY declared port. Default
+                     false: emit any key seen on any port.
+     :id           — sid for the step (default :join-by-key)
+
+   Note: this is a *batch* join — emissions happen on input-done, not
+   per-arrival. Use `cumulative-by-group` for incremental aggregation
+   over a single input."
+  [{:keys [ports key-fns on-match require-all? id]
+    :or   {require-all? false id :join-by-key}}]
+  (assert (and (sequential? ports) (>= (count ports) 2))
+          "join-by-key: :ports must be a vector of ≥2 keywords")
+  (assert (every? (set ports) (keys key-fns))
+          "join-by-key: :key-fns keys must match :ports")
+  (assert on-match "join-by-key: :on-match is required")
+  {:in id :out id :conns []
+   :procs
+   {id
+    (step/handler-map
+     {:ports   {:ins  (zipmap ports (repeat ""))
+                :outs {:out ""}}
+      :on-init (fn []
+                 {;; {key {port [{:msg :row} ...]}}
+                  :buf {}
+                  ;; Set of ports we've seen :on-input-done on.
+                  :done-ports #{}})
+      :on-data
+      (fn [ctx s row]
+        (let [port  (:in-port ctx)
+              k     ((get key-fns port) row)]
+          [(update-in s [:buf k port] (fnil conj [])
+                      {:msg (:msg ctx) :row row})
+           msg/drain]))
+      :on-input-done
+      (fn [_ctx s port]
+        (let [done' (conj (:done-ports s) port)
+              s'    (assoc s :done-ports done')]
+          [s' {}]))
+      :on-all-input-done
+      (fn [ctx s]
+        (let [emissions
+              (vec
+               (for [[k port-map] (sort-by key (:buf s))
+                     :let [items   (into {}
+                                         (for [p ports]
+                                           [p (mapv :row (get port-map p []))]))
+                           parents (mapv :msg
+                                         (mapcat val port-map))]
+                     :when (or (not require-all?)
+                               (every? #(seq (get items %)) ports))]
+                 (msg/merge ctx parents (on-match k items))))]
+          {:out emissions}))})}})
+
+;; ============================================================================
+;; Time windows — tumbling and sliding, watermark-driven
+;; ============================================================================
+
+(defn- window-start-of
+  "Floor a time-ms to its tumbling-window-start: `(quot t size) * size`."
+  [t size-ms]
+  (* (long size-ms) (long (quot (long t) (long size-ms)))))
+
+(defn tumbling-window
+  "Step that aggregates messages into non-overlapping fixed-size windows
+   keyed by an event-time extracted from the data. A window
+   `[start, start+size-ms)` closes when the watermark (max event-time
+   seen) reaches `start+size-ms`; on close, `on-window` is called as
+   `(on-window start end items)` and its return is emitted as one
+   message on `:out`. Empty windows are not emitted.
+
+   Late events (event-time falls into an already-closed window) are
+   passed to `on-late` (default: drop silently). On `:on-all-input-done`,
+   any remaining open windows are flushed in start-time order.
+
+   Config:
+     :size-ms   — window length in ms (required, positive)
+     :time-fn   — `(data → ms)` extractor (default: `:time`)
+     :on-window — `(start end items → summary)` (required)
+     :on-late   — `(item → any)` side-effect on a late drop (default
+                  no-op); items are also dropped from the windowed flow
+     :id        — sid for the step (default :tumbling-window)"
+  [{:keys [size-ms time-fn on-window on-late id]
+    :or   {time-fn :time on-late (fn [_]) id :tumbling-window}}]
+  (assert (and (number? size-ms) (pos? size-ms))
+          "tumbling-window: :size-ms must be positive")
+  (assert on-window "tumbling-window: :on-window is required")
+  (let [size (long size-ms)
+        emit-closed
+        (fn [ctx s wm]
+          (let [closed-keys (sort (filter #(<= (+ % size) wm) (keys (:windows s))))
+                emissions  (mapv (fn [start]
+                                   (msg/child ctx
+                                              (on-window start (+ start size)
+                                                         (get-in s [:windows start]))))
+                                 closed-keys)
+                s'         (update s :windows
+                                   (fn [ws] (apply dissoc ws closed-keys)))]
+            [s' emissions]))]
+    {:procs
+     {id
+      (step/handler-map
+       {:ports   {:ins {:in ""} :outs {:out ""}}
+        :on-init (fn [] {:windows {} :watermark Long/MIN_VALUE})
+        :on-data
+        (fn [ctx s d]
+          (let [t     (long (time-fn d))
+                start (window-start-of t size)
+                wm    (max (:watermark s) t)
+                ;; Late if the event's window is already closed.
+                late? (<= (+ start size) (:watermark s))]
+            (if late?
+              (do (on-late d) {})
+              (let [s1            (-> s
+                                      (assoc :watermark wm)
+                                      (update-in [:windows start] (fnil conj []) d))
+                    [s2 emissions] (emit-closed ctx s1 wm)]
+                [s2 (if (seq emissions) {:out emissions} {})]))))
+        :on-all-input-done
+        (fn [ctx s]
+          (let [open-keys (sort (keys (:windows s)))]
+            {:out (mapv (fn [start]
+                          (msg/child ctx
+                                     (on-window start (+ start size)
+                                                (get-in s [:windows start]))))
+                        open-keys)}))})}
+     :conns [] :in id :out id}))
+
+(defn sliding-window
+  "Step that aggregates messages into overlapping fixed-size windows
+   keyed by event-time. Window starts step every `:slide-ms`; each
+   window covers `[start, start+size-ms)`. An event at time `t`
+   belongs to every window containing `t`. A window closes when the
+   watermark (max event-time seen) reaches its end; on close,
+   `on-window` is called.
+
+   Config (same shape as `tumbling-window`):
+     :size-ms   — window length in ms (required, positive)
+     :slide-ms  — distance between consecutive window starts (required,
+                  positive; for tumbling behavior, set equal to size-ms)
+     :time-fn   — `(data → ms)` extractor (default: `:time`)
+     :on-window — `(start end items → summary)` (required)
+     :on-late   — `(item → any)` side-effect on late events
+     :id        — sid for the step (default :sliding-window)"
+  [{:keys [size-ms slide-ms time-fn on-window on-late id]
+    :or   {time-fn :time on-late (fn [_]) id :sliding-window}}]
+  (assert (and (number? size-ms) (pos? size-ms))
+          "sliding-window: :size-ms must be positive")
+  (assert (and (number? slide-ms) (pos? slide-ms))
+          "sliding-window: :slide-ms must be positive")
+  (assert on-window "sliding-window: :on-window is required")
+  (let [size  (long size-ms)
+        slide (long slide-ms)
+        ;; All window-starts that contain time t.
+        starts-of
+        (fn [t]
+          ;; First start whose end > t: smallest k*slide such that k*slide+size > t.
+          ;; → k > (t - size) / slide → k_min = floor((t - size) / slide) + 1.
+          ;; Last start that contains t: k*slide <= t → k_max = floor(t / slide).
+          (let [k-max (long (quot (long t) slide))
+                k-min (inc (long (quot (- (long t) size) slide)))
+                k-min (max 0 k-min)]
+            (mapv #(* slide ^long %) (range k-min (inc k-max)))))
+        emit-closed
+        (fn [ctx s wm]
+          (let [closed-keys (sort (filter #(<= (+ ^long % size) wm)
+                                          (keys (:windows s))))
+                emissions  (mapv (fn [start]
+                                   (msg/child ctx
+                                              (on-window start (+ start size)
+                                                         (get-in s [:windows start]))))
+                                 closed-keys)
+                s'         (update s :windows
+                                   (fn [ws] (apply dissoc ws closed-keys)))]
+            [s' emissions]))]
+    {:procs
+     {id
+      (step/handler-map
+       {:ports   {:ins {:in ""} :outs {:out ""}}
+        :on-init (fn [] {:windows {} :watermark Long/MIN_VALUE})
+        :on-data
+        (fn [ctx s d]
+          (let [t       (long (time-fn d))
+                wm      (max (:watermark s) t)
+                ;; Each candidate-start: late if its window already closed.
+                cands   (starts-of t)
+                live    (remove #(<= (+ ^long % size) (:watermark s)) cands)]
+            (if (and (empty? live) (seq cands))
+              ;; All candidate windows are closed → fully late.
+              (do (on-late d) {})
+              (let [s1 (reduce (fn [acc start]
+                                 (update-in acc [:windows start] (fnil conj []) d))
+                               (assoc s :watermark wm)
+                               live)
+                    [s2 emissions] (emit-closed ctx s1 wm)]
+                [s2 (if (seq emissions) {:out emissions} {})]))))
+        :on-all-input-done
+        (fn [ctx s]
+          (let [open-keys (sort (keys (:windows s)))]
+            {:out (mapv (fn [start]
+                          (msg/child ctx
+                                     (on-window start (+ start size)
+                                                (get-in s [:windows start]))))
+                        open-keys)}))})}
+     :conns [] :in id :out id}))
+
+;; ============================================================================
+;; Backoff / retry — exponential with jitter, dead-letter on exhaustion
+;; ============================================================================
+
+(defn with-backoff
+  "Wrap an inner handler-map's `:on-data` so that exceptions matching
+   `:retry?` trigger exponential-backoff retry. After `:max-retries`
+   exhausted (or a non-matching exception), the failure is emitted on
+   the inner's `:out` port as a dead-letter map tagged
+   `:dead-letter? true` (instead of propagating the exception).
+
+   Single-port design: dead-letters share the inner's `:out` port,
+   marked by the `:dead-letter?` flag. Downstream code routes by
+   inspecting the flag — keeps the handler-map shape compatible with
+   any consumer that expects a single output port (including
+   `c/stealing-workers`). For a clean two-port routing, follow
+   `with-backoff` with a `(step/step :route …)` that splits on the
+   flag.
+
+   Backoff schedule: attempt N (0-indexed) sleeps for
+   `min(base-ms * 2^N, max-ms) * (1 + jitter * rand)`.
+
+   Config:
+     :max-retries — number of retries after the first attempt (default 3,
+                    so up to 4 attempts total)
+     :base-ms     — initial backoff (default 100)
+     :max-ms      — cap on a single sleep (default 30000)
+     :jitter      — multiplier for additive randomness in [0, jitter * cap]
+                    (default 0.5; pass 0 for deterministic timing)
+     :retry?      — predicate on the thrown Throwable. Default: retry
+                    everything. To retry on a flag in `ex-data`, pass
+                    e.g. `(comp :transient ex-data)`.
+
+   Dead-letter payload shape (on `:out`):
+     {:dead-letter? true :error string :ex-data map-or-nil
+      :data input-data :attempts n}"
+  [{:keys [max-retries base-ms max-ms jitter retry? id]
+    :or   {max-retries 3 base-ms 100 max-ms 30000 jitter 0.5
+           retry? (constantly true) id :backoff}}
+   inner]
+  (assert (>= max-retries 0) "with-backoff: :max-retries must be non-negative")
+  (assert (pos? base-ms) "with-backoff: :base-ms must be positive")
+  (assert (step/handler-map? inner)
+          "with-backoff: inner must be a handler-map")
+  (let [user-on-data (:on-data inner)
+        wrapped
+        (assoc inner :on-data
+               (fn [ctx s d]
+                 (loop [attempt 0]
+                   (let [outcome (try {:ok (user-on-data ctx s d)}
+                                      (catch Throwable t {:err t}))]
+                     (cond
+                       (contains? outcome :ok)
+                       (:ok outcome)
+
+                       (and (retry? (:err outcome))
+                            (< attempt max-retries))
+                       (let [base (* (double base-ms) (Math/pow 2 attempt))
+                             cap  (min base (double max-ms))
+                             jit  (if (zero? jitter) 0.0 (* cap jitter (rand)))
+                             wait (max 1 (long (+ cap jit)))]
+                         (Thread/sleep wait)
+                         (recur (inc attempt)))
+
+                       :else
+                       (let [err (:err outcome)]
+                         {:out
+                          [(msg/child ctx
+                                      {:dead-letter? true
+                                       :error        (.getMessage err)
+                                       :ex-data      (ex-data err)
+                                       :data         d
+                                       :attempts     (inc attempt)})]}))))))]
+    {:procs {id wrapped} :conns [] :in id :out id}))

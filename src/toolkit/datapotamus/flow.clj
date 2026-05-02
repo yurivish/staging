@@ -577,3 +577,68 @@
                                (vec (repeat (count coll) []))
                                @collected)]
          (assoc result :outputs outputs))))))
+
+;; ============================================================================
+;; run-polling! — driver for unbounded polling sources
+;; ============================================================================
+
+(defn run-polling!
+  "Drive `stepmap` from a virtual-thread polling loop. Use for
+   unbounded streaming sources (e.g. an HN maxitem firehose) where
+   `run-seq` doesn't apply because there is no natural close.
+
+   Wraps the step in an output collector, starts the flow, and
+   spawns a virtual thread that ticks `poll-fn` every
+   `:interval-ms`. Each tick:
+     `(poll-fn state) → [state' values]`
+   yields zero or more values that are `inject!`ed into the flow's
+   `:in`. `state` defaults to `:init-state`.
+
+   Returns `{:handle h :collected a :stop! (fn [] ...)}`:
+     :handle    — the flow handle (for inject!, counters, pubsub)
+     :collected — atom of `{:msg-id :data}` maps, one per :out emission
+                  (live updates as the flow processes)
+     :stop!     — idempotent halt — terminates the polling thread,
+                  then `stop!`s the flow.
+
+   Options:
+     :interval-ms — poll cadence (default 1000)
+     :poll-fn     — required, see above
+     :init-state  — initial poll state (default {})
+     :max-ticks   — optional cap on poll iterations (test-only)
+     :pubsub      — external pubsub (default new)"
+  [stepmap {:keys [interval-ms poll-fn init-state max-ticks pubsub]
+            :or   {interval-ms 1000 init-state {}}}]
+  (assert poll-fn "run-polling!: :poll-fn is required")
+  (let [collected (atom [])
+        wf        (step/serial stepmap (collector-step ::collector collected))
+        handle    (start! wf (cond-> {} pubsub (assoc :pubsub pubsub)))
+        stop?     (atom false)
+        ticks     (atom 0)
+        thread
+        (Thread/startVirtualThread
+         (fn []
+           (try
+             (loop [s init-state]
+               (when (and (not @stop?)
+                          (or (nil? max-ticks) (< @ticks max-ticks)))
+                 (let [[s' values] (poll-fn s)]
+                   (swap! ticks inc)
+                   (doseq [v values]
+                     (when-not @stop?
+                       (inject! handle {:data v})))
+                   (when (and (not @stop?)
+                              (or (nil? max-ticks) (< @ticks max-ticks)))
+                     (Thread/sleep (long interval-ms)))
+                   (recur s'))))
+             (catch InterruptedException _ nil))))]
+    {:handle    handle
+     :collected collected
+     :ticks     ticks
+     :thread    thread
+     :stop!     (let [stopped? (atom false)]
+                  (fn []
+                    (when (compare-and-set! stopped? false true)
+                      (reset! stop? true)
+                      (.interrupt ^Thread thread)
+                      (stop! handle))))}))
