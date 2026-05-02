@@ -524,6 +524,23 @@ fine to alias that one as `:as c` and read the prefix as "combinator." For
 files that mix two or more, the four-letter aliases keep the call sites
 self-explanatory.
 
+## TODO: custom visualizer over the static-topology dump
+
+`clojure -X:export-pipelines` (see `/work/src/datapotamus_export.clj`)
+walks every pipeline namespace in the repo, calls its `build-flow`, and
+writes a single JSON file at `dev/pipelines.json` (gitignored). Each
+entry has `:name`, `:description` (the ns-form docstring),
+`:topology` (`step/topology` flat `{:nodes :edges}` with port specs
+spliced onto each leaf), and `:tree` (`viz/from-step` hierarchy).
+
+The point is to iterate on a custom web visualization separately from
+the live `obs/viz` event-sourced viewer — `obs/viz` shows runtime
+queue depth and busy counts on a topology; this dump is the static
+structural picture, ready to feed a frontend layout/diagram tool.
+Build a small renderer (D3? Datastar component? something else?) that
+consumes the JSON and lets us play with layouts before deciding what
+to integrate.
+
 ---
 
 **One thing to take with you.** A flow is a value. The invariant is a conservation law. Coordination patterns are balance-sheets. Write the state machines; let synthesis balance the tokens; let the runtime move the bytes. You govern from the algebra; the channels do as they're told.

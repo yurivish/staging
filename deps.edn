@@ -155,6 +155,13 @@
   :duckdb {:jvm-opts  ["--add-opens=java.base/java.nio=ALL-UNNAMED"
                        "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
            :main-opts ["-m" "toolkit.duckdb"]}
+  ;; Snapshot every Datapotamus pipeline to a single JSON file for
+  ;; offline visualization iteration.
+  ;;   clojure -X:export-pipelines
+  ;;   clojure -X:export-pipelines :out '"/tmp/pipelines.json"'
+  :export-pipelines {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                                "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
+                     :exec-fn  datapotamus-export/dump}
   ;; Check for outdated deps: clojure -M:outdated
   ;; Upgrade in place:        clojure -M:outdated --upgrade
   :outdated {:deps      {com.github.liquidz/antq {:mvn/version "RELEASE"}

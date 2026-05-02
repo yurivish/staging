@@ -122,6 +122,14 @@
       (step/input-at  :explode)
       (step/output-at :workers)))
 
+(defn build-flow
+  "Representative graph for topology export. Stages A and C share this
+   shape — they differ only in the worker handler body. Worker config
+   is nil because it is only closed over by the handler, never invoked
+   at construction."
+  []
+  (build-graph (stage-a-worker nil) 4))
+
 (defn- sort-by-input-order
   "Stealing-workers don't preserve order. Restore (task, chunk-id) input
    order on the way out so downstream globals (e.g. mention_indices into

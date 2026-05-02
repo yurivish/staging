@@ -304,13 +304,17 @@
 ;;    edge, and designate the public input/output boundaries.
 ;; ============================================================================
 
-(defn- build-flow [config]
-  (-> (step/beside (controller config)
-                   (pipeline-step config))
-      (step/input-at  [:controller :seed])
-      (step/connect   [:controller :to-pipeline] [:pipeline :in])
-      (step/connect   [:pipeline :out]           [:controller :round-results])
-      (step/output-at [:controller :final])))
+(declare default-config)
+
+(defn build-flow
+  ([] (build-flow default-config))
+  ([config]
+   (-> (step/beside (controller config)
+                    (pipeline-step config))
+       (step/input-at  [:controller :seed])
+       (step/connect   [:controller :to-pipeline] [:pipeline :in])
+       (step/connect   [:pipeline :out]           [:controller :round-results])
+       (step/output-at [:controller :final]))))
 
 ;; ============================================================================
 ;; 6. Public entry — settings template + `run-distill!`.

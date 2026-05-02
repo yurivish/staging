@@ -93,13 +93,17 @@
                  :seed       [{:round 0 :history [] :prompt data} {:to-ivw [data]}]
                  :ivw-result (handle-round config state data)))))
 
-(defn- build-flow [config]
-  (-> (step/beside (optimizer config)
-                   (interview (:models config)))
-      (step/input-at  [:optimizer :seed])
-      (step/connect   [:optimizer :to-ivw] [:interview :in])
-      (step/connect   [:interview :out]    [:optimizer :ivw-result])
-      (step/output-at [:optimizer :final])))
+(declare example-config)
+
+(defn build-flow
+  ([] (build-flow example-config))
+  ([config]
+   (-> (step/beside (optimizer config)
+                    (interview (:models config)))
+       (step/input-at  [:optimizer :seed])
+       (step/connect   [:optimizer :to-ivw] [:interview :in])
+       (step/connect   [:interview :out]    [:optimizer :ivw-result])
+       (step/output-at [:optimizer :final]))))
 
 ;; --- Console rendering -----------------------------------------------------
 

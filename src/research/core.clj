@@ -87,8 +87,13 @@
 ;; the chain against the singleton input vector and returns
 ;; `:outputs` aligned to it — `[[result-map]]` here, since one input
 ;; produced one output.
+(defn build-flow
+  "Static pipeline: build-request → research → extract."
+  []
+  (step/serial build-request research extract))
+
 (defn find-feeds! [term]
-  (let [flow   (step/serial build-request research extract)
+  (let [flow   (build-flow)
         res    (flow/run-seq flow [term])
         result (ffirst (:outputs res))]
     (when (= :completed (:state res))

@@ -223,7 +223,7 @@
   ([{:keys [terms since until bucket scope workers]
      :or   {terms   default-terms
             since   "2010-01-01"
-            until   nil
+            until   (LocalDate/now ZoneOffset/UTC)
             bucket  :month
             scope   :both
             workers 16}
