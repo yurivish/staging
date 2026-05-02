@@ -11,7 +11,7 @@
      clojure -M -e \"(require 'hn-tempo.core) (hn-tempo.core/run-once! \\\"tempo.json\\\" {:trace? true})\""
   (:require [clojure.data.json :as json]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.core :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.step :as step]
             [toolkit.hn.tree-fetch :as tree-fetch]

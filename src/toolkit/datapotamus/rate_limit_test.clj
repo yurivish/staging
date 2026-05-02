@@ -1,5 +1,5 @@
 (ns toolkit.datapotamus.rate-limit-test
-  "Tests for `c/rate-limited` — a passthrough step that paces messages
+  "Tests for `ct/rate-limited` — a passthrough step that paces messages
    through a shared token bucket. Insert it before a worker pool to
    bound the pool's effective RPS regardless of K."
   (:refer-clojure :exclude [run!])
@@ -7,7 +7,8 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.control :as ct]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.step :as step]))
 
@@ -17,7 +18,7 @@
 
 (deftest a1-passthrough-preserves-data
   (let [wf  (step/serial
-             (c/rate-limited {:rps 1000 :burst 1000})
+             (ct/rate-limited {:rps 1000 :burst 1000})
              (step/step :double (fn [n] (* 2 n))))
         res (flow/run-seq wf [1 2 3 4 5])]
     (is (= :completed (:state res)))
@@ -31,7 +32,7 @@
   ;; rps=10, burst=20, sending 20 msgs should complete in < 200ms
   ;; (bucket starts full; all 20 consumed from the burst).
   (let [wf  (step/serial
-             (c/rate-limited {:rps 10 :burst 20})
+             (ct/rate-limited {:rps 10 :burst 20})
              (step/step :id identity))
         t0  (System/currentTimeMillis)
         res (flow/run-seq wf (vec (range 20)))
@@ -48,7 +49,7 @@
   ;; First 5 immediate (burst). Remaining 20 at 20/s = 1s minimum.
   ;; Total elapsed: >= 1000ms (with some slack for jitter).
   (let [wf  (step/serial
-             (c/rate-limited {:rps 20 :burst 5})
+             (ct/rate-limited {:rps 20 :burst 5})
              (step/step :id identity))
         t0  (System/currentTimeMillis)
         res (flow/run-seq wf (vec (range 25)))
@@ -70,8 +71,8 @@
                             (Thread/sleep 5)  ;; tiny per-task work
                             {:out [(toolkit.datapotamus.msg/child ctx d)]})})
         wf  (step/serial
-             (c/rate-limited {:rps 25 :burst 5})
-             (c/stealing-workers :pool 8 worker))
+             (ct/rate-limited {:rps 25 :burst 5})
+             (cw/stealing-workers :pool 8 worker))
         n   30
         t0  (System/currentTimeMillis)
         res (flow/run-seq wf (vec (range n)))
@@ -89,7 +90,7 @@
                  rps   (gen/choose 20 50)
                  burst (gen/choose 1 5)]
     (let [wf  (step/serial
-               (c/rate-limited {:rps rps :burst burst})
+               (ct/rate-limited {:rps rps :burst burst})
                (step/step :id identity))
           t0  (System/currentTimeMillis)
           res (flow/run-seq wf (vec (range n)))

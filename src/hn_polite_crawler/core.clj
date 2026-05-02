@@ -2,8 +2,8 @@
   "Polite paginated crawler over the HN Algolia search API.
 
    Stress-tests two new Datapotamus combinators in concert:
-   `c/rate-limited` (shared-bucket gate) caps total RPS across the
-   whole worker pool, and `c/with-backoff` retries 429s with
+   `ct/rate-limited` (shared-bucket gate) caps total RPS across the
+   whole worker pool, and `ct/with-backoff` retries 429s with
    exponential backoff + jitter. Persistent failures are routed to
    dead-letters via the `:dead-letter?` flag on `:out`.
 
@@ -11,7 +11,8 @@
      clojure -M -e \"(require 'hn-polite-crawler.core) (hn-polite-crawler.core/run-once! [\\\"pg\\\" \\\"dang\\\"] \\\"crawl.json\\\")\""
   (:require [clojure.data.json :as json]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.control :as ct]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]))
@@ -20,7 +21,7 @@
 
 (defn- fetch-page!
   "One page of an Algolia author-history search. Throws ex-info with
-   `{:transient true}` on 429 or 5xx so `c/with-backoff` retries it."
+   `{:transient true}` on 429 or 5xx so `ct/with-backoff` retries it."
   [{:keys [username page]}]
   (let [url  (str base "/search_by_date?tags=comment,author_" username
                   "&hitsPerPage=100&page=" page)
@@ -35,7 +36,7 @@
 (defn- crawl-user!
   "Paginate one user's full history. Returns
    `{:user u :history [...] :pages n}`. `fetch-page!` raises on
-   transient errors; `c/with-backoff` upstream is what makes the
+   transient errors; `ct/with-backoff` upstream is what makes the
    wrapped retry work."
   [username]
   (loop [page 0 hits []]
@@ -76,10 +77,10 @@
     (step/step :emit-users nil
                (fn [ctx _s _tick]
                  {:out (msg/children ctx (mapv #(hash-map :user %) usernames))}))
-    (c/rate-limited {:rps rps :burst burst})
-    (c/stealing-workers
+    (ct/rate-limited {:rps rps :burst burst})
+    (cw/stealing-workers
      :pool k
-     (c/with-backoff {:max-retries max-retries :base-ms base-ms
+     (ct/with-backoff {:max-retries max-retries :base-ms base-ms
                       :retry?      (comp :transient ex-data)}
                      fetch-handler)))))
 

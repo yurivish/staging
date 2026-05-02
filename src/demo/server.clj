@@ -12,7 +12,7 @@
    [reitit.ring :as ring]
    [toolkit.datapotamus.flow :as flow]
    [toolkit.datapotamus.step :as step]
-   [toolkit.datapotamus.viz :as viz]
+   [toolkit.datapotamus.obs.viz :as viz]
    [toolkit.datastar.core :as d]
    [toolkit.hotreload :as hotreload]
    [toolkit.pubsub :as pubsub]

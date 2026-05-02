@@ -20,7 +20,8 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as ca]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
@@ -205,7 +206,7 @@
                    {:out [(msg/child ctx (assoc edge :edge_type et))]})))))
 
 (def aggregate-by-user
-  (c/batch-by-group
+  (ca/batch-by-group
    :user-id
    (fn [user-id rows]
      (summarize-user user-id (remove :empty? rows)))))
@@ -222,10 +223,10 @@
                            :user-ids (or user-ids []))]
      (step/serial :hn-reply-posture
                   (mk-emit-users opts')
-                  (c/stealing-workers :fetchers workers (mk-fetch-history opts'))
+                  (cw/stealing-workers :fetchers workers (mk-fetch-history opts'))
                   split-edges
-                  (c/stealing-workers :parents workers fetch-parent-step)
-                  (c/stealing-workers :classifiers workers classify-edge-step)
+                  (cw/stealing-workers :parents workers fetch-parent-step)
+                  (cw/stealing-workers :classifiers workers classify-edge-step)
                   aggregate-by-user))))
 
 ;; --- Trace pretty-printer -------------------------------------------------

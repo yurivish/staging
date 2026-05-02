@@ -11,7 +11,7 @@
    Stage B is its own beast (`podcast.tree-resolve`), but uses the same
    pattern of trace/emit at the LLM call site."
   (:require [podcast.llm :as llm]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.workers :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]))

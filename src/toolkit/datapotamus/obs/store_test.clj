@@ -1,11 +1,11 @@
-(ns toolkit.datapotamus.store-test
+(ns toolkit.datapotamus.obs.store-test
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [next.jdbc :as jdbc]
             [toolkit.datapotamus.flow :as flow]
+            [toolkit.datapotamus.obs.store :as store]
             [toolkit.datapotamus.recorder :as recorder]
             [toolkit.datapotamus.step :as step]
-            [toolkit.datapotamus.store :as store]
             [toolkit.pubsub :as pubsub])
   (:import (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
@@ -34,17 +34,17 @@
 ;; Topology snapshot
 ;; ============================================================================
 
-(deftest snapshot-topology-flat
+(deftest topology-flat
   (let [wf (step/serial (step/step :inc inc)
                         (step/step :dbl #(* 2 %))
                         (step/sink))
-        {:keys [nodes edges]} (store/snapshot-topology wf)]
-    (is (= [{:path ["inc"]  :name "inc"  :kind :leaf}
-            {:path ["dbl"]  :name "dbl"  :kind :leaf}
-            {:path ["sink"] :name "sink" :kind :leaf}]
+        {:keys [nodes edges]} (step/topology wf)]
+    (is (= [{:path [:inc]  :name "inc"  :kind :leaf}
+            {:path [:dbl]  :name "dbl"  :kind :leaf}
+            {:path [:sink] :name "sink" :kind :leaf}]
            nodes))
-    (is (= #{{:from-path ["inc"] :from-port "out" :to-path ["dbl"]  :to-port "in"}
-             {:from-path ["dbl"] :from-port "out" :to-path ["sink"] :to-port "in"}}
+    (is (= #{{:from-path [:inc] :from-port :out :to-path [:dbl]  :to-port :in}
+             {:from-path [:dbl] :from-port :out :to-path [:sink] :to-port :in}}
            (set edges)))))
 
 ;; ============================================================================

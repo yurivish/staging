@@ -11,7 +11,7 @@
      - closed-loop and :count load modes (open-loop/rate in phase 3)
      - E2E latency only (per-stage latency needs nanoTime trace events)
      - assumes the user step has a single `:out` endpoint (serial-able)"
-  (:require [toolkit.datapotamus.combinators :as dc]
+  (:require [toolkit.datapotamus.combinators.workers :as dc]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.watchers.latency :as latency]
@@ -213,7 +213,7 @@
   "W parallel identity workers behind a round-robin router + join.
    Throughput should scale with W up to the router/join bottleneck."
   [w]
-  (dc/workers w (step/step :inner identity)))
+  (dc/round-robin-workers w (step/step :inner identity)))
 
 ;; ---- Reporting ----------------------------------------------------
 

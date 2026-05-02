@@ -8,7 +8,7 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.control :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]))

@@ -11,7 +11,7 @@
      clojure -M -e \"(require 'hn-join.core) (hn-join.core/run-once! \\\"join.json\\\")\""
   (:require [clojure.data.json :as json]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]

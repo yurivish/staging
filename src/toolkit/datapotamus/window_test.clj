@@ -5,7 +5,7 @@
    watermark reaches their end."
   (:refer-clojure :exclude [run!])
   (:require [clojure.test :refer [deftest is testing]]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as c]
             [toolkit.datapotamus.flow :as flow]))
 
 (defn- mk-event [t v] {:time t :v v})

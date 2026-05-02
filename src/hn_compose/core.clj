@@ -12,7 +12,8 @@
    the upcoming visualization tool a meaty multi-stage trace to
    render."
   (:require [clojure.data.json :as json]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as ca]
+            [toolkit.datapotamus.combinators.control :as ct]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]))
@@ -67,12 +68,12 @@
   ([{:keys [size-ms rps burst]
      :or   {size-ms 60000 rps 1000 burst 1000}}]
    (let [;; Stories sub-pipeline (flat — inner procs at outer level).
-         rl       (c/rate-limited {:rps rps :burst burst :id :stories-rl})
+         rl       (ct/rate-limited {:rps rps :burst burst :id :stories-rl})
          bkt      {:procs {:stories-bkt (stories-bucket-handler size-ms)}
                    :conns [] :in :stories-bkt :out :stories-bkt}
          stories  (step/serial rl bkt)
          ;; Comments sub-pipeline.
-         win      (c/tumbling-window {:size-ms size-ms :time-fn :time
+         win      (ca/tumbling-window {:size-ms size-ms :time-fn :time
                                       :id :comments-win
                                       :on-window (fn [start end items]
                                                    {:window-start start
@@ -82,7 +83,7 @@
                    :conns [] :in :comments-exp :out :comments-exp}
          comments (step/serial win exp)
          ;; Join.
-         join     (c/join-by-key
+         join     (ca/join-by-key
                    {:id      :join
                     :ports   [:stories :comment-counts]
                     :key-fns {:stories       (juxt :by :window-start)

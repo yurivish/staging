@@ -16,7 +16,8 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as ca]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
@@ -212,7 +213,7 @@
                  {:out [(msg/child ctx (assoc cell :n (or n 0)))]}))))
 
 (def aggregate-by-term
-  (c/batch-by-group
+  (ca/batch-by-group
    :term
    (fn [term cells]
      (summarize-term term (:scope (first cells)) cells))))
@@ -231,7 +232,7 @@
                           :bucket bucket :scope scope)]
      (step/serial :hn-buzzword-obituaries
                   (mk-emit-cells opts')
-                  (c/stealing-workers :counters workers count-cell-step)
+                  (cw/stealing-workers :counters workers count-cell-step)
                   aggregate-by-term))))
 
 ;; --- Trace pretty-printer ---------------------------------------------------

@@ -20,7 +20,8 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as ca]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
@@ -232,7 +233,7 @@
                  {:out (msg/children ctx hs)}))))
 
 (def dedup-step
-  (c/batch-by-group
+  (ca/batch-by-group
    :objectID
    (fn [oid hits]
      (let [hit (first hits)]
@@ -309,15 +310,15 @@
                       :phrases phrases :since since :until until)]
      (step/serial :hn-mind-changed
                   (mk-emit-phrases opts')
-                  (c/stealing-workers :phrase-pages
+                  (cw/stealing-workers :phrase-pages
                                       phrase-workers
                                       (mk-fetch-phrase-pages opts'))
                   dedup-step
-                  (c/stealing-workers :hydrators 8 hydrate-step)
-                  (c/stealing-workers :filters
+                  (cw/stealing-workers :hydrators 8 hydrate-step)
+                  (cw/stealing-workers :filters
                                       filter-workers
                                       (mk-filter-step filter-threshold))
-                  (c/stealing-workers :judges judge-workers judge-step)
+                  (cw/stealing-workers :judges judge-workers judge-step)
                   final-collector))))
 
 ;; --- Trace pretty-printer --------------------------------------------------

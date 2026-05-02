@@ -22,7 +22,8 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as ca]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
@@ -331,7 +332,7 @@
                    {:out [(msg/child ctx (merge pair j))]})))))
 
 (def final-collector
-  (c/batch-by-group
+  (ca/batch-by-group
    :user-id
    (fn [user-id rows]
      (let [real   (remove :empty? rows)
@@ -361,13 +362,13 @@
                            :user-ids (or user-ids []))]
      (step/serial :hn-self-contradiction
                   (mk-emit-users opts')
-                  (c/stealing-workers :fetchers workers (mk-fetch-history opts'))
+                  (cw/stealing-workers :fetchers workers (mk-fetch-history opts'))
                   split-comments
-                  (c/stealing-workers :taggers workers tag-step)
+                  (cw/stealing-workers :taggers workers tag-step)
                   topic-group-step
                   (mk-pair-fanout opts')
-                  (c/stealing-workers :scorers workers (mk-pair-score filter-threshold))
-                  (c/stealing-workers :judges workers pair-judge-step)
+                  (cw/stealing-workers :scorers workers (mk-pair-score filter-threshold))
+                  (cw/stealing-workers :judges workers pair-judge-step)
                   final-collector))))
 
 ;; --- Trace pretty-printer ------------------------------------------------

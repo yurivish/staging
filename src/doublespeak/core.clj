@@ -25,7 +25,7 @@
             [clojure.data.json :as json]
             [clojure.string :as str]
             [doublespeak.llm :as llm]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.core :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.step :as step]
             [toolkit.pubsub :as pubsub]))

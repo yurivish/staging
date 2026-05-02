@@ -1,4 +1,4 @@
-(ns toolkit.datapotamus.store
+(ns toolkit.datapotamus.obs.store
   "DuckDB-backed trace storage for a single Datapotamus run.
 
    One DuckDB file per run. Four tables:
@@ -9,70 +9,25 @@
      payloads  — content-addressed dedup of envelope :data values.
 
    Public API:
-     (snapshot-topology stepmap)        → pure {:nodes [...], :edges [...]}
      (make-run-meta stepmap & extras)   → seed a run-meta map for the recorder
      (finalize-run-meta run-meta)       → stamp finish wall-time + duration
      (init! ds-or-path)                 → idempotent DDL bootstrap
      (flush-run! ds-or-path trace)      → ingest a deref'd recorder trace
 
    Caller hooks `make-run-meta` into `recorder/start-recorder!` so the
-   trace map's `:run` field carries everything `flush-run!` needs."
+   trace map's `:run` field carries everything `flush-run!` needs.
+
+   Topology shape comes from `toolkit.datapotamus.step/topology` — see
+   that fn's docstring."
   (:require [clojure.data.json :as json]
-            [clojure.string :as str]
             [next.jdbc :as jdbc]
             [toolkit.datapotamus.step :as step]
             [toolkit.llm.cache :as cache])
   (:import (java.sql Connection Timestamp)
            (java.time Instant)))
 
-;; ============================================================================
-;; Topology snapshot — pure walk over a stepmap (procs + conns, recursively)
-;; ============================================================================
-
-(defn- humanize [sid]
-  (-> (if (keyword? sid) (name sid) (str sid))
-      (str/replace "-" " ")))
-
 (defn- sid-str [sid]
   (if (keyword? sid) (name sid) (str sid)))
-
-(defn- conn->edge [parent-path [[from-sid from-port] [to-sid to-port] _opts]]
-  {:from-path (conj parent-path (sid-str from-sid))
-   :from-port (sid-str from-port)
-   :to-path   (conj parent-path (sid-str to-sid))
-   :to-port   (sid-str to-port)})
-
-(defn- walk-procs [procs parent-path]
-  (reduce
-   (fn [acc [sid proc]]
-     (let [path (conj parent-path (sid-str sid))
-           name (humanize sid)]
-       (cond
-         (step/step? proc)
-         (let [child (walk-procs (:procs proc) path)
-               child-edges (mapv #(conn->edge path %) (:conns proc))]
-           (-> acc
-               (update :nodes conj {:path path :name name :kind :container})
-               (update :nodes into (:nodes child))
-               (update :edges into (:edges child))
-               (update :edges into child-edges)))
-
-         (step/handler-map? proc)
-         (update acc :nodes conj {:path path :name name :kind :leaf})
-
-         :else
-         (throw (ex-info (str "Unknown proc shape at " sid) {:sid sid})))))
-   {:nodes [] :edges []}
-   procs))
-
-(defn snapshot-topology
-  "Walk a stepmap into `{:nodes [{:path :name :kind}], :edges [{:from-path
-   :from-port :to-path :to-port}]}`. Captures both `:procs` (recursively)
-   and `:conns` at every level. Pure."
-  [stepmap]
-  (let [base (walk-procs (:procs stepmap) [])
-        top  (mapv #(conn->edge [] %) (:conns stepmap))]
-    (update base :edges into top)))
 
 ;; ============================================================================
 ;; Run-meta seeding
@@ -87,7 +42,7 @@
    (merge {:run-id          (random-uuid)
            :started-at-wall (Instant/now)
            :started-at-ns   (System/nanoTime)
-           :topology        (snapshot-topology stepmap)}
+           :topology        (step/topology stepmap)}
           extras)))
 
 (defn finalize-run-meta

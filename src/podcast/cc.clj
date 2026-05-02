@@ -15,7 +15,7 @@
             [clojure.string :as str]
             [podcast.core :as pc]
             [podcast.llm :as llm]
-            [toolkit.datapotamus.claude-code :as cc-step]
+            [toolkit.datapotamus.steps.claude-code :as cc-step]
             [toolkit.datapotamus.recorder :as recorder]
             [toolkit.datapotamus.trace :as trace]
             [toolkit.llm.cache :as cache]

@@ -18,7 +18,8 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as ca]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
@@ -228,7 +229,7 @@
                    {:out [(msg/child ctx (merge row c))]})))))
 
 (defn- mk-aggregate [{:keys [peak-min silent-quarters] :as cfg}]
-  (c/batch-by-group
+  (ca/batch-by-group
    :user-id
    (fn [user-id rows]
      (summarize-user user-id (remove :empty? rows) cfg))))
@@ -246,9 +247,9 @@
                            :user-ids (or user-ids []))]
      (step/serial :hn-topic-graveyard
                   (mk-emit-users opts')
-                  (c/stealing-workers :fetchers workers (mk-fetch-history opts'))
+                  (cw/stealing-workers :fetchers workers (mk-fetch-history opts'))
                   split-comments
-                  (c/stealing-workers :classifiers workers classify-step)
+                  (cw/stealing-workers :classifiers workers classify-step)
                   (mk-aggregate opts')))))
 
 ;; --- Trace pretty-printer ------------------------------------------------

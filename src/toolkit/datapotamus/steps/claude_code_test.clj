@@ -1,4 +1,4 @@
-(ns toolkit.datapotamus.claude-code-test
+(ns toolkit.datapotamus.steps.claude-code-test
   "Sanity checks for the Claude Code step. Real-binary calls; cost-minimized
    with `:bare? true` (skip project-context loading) and `:model \"haiku\"`.
    Auth comes from `claude.key` in the JVM cwd, passed to the subprocess
@@ -8,7 +8,7 @@
    without auth setup."
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
-            [toolkit.datapotamus.claude-code :as cc])
+            [toolkit.datapotamus.steps.claude-code :as cc])
   (:import [java.io BufferedReader StringReader]))
 
 (defn- claude-key []

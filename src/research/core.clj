@@ -25,7 +25,7 @@
        user=> (require 'research.core)
        user=> (research.core/find-feeds! \"rationalist blogs\")"
   (:require [clojure.pprint :as pp]
-            [toolkit.datapotamus.claude-code :as cc]
+            [toolkit.datapotamus.steps.claude-code :as cc]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.step :as step]))
 

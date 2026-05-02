@@ -30,7 +30,7 @@
        the recursion. Token mass converges into the final emission."
   (:require [clojure.string :as str]
             [podcast.llm :as llm]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.workers :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]

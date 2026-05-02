@@ -1,14 +1,14 @@
 (ns podcast.cc-test
-  "Tests for podcast.cc. Stubs toolkit.datapotamus.claude-code/run! the way
-   tree_resolve_test stubs llm/cached-chat! — pure, no subprocess, no LMDB
-   miss penalty (cache short-circuits on the second call but Phase 1 only
-   exercises misses)."
+  "Tests for podcast.cc. Stubs toolkit.datapotamus.steps.claude-code/run!
+   the way tree_resolve_test stubs llm/cached-chat! — pure, no subprocess,
+   no LMDB miss penalty (cache short-circuits on the second call but
+   Phase 1 only exercises misses)."
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [podcast.cc :as cc]
-            [toolkit.datapotamus.claude-code :as cc-step]
+            [toolkit.datapotamus.steps.claude-code :as cc-step]
             [toolkit.llm.cache :as cache]))
 
 ;; --- fixtures ----------------------------------------------------------------

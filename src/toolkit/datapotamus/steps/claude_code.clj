@@ -1,4 +1,4 @@
-(ns toolkit.datapotamus.claude-code
+(ns toolkit.datapotamus.steps.claude-code
   "Datapotamus step that runs Claude Code (the Agent SDK CLI, `claude -p`)
    as a subprocess. One input prompt in, one result map out — no matter how
    many tool calls Claude makes internally.

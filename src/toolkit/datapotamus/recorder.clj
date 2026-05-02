@@ -3,7 +3,7 @@
    pubsub and accumulates everything that happens into a single map —
    the artefact a retrospective UI loads to walk the run end-to-end.
 
-   Same subscribe-and-reduce pattern as `toolkit.datapotamus.viz`,
+   Same subscribe-and-reduce pattern as `toolkit.datapotamus.obs.viz`,
    but it keeps the full event stream (not aggregated counters).
    Use `viz` for live dashboards, `recorder` for after-the-fact
    inspection.

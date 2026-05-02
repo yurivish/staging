@@ -7,7 +7,7 @@
    Data path:
      emit-users   →  fetch-history (paginated Algolia)
      split-with-bucket (msg/children — each comment is a unit, year-month stamped)
-     classify-llm (c/stealing-workers — Haiku tool call)
+     classify-llm (cw/stealing-workers — Haiku tool call)
      aggregate-by-user (group-by user-id; secondary group-by year-month;
                         emit one msg per user with per-month rows nested)
 
@@ -16,7 +16,8 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as ca]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
@@ -205,7 +206,7 @@
                    {:out [(msg/child ctx (merge row c))]})))))
 
 (def aggregate-by-user
-  (c/batch-by-group
+  (ca/batch-by-group
    :user-id
    (fn [user-id rows]
      (let [real   (remove :empty? rows)
@@ -230,9 +231,9 @@
                            :user-ids (or user-ids []))]
      (step/serial :hn-emotion
                   (mk-emit-users opts')
-                  (c/stealing-workers :fetchers workers (mk-fetch-history opts'))
+                  (cw/stealing-workers :fetchers workers (mk-fetch-history opts'))
                   split-comments
-                  (c/stealing-workers :classifiers workers classify-step)
+                  (cw/stealing-workers :classifiers workers classify-step)
                   aggregate-by-user))))
 
 ;; --- Trace pretty-printer ------------------------------------------------

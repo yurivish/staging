@@ -25,7 +25,8 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [com.stuartsierra.dependency :as dep]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.core :as cc]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
@@ -663,7 +664,7 @@
 (deftest children-splits-tokens-across-siblings
   (let [seen (atom [])
         wf (-> (step/beside
-                (c/fan-out :fo [:out])
+                (cc/fan-out :fo [:out])
                 (step/step :burst {:ins {:in ""} :outs {:out ""}}
                            (fn [ctx s _d]
                              (let [kids (msg/children ctx [:a :b :c])]
@@ -782,8 +783,8 @@
 (deftest provenance-dag-is-well-formed
   (let [ports  [:a :b :c]
         wf     (-> (step/beside
-                    (c/fan-out :split ports)
-                    (c/fan-in :fi :split ports)
+                    (cc/fan-out :split ports)
+                    (cc/fan-in :fi :split ports)
                     (step/sink))
                    (wire-ports :split :fi ports)
                    (step/connect [:fi :out] [:sink :in])
@@ -805,7 +806,7 @@
 (deftest multiplicity-frequencies
   (let [ports  [:a :b :c]
         wf     (-> (step/beside
-                    (c/fan-out :split ports)
+                    (cc/fan-out :split ports)
                     (step/sink))
                    (wire-all :split ports :sink)
                    (step/input-at :split)
@@ -833,7 +834,7 @@
 (deftest static-fan-out
   (let [ports  [:a :b :c]
         wf     (-> (step/beside
-                    (c/fan-out :split ports)
+                    (cc/fan-out :split ports)
                     (step/sink))
                    (wire-all :split ports :sink)
                    (step/input-at :split)
@@ -885,8 +886,8 @@
 (deftest token-fan-in
   (let [ports  [:a :b :c]
         wf     (-> (step/beside
-                    (c/fan-out :split ports)
-                    (c/fan-in :fi :split ports)
+                    (cc/fan-out :split ports)
+                    (cc/fan-in :fi :split ports)
                     (step/sink))
                    (wire-ports :split :fi ports)
                    (step/connect [:fi :out] [:sink :in])
@@ -919,10 +920,10 @@
   (let [outer-ports [:o0 :o1 :o2]
         inner-ports [:i0 :i1]
         wf     (-> (step/beside
-                    (c/fan-out :outer outer-ports)
-                    (c/fan-out :inner inner-ports)
-                    (c/fan-in  :fi-inner :inner inner-ports)
-                    (c/fan-in  :fi-outer :outer [:in])
+                    (cc/fan-out :outer outer-ports)
+                    (cc/fan-out :inner inner-ports)
+                    (cc/fan-in  :fi-inner :inner inner-ports)
+                    (cc/fan-in  :fi-outer :outer [:in])
                     (step/sink))
                    (wire-all :outer outer-ports :inner)
                    (wire-ports :inner :fi-inner inner-ports)
@@ -1051,7 +1052,7 @@
                            a (-> (msg/child ctx :a-side) (msg/assoc-tokens {gid v1}))
                            b (-> (msg/child ctx :b-side) (msg/assoc-tokens {gid v2}))]
                        [s {:a [a] :b [b]}])))
-        wf (-> (step/beside minter (c/fan-in :fi gid-key [:in]) (step/sink))
+        wf (-> (step/beside minter (cc/fan-in :fi gid-key [:in]) (step/sink))
                (step/connect [:minter :a] [:fi :in])
                (step/connect [:minter :b] [:fi :in])
                (step/connect [:fi :out] [:sink :in])
@@ -1670,7 +1671,7 @@
                           (fn [ctx _s d]
                             (swap! seen conj [(:prefix (:pubsub ctx)) d])
                             {:out [(msg/pass ctx)]}))
-        wf     (c/round-robin-workers :pool 3 probe)
+        wf     (cw/round-robin-workers :pool 3 probe)
         result (flow/run-seq wf (range 9))]
     (testing "run completes; every input produces exactly one output"
       (is (= :completed (:state result)))
@@ -1686,7 +1687,7 @@
                        (fn [_ctx s d]
                          (let [s' (update s :sum (fnil + 0) d)]
                            [s' {:out [(:sum s')]}])))
-        wf  (step/serial (c/round-robin-workers :pool 2 acc))
+        wf  (step/serial (cw/round-robin-workers :pool 2 acc))
         res (flow/run-seq wf [10 1 20 2 30 3])]
     (is (= :completed (:state res)))
     (testing "w0 sees 10,20,30 → sums 10,30,60; w1 sees 1,2,3 → sums 1,3,6"
@@ -1698,7 +1699,7 @@
 (deftest round-robin-workers-preserve-tokens
   (let [wf (step/serial
            (step/step :inc inc)
-           (c/round-robin-workers :pool 3 (step/step :noop identity))
+           (cw/round-robin-workers :pool 3 (step/step :noop identity))
            (step/sink))
         h  (start! wf)]
     (try
@@ -1720,7 +1721,7 @@
 ;; emits one signal.
 (deftest round-robin-workers-route-signals-not-broadcast
   (let [wf (step/serial
-           (c/round-robin-workers :pool 4 (step/passthrough :w))
+           (cw/round-robin-workers :pool 4 (step/passthrough :w))
            (step/sink))
         h  (start! wf)]
     (try
@@ -1740,7 +1741,7 @@
 ;; ports ensure on-all-input-done fires once, not K times.
 (deftest round-robin-workers-input-done-cascade-fires-once
   (let [wf (step/serial
-           (c/round-robin-workers :pool 3 (step/passthrough :w))
+           (cw/round-robin-workers :pool 3 (step/passthrough :w))
            (step/sink))
         h  (start! wf)]
     (flow/inject! h {})
@@ -1758,7 +1759,7 @@
 ;; multiple procs.
 (deftest round-robin-workers-accepts-composite-step
   (let [inner (step/serial (step/step :a inc) (step/step :b #(* 2 %)))
-        wf    (step/serial (c/round-robin-workers :pool 2 inner))
+        wf    (step/serial (cw/round-robin-workers :pool 2 inner))
         res   (flow/run-seq wf [1 2 3 4])]
     (is (= :completed (:state res)))
     (is (= [[4] [6] [8] [10]] (:outputs res)))))
@@ -1781,7 +1782,7 @@
 ;; ----------------------------------------------------------------------------
 
 (deftest stealing-workers-exactly-once-delivery
-  (let [wf  (c/stealing-workers :pool 4 (step/step :id identity))
+  (let [wf  (cw/stealing-workers :pool 4 (step/step :id identity))
         res (flow/run-seq wf (range 20))]
     (is (= :completed (:state res)))
     ;; Each input produces exactly one output with the same value;
@@ -1791,7 +1792,7 @@
 
 (deftest stealing-workers-input-done-cascade-fires-once
   (let [wf (step/serial
-            (c/stealing-workers :pool 3 (step/passthrough :w))
+            (cw/stealing-workers :pool 3 (step/passthrough :w))
             (step/sink))
         h  (start! wf)]
     (flow/inject! h {})
@@ -1805,7 +1806,7 @@
       (is (= 1 (count (filter #(= :sink (:step-id %)) dones)))))))
 
 (deftest stealing-workers-k-1-degenerate
-  (let [wf  (c/stealing-workers :pool 1 (step/step :inc inc))
+  (let [wf  (cw/stealing-workers :pool 1 (step/step :inc inc))
         res (flow/run-seq wf [1 2 3])]
     (is (= :completed (:state res)))
     (is (= [[2] [3] [4]] (:outputs res)))))
@@ -1813,7 +1814,7 @@
 (deftest stealing-workers-preserve-tokens
   (let [wf (step/serial
             (step/step :inc inc)
-            (c/stealing-workers :pool 3 (step/step :noop identity))
+            (cw/stealing-workers :pool 3 (step/step :noop identity))
             (step/sink))
         h  (start! wf)]
     (try
@@ -1835,7 +1836,7 @@
   ;; shim takes it, forwards it to its inner, and downstream sees one
   ;; signal — not K.
   (let [wf (step/serial
-            (c/stealing-workers :pool 4 (step/passthrough :w))
+            (cw/stealing-workers :pool 4 (step/passthrough :w))
             (step/sink))
         h  (start! wf)]
     (try
@@ -1853,7 +1854,7 @@
 
 (deftest stealing-workers-accepts-composite-step
   (let [inner (step/serial (step/step :a inc) (step/step :b #(* 2 %)))
-        wf    (step/serial (c/stealing-workers :pool 2 inner))
+        wf    (step/serial (cw/stealing-workers :pool 2 inner))
         res   (flow/run-seq wf [1 2 3 4])]
     (is (= :completed (:state res)))
     (is (= [[4] [6] [8] [10]] (:outputs res)))))
@@ -1864,7 +1865,7 @@
   (let [inner  (step/step :double {:ins {:in ""} :outs {:out ""}}
                           (fn [ctx _ d]
                             {:out [(msg/child ctx d) (msg/child ctx (- d))]}))
-        wf     (c/stealing-workers :pool 2 inner)
+        wf     (cw/stealing-workers :pool 2 inner)
         result (flow/run-seq wf [1 2 3])]
     (is (= :completed (:state result)))
     (is (= [#{1 -1} #{2 -2} #{3 -3}]
@@ -1889,8 +1890,8 @@
                   (let [t0 (System/currentTimeMillis)]
                     (flow/run-seq wf items)
                     (- (System/currentTimeMillis) t0)))
-        rr-time (time! (c/round-robin-workers :pool 2 slow))
-        ws-time (time! (c/stealing-workers :pool 2 slow))]
+        rr-time (time! (cw/round-robin-workers :pool 2 slow))
+        ws-time (time! (cw/stealing-workers :pool 2 slow))]
     ;; Optimal: rr ≈ 800 ms (slow worker pinned to all four 200s),
     ;; ws ≈ 420 ms (rebalanced). Ratio ≈ 0.53. The ws topology has
     ;; a few more hops than rr (coordinator + shim + inner + exit-wrap
@@ -1930,7 +1931,7 @@
 (deftest fan-out-dynamic-selector-vector-return
   (let [ports  [:a :b :c]
         wf     (-> (step/beside
-                    (c/fan-out :dyn ports (fn [d] (:pick d)))
+                    (cc/fan-out :dyn ports (fn [d] (:pick d)))
                     (step/sink))
                    (wire-all :dyn ports :sink)
                    (step/input-at :dyn)
@@ -1948,7 +1949,7 @@
 (deftest fan-out-dynamic-selector-map-return
   (let [ports  [:a :b :c]
         wf     (-> (step/beside
-                    (c/fan-out :dyn ports (fn [d] {:a (:x d) :b (:y d)}))
+                    (cc/fan-out :dyn ports (fn [d] {:a (:x d) :b (:y d)}))
                     (step/sink))
                    (wire-all :dyn ports :sink)
                    (step/input-at :dyn)
@@ -1964,8 +1965,8 @@
 (deftest fan-in-preserves-port-of-origin
   (let [ports  [:a :b :c]
         wf     (-> (step/beside
-                    (c/fan-out :split ports (fn [_] {:a 1 :b 2 :c 3}))
-                    (c/fan-in :gather :split ports)
+                    (cc/fan-out :split ports (fn [_] {:a 1 :b 2 :c 3}))
+                    (cc/fan-in :gather :split ports)
                     (step/sink))
                    (wire-ports :split :gather ports)
                    (step/connect [:gather :out] [:sink :in])
@@ -1981,8 +1982,8 @@
 (deftest fan-in-post-fn-drops-port-keys
   (let [ports  [:a :b :c]
         wf     (-> (step/beside
-                    (c/fan-out :split ports (fn [_] {:a 1 :b 2 :c 3}))
-                    (c/fan-in :gather :split ports vals)
+                    (cc/fan-out :split ports (fn [_] {:a 1 :b 2 :c 3}))
+                    (cc/fan-in :gather :split ports vals)
                     (step/sink))
                    (wire-ports :split :gather ports)
                    (step/connect [:gather :out] [:sink :in])
@@ -1996,13 +1997,13 @@
       (is (= 3 (count (:data merged)))))))
 
 ;; Parallel-roles: one question fans out to four heterogeneous specialists.
-;; `c/parallel` hides the fan-out/fan-in plumbing; port keys double as role
+;; `cc/parallel` hides the fan-out/fan-in plumbing; port keys double as role
 ;; names, so the scatter-gather bracket is a single map-shaped declaration.
 (deftest parallel-roles-agent-workflow
   (let [prompt-fn (fn [role q] (str (name role) ":" q))
         role-step (fn [id] (step/step id (fn [{:keys [question]}] (prompt-fn id question))))
         wf (step/serial
-            (c/parallel :roles
+            (cc/parallel :roles
                         {:solver  (role-step :solver)
                          :facts   (role-step :facts)
                          :skeptic (role-step :skeptic)
@@ -2027,7 +2028,7 @@
         worker   (fn [id] (step/step id (fn [q] (solve-fn q (get temps id)))))
         judge    (step/step :pick (fn [cs] (apply max-key :score cs)))
         wf (step/serial
-            (c/parallel :ensemble
+            (cc/parallel :ensemble
                         {:w0 (worker :w0) :w1 (worker :w1)
                          :w2 (worker :w2) :w3 (worker :w3)}
                         :post vals)
@@ -2058,7 +2059,7 @@
                                               {:task t :budget each}])
                                    tasks))))
         wf (step/serial
-            (c/parallel :plan
+            (cc/parallel :plan
                         {:w0 (worker :w0) :w1 (worker :w1) :w2 (worker :w2)}
                         :select selector
                         :post   vals)
@@ -2091,8 +2092,8 @@
                                         "|own="  (get round1 side)
                                         "|peer=" (get round1 peer))))))
         wf (step/serial
-            (c/parallel :r1 {:a (debater :a) :b (debater :b)})
-            (c/parallel :r2 {:a (critic  :a) :b (critic  :b)})
+            (cc/parallel :r1 {:a (debater :a) :b (debater :b)})
+            (cc/parallel :r2 {:a (critic  :a) :b (critic  :b)})
             (step/sink))
         result (run! wf {:data "is P true?"})
         final  (first (filterv #(= :sink (:step-id %)) (events-of result :recv)))]

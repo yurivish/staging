@@ -485,25 +485,44 @@ That seam is the most important design decision in the library. The algebra does
 ## Where the code lives
 
 ```
-msg.clj          envelopes, free algebra, pure synthesis
-step.clj         steps, handler-maps, composition
-flow.clj         the interpreter — the only file that imports core.async.flow
-combinators.clj  parallel, fan-out, fan-in, workers
-token.clj        the u64 XOR algebra
-counters.clj     sent / recv / completed; LongAdder-backed
-trace.clj        event constructors and scoped pubsub
-                   (don't import this; subscribe on the pubsub instead)
+msg.clj                   envelopes, free algebra, pure synthesis
+step.clj                  steps, handler-maps, composition, topology walk
+flow.clj                  the interpreter — the only file that imports core.async.flow
+token.clj                 the u64 XOR algebra
+counters.clj              sent / recv / completed; atom-held record snapshot
+trace.clj                 event constructors and scoped pubsub
+                            (don't import this; subscribe on the pubsub instead)
+recorder.clj              after-the-fact pubsub event accumulator
+
+combinators/core.clj      fan-out, fan-in, parallel
+combinators/workers.clj   round-robin-workers, stealing-workers
+combinators/aggregate.clj batch/cumulative-by-group, join-by-key,
+                            tumbling-window, sliding-window
+combinators/control.clj   rate-limited, with-backoff
+
+obs/viz.clj               live event-sourced Datastar visualizer
+obs/store.clj             DuckDB-backed trace persistence
+steps/claude_code.clj     Datapotamus step wrapping the Claude Code CLI
+watchers/latency.clj      per-step latency histogram (ConcurrentHashMap)
 ```
 
 Typical aliases:
 
 | Namespace | Alias | When |
 |---|---|---|
-| `toolkit.datapotamus.step`        | `:as step` | Always |
-| `toolkit.datapotamus.flow`        | `:as flow` | Always |
-| `toolkit.datapotamus.msg`         | `:as msg`  | Whenever building msgs |
-| `toolkit.datapotamus.combinators` | `:as c`    | Parallel, workers, fan-out / fan-in |
-| `toolkit.datapotamus.token`       | `:as tok`  | Designing new combinators |
+| `toolkit.datapotamus.step`                   | `:as step` | Always |
+| `toolkit.datapotamus.flow`                   | `:as flow` | Always |
+| `toolkit.datapotamus.msg`                    | `:as msg`  | Whenever building msgs |
+| `toolkit.datapotamus.combinators.core`       | `:as cc`   | parallel, fan-out / fan-in |
+| `toolkit.datapotamus.combinators.workers`    | `:as cw`   | round-robin-workers, stealing-workers |
+| `toolkit.datapotamus.combinators.aggregate`  | `:as ca`   | batch/cumulative-by-group, joins, windows |
+| `toolkit.datapotamus.combinators.control`    | `:as ct`   | rate-limited, with-backoff |
+| `toolkit.datapotamus.token`                  | `:as tok`  | Designing new combinators |
+
+If a file uses combinators from only one of those four submodules, it's
+fine to alias that one as `:as c` and read the prefix as "combinator." For
+files that mix two or more, the four-letter aliases keep the call sites
+self-explanatory.
 
 ---
 

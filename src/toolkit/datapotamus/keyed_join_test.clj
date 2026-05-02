@@ -5,7 +5,7 @@
    `:on-all-input-done`."
   (:refer-clojure :exclude [run!])
   (:require [clojure.test :refer [deftest is testing]]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]))

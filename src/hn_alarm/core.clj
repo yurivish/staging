@@ -13,7 +13,7 @@
      clojure -M -e \"(require 'hn-alarm.core) (let [h (hn-alarm.core/run-live! {})] (Thread/sleep 60000) ((:stop! h)))\""
   (:require [clojure.data.json :as json]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]))

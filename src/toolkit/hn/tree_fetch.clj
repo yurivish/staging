@@ -25,7 +25,7 @@
    `:get-json` is the URL→JSON fn (typically `clojure.data.json` over
    `http-kit/get`); supplied as an arg so each pipeline can stub it
    in tests."
-  (:require [toolkit.datapotamus.combinators :as c]
+  (:require [toolkit.datapotamus.combinators.workers :as c]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]))
 

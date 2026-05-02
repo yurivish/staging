@@ -51,7 +51,8 @@
    pipelines — see `handler-map`.
 
    Nothing in this namespace touches pubsub or core.async."
-  (:require [toolkit.datapotamus.msg :as msg]))
+  (:require [clojure.string :as str]
+            [toolkit.datapotamus.msg :as msg]))
 
 ;; ============================================================================
 ;; Predicates
@@ -217,3 +218,51 @@
 
 (defn input-at  [s ref] (assoc s :in ref))
 (defn output-at [s ref] (assoc s :out ref))
+
+;; ============================================================================
+;; Topology — pure walk of a stepmap into a flat {:nodes :edges} view
+;; ============================================================================
+
+(defn- humanize [sid]
+  (-> (if (keyword? sid) (name sid) (str sid))
+      (str/replace "-" " ")))
+
+(defn- conn->edge [parent-path [[from-sid from-port] [to-sid to-port] _opts]]
+  {:from-path (conj parent-path from-sid)
+   :from-port from-port
+   :to-path   (conj parent-path to-sid)
+   :to-port   to-port})
+
+(defn- walk-procs [acc procs parent-path]
+  (reduce
+   (fn [acc [sid proc]]
+     (let [path (conj parent-path sid)
+           node {:path path :name (humanize sid)}]
+       (cond
+         (step? proc)
+         (-> acc
+             (update :nodes conj (assoc node :kind :container))
+             (walk-procs (:procs proc) path)
+             (update :edges into (mapv #(conn->edge path %) (:conns proc))))
+
+         (handler-map? proc)
+         (update acc :nodes conj (assoc node :kind :leaf))
+
+         :else
+         (throw (ex-info (str "Unknown proc shape at " sid) {:sid sid})))))
+   acc
+   procs))
+
+(defn topology
+  "Walk a stepmap into a flat {:nodes :edges} view. Pure.
+
+   :nodes  — [{:path :name :kind} ...] one entry per proc/subflow,
+             recursively. `:path` is a vec of keyword sids (top-level
+             procs have a 1-vector path); `:kind` is `:container` (a
+             step with nested procs) or `:leaf` (a handler-map);
+             `:name` is a humanized display string for `:path`'s tip.
+   :edges  — [{:from-path :from-port :to-path :to-port} ...] one
+             entry per conn at every level."
+  [stepmap]
+  (let [base (walk-procs {:nodes [] :edges []} (:procs stepmap) [])]
+    (update base :edges into (mapv #(conn->edge [] %) (:conns stepmap)))))

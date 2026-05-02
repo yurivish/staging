@@ -1,4 +1,4 @@
-(ns toolkit.datapotamus.viz
+(ns toolkit.datapotamus.obs.viz
   "Event-sourced live visualizer for Datapotamus flows.
 
    Subscribes to a flow's pubsub, reduces events into an in-memory store,
@@ -33,40 +33,23 @@
   (:import (java.util.concurrent CompletableFuture TimeUnit TimeoutException)))
 
 ;; ============================================================================
-;; Topology — walk a step def into a tree of logical nodes
+;; Topology — re-tree step/topology output for nested-card rendering
 ;; ============================================================================
 
-(defn- humanize [sid]
-  (-> (if (keyword? sid) (name sid) (str sid))
-      (str/replace "-" " ")))
-
-(declare build-node)
-
-(defn- build-children [procs path]
-  (mapv (fn [[sid proc]] (build-node sid proc (conj path sid)))
-        procs))
-
-(defn- build-node [sid proc path]
-  (cond
-    (step/step? proc)
-    {:path     path
-     :name     (humanize sid)
-     :kind     :container
-     :children (build-children (:procs proc) path)}
-
-    (step/handler-map? proc)
-    {:path path :name (humanize sid) :kind :leaf}
-
-    :else
-    (throw (ex-info (str "Unknown proc shape at " sid) {:sid sid}))))
-
 (defn from-step
-  "Walk a step def into a topology tree rooted at a synthetic :container."
+  "Walk a step def into a topology tree rooted at a synthetic :container.
+   Tree-up over (step/topology stepmap) — nodes are grouped by parent
+   path and recursed under the synthetic root."
   [stepmap]
-  {:path     []
-   :name     "root"
-   :kind     :container
-   :children (build-children (:procs stepmap) [])})
+  (let [{:keys [nodes]} (step/topology stepmap)
+        by-parent (group-by #(vec (butlast (:path %))) nodes)
+        build (fn build [path]
+                (mapv (fn [n]
+                        (cond-> (select-keys n [:path :name :kind])
+                          (= :container (:kind n))
+                          (assoc :children (build (:path n)))))
+                      (sort-by :path (get by-parent path []))))]
+    {:path [] :name "root" :kind :container :children (build [])}))
 
 ;; ============================================================================
 ;; Scope decoding

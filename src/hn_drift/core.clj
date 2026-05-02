@@ -12,7 +12,7 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.workers :as c]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]

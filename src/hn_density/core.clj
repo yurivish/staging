@@ -13,7 +13,8 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as str]
             [org.httpkit.client :as http]
-            [toolkit.datapotamus.combinators :as c]
+            [toolkit.datapotamus.combinators.aggregate :as ca]
+            [toolkit.datapotamus.combinators.workers :as cw]
             [toolkit.datapotamus.flow :as flow]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]
@@ -206,7 +207,7 @@
      :sample_comments          sample}))
 
 (def aggregate-by-user
-  (c/batch-by-group :user-id summarize-user))
+  (ca/batch-by-group :user-id summarize-user))
 
 ;; --- Flow -------------------------------------------------------------------
 
@@ -224,9 +225,9 @@
                 (mk-fetch-top-ids n-stories)
                 (tree-fetch/step {:k tree-workers :get-json get-json})
                 (rank-step m-commenters)
-                (c/round-robin-workers :user-fetchers user-workers (mk-fetch-user-step k-comments))
+                (cw/round-robin-workers :user-fetchers user-workers (mk-fetch-user-step k-comments))
                 split-comments
-                (c/stealing-workers :scorers llm-workers score-step)
+                (cw/stealing-workers :scorers llm-workers score-step)
                 aggregate-by-user)))
 
 ;; --- Trace pretty-printer ---------------------------------------------------
