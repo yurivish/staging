@@ -150,7 +150,7 @@
 
 (declare render-shape)
 
-(declare render-inline-sg compute-branch-lines)
+(declare render-inline-sg render-inline-prime compute-branch-lines)
 
 (defn- render-elt
   "Render one :order element (a path, a nested :cycle record, or a
@@ -188,6 +188,13 @@
     ;; rendered by the chain — so we emit only the branches under a
     ;; rail at depth+1.
     (render-inline-sg elt children-map (inc depth))
+
+    (and (map? elt) (= :prime (:kind elt)))
+    ;; Inline prime record inside a parent chain's :order — a non-SP
+    ;; cluster between two chain neighbors. Render with a `(prime)`
+    ;; header and the prime's internal :order indented; its `:source`
+    ;; and `:sink` are chain neighbors, so we skip those.
+    (render-inline-prime elt children-map (inc depth))
 
     :else
     [{:line (str (indent depth) (pr-str elt)) :fall-through? false :paths []}]))
@@ -320,6 +327,36 @@
    `branch-depth`."
   [sg children-map branch-depth]
   (compute-branch-lines (:branches sg) children-map branch-depth))
+
+(defn- render-inline-prime
+  "Render a prime record nested inside a parent chain's :order — a
+   non-SP cluster between two chain neighbors. Emits a `(prime)`
+   header line and the cluster's internal nodes at one deeper indent
+   (the :order with :source / :sink stripped, since those are chain
+   neighbors). Off-spine annotations within the prime aren't shown
+   inline (they'd require a more elaborate sub-render); the header
+   signals that the cluster is non-decomposable."
+  [prime children-map branch-depth]
+  (let [order (:order prime)
+        S (:source prime)
+        T (:sink prime)
+        interior (->> order
+                      (remove #(or (= % S) (= % T)))
+                      vec)
+        node-name (fn [elt]
+                    (cond
+                      (vector? elt)
+                      (or (some-> (get children-map elt) :name)
+                          (last-sid elt))
+                      :else (pr-str elt)))]
+    (cons {:line (str (indent branch-depth) "(prime)")
+           :fall-through? false
+           :paths (vec (filter vector? interior))}
+          (mapv (fn [elt]
+                  {:line (str (indent (inc branch-depth)) (node-name elt))
+                   :fall-through? false
+                   :paths (when (vector? elt) [elt])})
+                interior))))
 
 ;; ---- Pattern compression for cycle / prime :order ----
 ;;
