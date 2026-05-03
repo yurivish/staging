@@ -103,7 +103,7 @@ and (where present) `:internal-edges`. From those:
 - **Spine** = consecutive pairs along `:order` that exist in
   `:internal-edges`. These render as fall-through edges (the `↓` rail).
 - **Off-spine** = every other internal edge. These render as inline
-  annotations (`← <name>` for back, `→ <name>` for forward).
+  annotations (`⤴ <name>` for back, `⤵ <name>` for forward).
 
 By construction:
 
@@ -175,8 +175,8 @@ Trace a contiguous `↓` column to read the spine.
 
 **Right annotations** (after the name):
 
-- `← <name>` — back-edge to a line above (always named).
-- `→ <name>` — forward off-spine to a non-adjacent line below.
+- `⤴ <name>` — back-edge to a line above (always named).
+- `⤵ <name>` — forward off-spine to a non-adjacent line below.
 
 Adjacent forward edges aren't annotated — that's the spine, encoded by
 left `↓` only.
@@ -212,7 +212,7 @@ Cycle aggregation in action (16 identical worker triples):
 
 ```
 ↓ counters (stealing-workers)
-    ext  → coord
+    ext  ⤵ coord
 ↓   16× shim K
 ↓   16× worker K
       count cell
@@ -221,8 +221,9 @@ Cycle aggregation in action (16 identical worker triples):
     drop
 ```
 
-The `↓` column reads the spine; the `→ coord` annotation marks the
-feedback edge from `ext` back to `coord` that closes the SCC.
+The `↓` column reads the spine; the `⤵ coord` annotation marks the
+feedback edge from `ext` going across-and-down to `coord` that closes
+the SCC.
 
 ## Algorithm-boundary demos
 
@@ -239,18 +240,18 @@ to two independent sinks. Two sources (`stream-a`, `stream-b`) and two
 sinks (`sink-x`, `sink-y`) at one container level fail
 `classify-dag`'s single-source / single-sink check, so it falls
 through to `:prime`. `kahn-order` produces `:order`; every edge ends
-up in `:internal-edges`; off-spine forwards (`→`) annotate the
+up in `:internal-edges`; off-spine forwards (`⤵`) annotate the
 non-consecutive edges.
 
 ```
-  stream a  → merge
+  stream a  ⤵ merge
 ↓ stream b
-↓ merge  → sink y
+↓ merge  ⤵ sink y
   sink x
   sink y
 ```
 
-No bracket rail (not scatter-gather). The two `→` annotations show
+No bracket rail (not scatter-gather). The two `⤵` annotations show
 where edges skip spine positions: `stream-a → merge` skips `stream-b`,
 `merge → sink-y` skips `sink-x`.
 
@@ -270,15 +271,15 @@ Eades has no empty source / empty sink to peel, so it picks the
 highest-score node — `intake`. After dropping intake's edges, both
 checkers are empty sources (lex tiebreak picks `content-check` first),
 then `format-check`, `decide`, `retry`. The single back-edge
-(`retry → intake`) closes the loop and shows up as `← intake` on the
+(`retry → intake`) closes the loop and shows up as `⤴ intake` on the
 last line — exactly the FAS we want.
 
 ```
-↓ intake  → format check
-  content check  → decide
+↓ intake  ⤵ format check
+  content check  ⤵ decide
 ↓ format check
 ↓ decide
-  retry  ← intake
+  retry  ⤴ intake
 ```
 
 Compare with `stealing-workers` / `round-robin-workers`: every member
@@ -300,12 +301,12 @@ not a bijection (`|ij| ≠ |Ci|`), not complete
 returns `nil` and the renderer falls back to per-member output.
 
 ```
-  shifter 0  → target 0, → target 1
-↓ shifter 1  → target 2
+  shifter 0  ⤵ target 0, ⤵ target 1
+↓ shifter 1  ⤵ target 2
 ↓ target 1
-↓ shifter 2  → target 2
-  target 0  ← shifter 1
-  target 2  ← shifter 0
+↓ shifter 2  ⤵ target 2
+  target 0  ⤴ shifter 1
+  target 2  ⤴ shifter 0
 ```
 
 Without this demo the gate's `:partial` branch is untested by the
