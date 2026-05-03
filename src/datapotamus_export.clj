@@ -41,6 +41,7 @@
    {:ns 'hn-self-contradiction.core  :invoke :opts-map}
    {:ns 'hn-self-correct.core        :invoke :opts-map}
    {:ns 'hn-shape.core               :invoke :opts-map}
+   {:ns 'toolkit.hn-sota.core        :invoke :opts-map}
    {:ns 'hn-steelman.core            :invoke :opts-map}
    {:ns 'hn-tempo.core               :invoke :opts-map}
    {:ns 'hn-title-editorialize.core  :invoke :opts-map}
