@@ -397,6 +397,44 @@
                   u       (first ranked)]
               (recur (disj remaining u) (drop-node u edges) (conj s1 u) s2))))))))
 
+(declare unmark-shape-tree)
+
+(defn- unmark-elt
+  "Replace SCC markers with :cycle records inside an :order element.
+   For nested shape records (scatter-gather, etc.), recurse via
+   `unmark-shape-tree`."
+  [unmark elt]
+  (cond
+    (and (map? elt) (#{:chain :scatter-gather :cycle :prime :empty} (:kind elt)))
+    (unmark-shape-tree elt unmark)
+    :else
+    (unmark elt)))
+
+(defn- unmark-shape-tree
+  "Walk a shape tree and replace SCC markers (`{::scc members}`) with
+   :cycle records via `unmark`. Recurses through nested shape records
+   in :order (scatter-gather inside chain) and :branches
+   (sub-shapes inside scatter-gather)."
+  [shape unmark]
+  (let [unmark-edge (fn [[u v]] [(unmark u) (unmark v)])
+        unmark-order (fn [order] (mapv #(unmark-elt unmark %) order))]
+    (case (:kind shape)
+      :empty shape
+      :chain (update shape :order unmark-order)
+      :scatter-gather (-> shape
+                          (update :source unmark)
+                          (update :sink unmark)
+                          (update :branches
+                                  (fn [bs] (mapv #(unmark-shape-tree % unmark) bs))))
+      :cycle (-> shape
+                 (update :order unmark-order)
+                 (cond->
+                  (:internal-edges shape)
+                   (update :internal-edges (fn [es] (mapv unmark-edge es)))))
+      :prime (-> shape
+                 (update :order unmark-order)
+                 (update :internal-edges (fn [es] (mapv unmark-edge es)))))))
+
 (defn- ->cycle [members internal-edges]
   (let [int-edges (vec internal-edges)]
     {:kind :cycle
@@ -446,23 +484,8 @@
             unmark      (fn [x]
                           (if-let [members (::scc x)]
                             (->cycle members (get scc-eds-of x))
-                            x))
-            unmark-edge (fn [[u v]] [(unmark u) (unmark v)])]
-        (cond-> dag-shape
-          (:order dag-shape)
-          (update :order #(mapv unmark %))
-
-          (:branches dag-shape)
-          (update :branches (fn [bs] (mapv #(mapv unmark %) bs)))
-
-          (:source dag-shape)
-          (update :source unmark)
-
-          (:sink dag-shape)
-          (update :sink unmark)
-
-          (:internal-edges dag-shape)
-          (update :internal-edges #(mapv unmark-edge %)))))))
+                            x))]
+        (unmark-shape-tree dag-shape unmark)))))
 
 ;; ============================================================================
 ;; Tree assembly

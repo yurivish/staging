@@ -152,6 +152,37 @@
       (is (= [:d] (nth (:order shape) 3)))
       (is (= [:sink] (nth (:order shape) 4))))))
 
+(deftest mixed-cycles-and-sp-recurse-via-unmark
+  (testing "Two cycles in series at one level: src → (A↔B) → join → (C↔D) → sink"
+    (let [src   (step/step :src  {:ins {:in ""} :outs {:out ""}}                       (fn [_ _ _] {}))
+          a     (step/step :a    {:ins {:in "" :loop ""} :outs {:fwd "" :back ""}}     (fn [_ _ _] {}))
+          b     (step/step :b    {:ins {:in ""} :outs {:back ""}}                      (fn [_ _ _] {}))
+          join  (step/step :join {:ins {:in ""} :outs {:out ""}}                       (fn [_ _ _] {}))
+          c     (step/step :c    {:ins {:in "" :loop ""} :outs {:fwd "" :back ""}}     (fn [_ _ _] {}))
+          d     (step/step :d    {:ins {:in ""} :outs {:back ""}}                      (fn [_ _ _] {}))
+          snk   (step/sink)
+          sm (-> (step/beside src a b join c d snk)
+                 (step/connect [:src :out]   [:a :in])
+                 (step/connect [:a :back]    [:b :in])
+                 (step/connect [:b :back]    [:a :loop])
+                 (step/connect [:a :fwd]     [:join :in])
+                 (step/connect [:join :out]  [:c :in])
+                 (step/connect [:c :back]    [:d :in])
+                 (step/connect [:d :back]    [:c :loop])
+                 (step/connect [:c :fwd]     [:sink :in]))
+          shape (:shape (shape/decompose (step/topology sm)))]
+      (is (= :chain (:kind shape))
+          "outer level decomposes as chain (cycles condense to opaque markers, then chain across them)")
+      (is (= 5 (count (:order shape)))
+          ":order = [src, cycle1, join, cycle2, sink]")
+      (is (= [:src] (first (:order shape))))
+      (is (= [:join] (nth (:order shape) 2)))
+      (is (= [:sink] (last (:order shape))))
+      (is (= :cycle (:kind (nth (:order shape) 1)))
+          "first cycle properly unmarked")
+      (is (= :cycle (:kind (nth (:order shape) 3)))
+          "second cycle properly unmarked"))))
+
 (deftest wheatstone-bridge-stays-prime
   (testing "src → {A, B}, A → {C, T}, B → C, C → T (T = sink): non-SP, falls to :prime"
     (let [src (step/step :src {:ins {:in ""} :outs {:to-a "" :to-b ""}} (fn [_ _ _] {}))
