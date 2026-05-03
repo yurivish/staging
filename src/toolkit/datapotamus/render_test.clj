@@ -49,7 +49,7 @@
     (is (every? #(not (re-find #"[←→]" %)) out))))
 
 (deftest scatter-gather-marks-branches-with-bracket-rail
-  (testing "heterogeneous branches form a ⎡⎢⎣ bracket rail"
+  (testing "heterogeneous branches form a ⎢ rail (one row per branch)"
     (let [sm (step/serial
               (step/step :pre inc)
               (cc/parallel :p
@@ -57,11 +57,10 @@
                             :y (step/step :sy inc)
                             :z (step/step :sz inc)})
               (step/sink))
-          out (lines sm)]
-      (is (some #(str/includes? % "⎡") out)
-          "expected at least one ⎡ (top corner)")
-      (is (some #(str/includes? % "⎣") out)
-          "expected at least one ⎣ (bottom corner)"))))
+          out (lines sm)
+          rail-lines (filter #(str/includes? % "⎢") out)]
+      (is (= 3 (count rail-lines))
+          (str "expected 3 ⎢ rail rows (one per branch); got: " (pr-str out))))))
 
 (deftest scatter-gather-source-and-sink-no-fall-through
   (let [sm (cc/parallel :p

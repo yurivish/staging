@@ -94,34 +94,30 @@
     tagged))
 
 (defn- apply-bracket-rail
-  "Decorate a flat seq of branch lines with the parallel-section bracket
-   `⎡⎢⎣` and absorb in-branch chain fall-through into the rail itself. Each line
-   gets a 2-character prefix `<bracket><↓ or space>` flush against the
-   content:
-     - `⎡↓name` — first line of bracket, in-branch fall-through to next line.
-     - `⎡ name` — first line of bracket, no in-branch fall-through.
-     - `⎢↓name` / `⎢ name` — middle lines.
-     - `⎣ name` — last line of bracket; never has fall-through.
-     - `⎢ name` (alone) — single-line bracket.
+  "Decorate a flat seq of branch lines with the parallel-section
+   `⎢` rail and absorb in-branch chain fall-through into the rail
+   itself. Each line gets a 2-character prefix `⎢<↓ or space>`:
+     - `⎢↓name` — in-branch fall-through to next line.
+     - `⎢ name` — no in-branch fall-through.
+   Corners (`⎡⎣`) are deliberately omitted — they were ambiguous
+   about whether the parent line above belongs to the bracket. A
+   uniform `⎢` rail says \"these lines are siblings under the parent
+   above\" without that ambiguity. Last line never has fall-through
+   (nothing inside the bracket after it).
    Leading whitespace on the input line is fully replaced — all
    bracket-wrapped content sits at the same column relative to the
    rail, regardless of nesting depth. Inner brackets re-introduce
-   visual offset where needed. Output `:fall-through?` is cleared so `finalize`
-   doesn't also emit a left-column `↓` for the same line."
+   visual offset where needed. Output `:fall-through?` is cleared so
+   `finalize` doesn't also emit a left-column `↓` for the same line."
   [tagged-lines]
   (let [total (count tagged-lines)]
     (vec
      (map-indexed
       (fn [i {:keys [line fall-through? paths]}]
         (let [last? (= (dec total) i)
-              bracket (cond
-                        (and (= 0 i) (= 1 total)) "⎢"
-                        (= 0 i) "⎡"
-                        last? "⎣"
-                        :else "⎢")
               fall-through-mark (if (and fall-through? (not last?)) "↓" " ")
               rest-line (str/replace line #"^\s+" "")
-              new-line (str bracket fall-through-mark rest-line)]
+              new-line (str "⎢" fall-through-mark rest-line)]
           {:line new-line :fall-through? false :paths paths}))
       tagged-lines))))
 
