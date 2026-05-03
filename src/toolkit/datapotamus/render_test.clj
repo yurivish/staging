@@ -62,13 +62,18 @@
       (is (= 3 (count rail-lines))
           (str "expected 3 ⎢ rail rows (one per branch); got: " (pr-str out))))))
 
-(deftest scatter-gather-source-and-sink-no-fall-through
-  (let [sm (cc/parallel :p
-                        {:a (step/step :sa inc)
-                         :b (step/step :sb inc)})
-        out (lines sm)]
-    (is (every? #(str/starts-with? % "  ") out)
-        "no scatter-gather elements get ↓ — all start with two-space placeholder")))
+(deftest scatter-gather-source-has-fall-through-sink-does-not
+  (testing "source always has ↓ (edge to first branch is real); sink doesn't unless container has outer chain successor"
+    (let [sm (cc/parallel :p
+                          {:a (step/step :sa inc)
+                           :b (step/step :sb inc)})
+          out (lines sm)
+          fan-out-line (some #(when (str/includes? % "fan out") %) out)
+          fan-in-line  (some #(when (str/includes? % "fan in") %) out)]
+      (is (str/starts-with? fan-out-line "↓ ")
+          (str "expected ↓ on fan out (source always has edge to first branch); got: " (pr-str fan-out-line)))
+      (is (str/starts-with? fan-in-line "  ")
+          (str "expected no ↓ on fan in (no outer chain successor); got: " (pr-str fan-in-line))))))
 
 (deftest identical-branches-compress-to-k-times
   (testing "round-robin-workers: K identical workers → '<K>× <inner>'"

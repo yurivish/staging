@@ -85,13 +85,23 @@
     tagged))
 
 (defn- with-fall-through
-  "Set :fall-through? on the FIRST line of `tagged` (the order-element's
-   representative line in its parent shape). Inner lines keep whatever
-   :fall-through? they got from their own shape rendering."
+  "Set :fall-through? on both the FIRST and LAST line of `tagged`. The
+   first is the element's header in its parent shape; the last is its
+   rendered exit point — for a leaf they're the same line; for a
+   container with internal chain they differ. Setting both means the
+   element's outer fall-through visually propagates from its header
+   down through nested content to its exit, so the reader sees a
+   continuous ↓ trail across container boundaries."
   [tagged fall-through?]
-  (if (seq tagged)
-    (cons (assoc (first tagged) :fall-through? (boolean fall-through?)) (rest tagged))
-    tagged))
+  (let [v (vec tagged)
+        n (count v)
+        ft (boolean fall-through?)]
+    (cond
+      (zero? n) v
+      (= 1 n)   (assoc-in v [0 :fall-through?] ft)
+      :else     (-> v
+                    (assoc-in [0 :fall-through?] ft)
+                    (assoc-in [(dec n) :fall-through?] ft)))))
 
 (defn- apply-bracket-rail
   "Decorate a flat seq of branch lines with the parallel-section
@@ -631,18 +641,18 @@
     ;; `source → K× block → sink`, so we add fall-through on source
     ;; and the K× header, and decorate the block with a single-row
     ;; `⎢` rail to keep the parallel-bracket signal visible.
-    ;; Uncompressed mode: source has edges to multiple branches;
-    ;; fall-through would imply a single successor, so we suppress it
-    ;; and let the multi-row bracket rail carry the structure.
+    ;; Uncompressed mode: source still has an edge to the first
+    ;; branch, so it gets ↓ too — the rule is "↓ if next visible line
+    ;; is a real successor," and that's true even when there are
+    ;; OTHER successors as well.
     (let [branch-depth depth
           branches (:branches shape)
           rendered (mapv #(branch-rendered % children-map branch-depth) branches)
           result (compress-branches rendered)
           [k mode] result
-          collapsed? (= :collapsed mode)
           source-lines (with-fall-through
                         (render-elt (:source shape) children-map depth)
-                        collapsed?)
+                        true)
           branch-lines (case mode
                          :collapsed
                          (let [[_ _ payload all-paths] result
