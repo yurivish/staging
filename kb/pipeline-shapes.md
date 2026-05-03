@@ -224,6 +224,93 @@ Cycle aggregation in action (16 identical worker triples):
 The `↓` column reads the spine; the `→ coord` annotation marks the
 feedback edge from `ext` back to `coord` that closes the SCC.
 
+## Algorithm-boundary demos
+
+The everyday pipelines (registry in `src/datapotamus_export.clj`) are
+all series-parallel with symmetric cycles by construction, so several
+algorithms in this pass exist for shapes that real pipelines never
+trigger. Three handcrafted demos isolate each one. Generator at
+`dev/render_algorithm_demos.clj`.
+
+### `prime-bowtie` — Kahn topo sort + `:prime` fallback
+
+Two independent input streams converge at a merge node, then fan out
+to two independent sinks. Two sources (`stream-a`, `stream-b`) and two
+sinks (`sink-x`, `sink-y`) at one container level fail
+`classify-dag`'s single-source / single-sink check, so it falls
+through to `:prime`. `kahn-order` produces `:order`; every edge ends
+up in `:internal-edges`; off-spine forwards (`→`) annotate the
+non-consecutive edges.
+
+```
+  stream a  → merge
+↓ stream b
+↓ merge  → sink y
+  sink x
+  sink y
+```
+
+No bracket rail (not scatter-gather). The two `→` annotations show
+where edges skip spine positions: `stream-a → merge` skips `stream-b`,
+`merge → sink-y` skips `sink-x`.
+
+### `asymmetric-cycle` — Eades–Lin–Smyth FAS heuristic
+
+A 5-node validation loop with asymmetric in/out degrees:
+
+| node | out | in | score |
+|---|---|---|---|
+| `intake` | 2 | 1 | +1 |
+| `format-check` | 1 | 1 | 0 |
+| `content-check` | 1 | 1 | 0 |
+| `decide` | 1 | 2 | −1 |
+| `retry` | 1 | 1 | 0 |
+
+Eades has no empty source / empty sink to peel, so it picks the
+highest-score node — `intake`. After dropping intake's edges, both
+checkers are empty sources (lex tiebreak picks `content-check` first),
+then `format-check`, `decide`, `retry`. The single back-edge
+(`retry → intake`) closes the loop and shows up as `← intake` on the
+last line — exactly the FAS we want.
+
+```
+↓ intake  → format check
+  content check  → decide
+↓ format check
+↓ decide
+  retry  ← intake
+```
+
+Compare with `stealing-workers` / `round-robin-workers`: every member
+there has the same degree by construction, so the score is a wash and
+lex tiebreak does all the work. Here the score actually discriminates,
+putting the source-leaning node at the start regardless of name.
+
+### `partial-bipartite-cycle` — faithfulness-gate bail
+
+Six-node SCC: three `shifter-*` and three `target-*`. Each shifter
+sends to two consecutive targets in a cyclic shift; each target sends
+back to one shifter. All three shifters have identical structural
+neighborhoods (1 in, 2 outs to target-class members) so 1-WL keeps
+them in one class; same for targets.
+
+But the shifter→target edge multiset has 6 edges out of 9 possible:
+not a bijection (`|ij| ≠ |Ci|`), not complete
+(`|ij| ≠ |Ci|·|Cj|`). The pattern is `:partial`, so `aggregate-cycle`
+returns `nil` and the renderer falls back to per-member output.
+
+```
+  shifter 0  → target 0, → target 1
+↓ shifter 1  → target 2
+↓ target 1
+↓ shifter 2  → target 2
+  target 0  ← shifter 1
+  target 2  ← shifter 0
+```
+
+Without this demo the gate's `:partial` branch is untested by the
+registry — every real cycle hits one of the four faithful patterns.
+
 ## Mathematical framing
 
 Two literatures speak directly to this decomposition.

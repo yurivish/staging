@@ -31,11 +31,18 @@
     (let [s (last path)]
       (if (keyword? s) (name s) (str s)))))
 
+(defn- humanize-sid
+  "Humanize a step id the same way `step/topology` humanizes leaf
+   names — keyword `:format-check` → `format check`. Keeps annotation
+   text consistent with the displayed leaf name."
+  [s]
+  (when s (str/replace s "-" " ")))
+
 (defn- elt-name
   "Short name for an :order element used in inline annotations."
   [elt]
   (cond
-    (vector? elt) (or (last-sid elt) "")
+    (vector? elt) (or (humanize-sid (last-sid elt)) "")
 
     (and (map? elt) (= :cycle (:kind elt)))
     (str "↻" (when-let [m (first (:order elt))] (elt-name m)))
