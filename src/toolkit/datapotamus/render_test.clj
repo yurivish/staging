@@ -20,7 +20,7 @@
     (is (= ["  only"] (lines sm)))))
 
 (deftest two-cycle-uses-named-back-arrow
-  (testing "agent ↔ worker: spine agent→worker, worker→agent rendered as ⤴ agent"
+  (testing "agent ↔ worker: spine agent→worker, worker→agent rendered as ⬏ agent"
     (let [agent  (step/step :agent
                             {:ins {:in "" :loop ""}
                              :outs {:to "" :final ""}}
@@ -37,9 +37,9 @@
       (is (str/starts-with? (first out) "↓ ")
           "agent has fall-through to worker (spine edge)")
       ;; Backward edge always names the target — even adjacent.
-      (is (str/includes? (second out) "⤴ agent")
-          (str "expected '⤴ agent' on worker line; got: " (pr-str (second out))))
-      (is (not (str/includes? (second out) "⤵"))))))
+      (is (str/includes? (second out) "⬏ agent")
+          (str "expected '⬏ agent' on worker line; got: " (pr-str (second out))))
+      (is (not (str/includes? (second out) "⬎"))))))
 
 (deftest prime-two-disjoint-no-fall-through-no-annotations
   (let [sm (step/beside (step/step :a inc) (step/step :b inc))

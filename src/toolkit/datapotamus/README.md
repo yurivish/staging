@@ -557,8 +557,8 @@ Quick reference:
 | Name at a deeper column inside a bracket | Continuation of the previous arm's chain |
 | `↓` left column | Outer-shape chain flow (between same-indent siblings) |
 | `↓` next to a bracket char (`⎢↓ `) | In-branch chain flow within a parallel arm |
-| `⤴ <name>` right | Back-edge to a line above (always named) — across-then-up |
-| `⤵ <name>` right | Forward off-spine to a non-adjacent line below — across-then-down |
+| `⬏ <name>` right | Back-edge to a line above (always named) — across-then-up |
+| `⬎ <name>` right | Forward off-spine to a non-adjacent line below — across-then-down |
 | `K× <name>` | K identical parallel things collapsed |
 | `<name> (combinator)` on a container line | Marks containers built by named combinators (`parallel`, `round-robin-workers`, `stealing-workers`) so the reader doesn't have to infer from the inner proc shape |
 
@@ -603,10 +603,10 @@ block. Inter-class edges are summarized using one of these patterns
 
 | Pattern | Condition | Display |
 |---|---|---|
-| **fan-in** | every `Ci`-member → singleton `Cj` | `K× xK ⤵ y` |
-| **fan-out** | singleton `Ci` → every `Cj`-member | `x ⤴ K× yK` |
-| **bijection** | `\|Ci\| = \|Cj\| = K`, edges form a perfect matching | `K× xK ⤵ yK` (suffix-K convention) |
-| **complete** | every `Ci`-member → every `Cj`-member | `K× xK ⤵ K× yK` |
+| **fan-in** | every `Ci`-member → singleton `Cj` | `K× xK ⬎ y` |
+| **fan-out** | singleton `Ci` → every `Cj`-member | `x ⬏ K× yK` |
+| **bijection** | `\|Ci\| = \|Cj\| = K`, edges form a perfect matching | `K× xK ⬎ yK` (suffix-K convention) |
+| **complete** | every `Ci`-member → every `Cj`-member | `K× xK ⬎ K× yK` |
 
 If any inter-class pattern is *partial* (none of the above), the
 faithfulness gate bails on aggregation for that shape; per-member
@@ -620,11 +620,11 @@ rendering is used. To force per-member rendering globally, pass
 
 Disaggregation is lossless — any block aggregation can be expanded.
 - **Right** (after the name):
-  - `⤴ <name>` — back-edge to a line above (always named).
-  - `⤵ <name>` — forward off-spine to a non-adjacent line below.
+  - `⬏ <name>` — back-edge to a line above (always named).
+  - `⬎ <name>` — forward off-spine to a non-adjacent line below.
   - (Adjacent forward = the spine, encoded by left `↓` only.)
-  - The arrows visually indicate the path: `⤴` goes across-then-up
-    to find the target above; `⤵` goes across-then-down.
+  - The arrows visually indicate the path: `⬏` goes across-then-up
+    to find the target above; `⬎` goes across-then-down.
 
 Reading rule: a `↓` in the left column says "the next visible line
 is a real edge from me at this shape's level"; everything else is
