@@ -250,7 +250,15 @@
   [paths edges S T]
   (let [middle (disj (set paths) S T)
         middle-edges (filterv (fn [[u v]] (and (middle u) (middle v))) edges)
-        components (weak-components middle middle-edges)
+        components (->> (weak-components middle middle-edges)
+                        ;; Sort each component lex; sort components by
+                        ;; their first node-key. Clojure's compare on
+                        ;; vectors orders shorter vecs first regardless
+                        ;; of content, which would put multi-element
+                        ;; chains last — first-key sort gives proper
+                        ;; lex ordering across all branches.
+                        (mapv #(vec (sort-by node-key %)))
+                        (sort-by #(node-key (first %))))
         has-direct? (boolean (some (fn [[u v]] (and (= u S) (= v T))) edges))]
     (when (>= (count components) (if has-direct? 1 2))
       (let [branch-shapes

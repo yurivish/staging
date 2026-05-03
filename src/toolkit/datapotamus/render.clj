@@ -208,11 +208,24 @@
       (apply concat
              (map-indexed
               (fn [i elt]
-                (with-fall-through (render-elt elt children-map (+ branch-depth i))
-                         (< i (dec n))))
+                (let [rendered (render-elt elt children-map (+ branch-depth i))]
+                  ;; Mirror render-shape's :chain handling: inline
+                  ;; sub-shape records don't get with-fall-through
+                  ;; propagation (their internal lines are siblings,
+                  ;; not chain successors of each other).
+                  (if (and (map? elt) (= :scatter-gather (:kind elt)))
+                    rendered
+                    (with-fall-through rendered (< i (dec n))))))
               order)))
 
-    :empty []
+    :empty
+    ;; A direct source→sink branch (no intermediate steps). Render as
+    ;; a single marker row so the rail invariant "↓ above a ⎢ rail
+    ;; means fan out to every member" stays correct — without the
+    ;; marker, the direct path is invisible and the rail looks like
+    ;; it has fewer members than it really does.
+    [{:line (str (indent branch-depth) "(direct)")
+      :fall-through? false :paths []}]
 
     ;; Non-chain branch (scatter-gather, cycle, prime as a sub-shape).
     ;; Recurse via render-shape; outer bracket rail wraps the result.
