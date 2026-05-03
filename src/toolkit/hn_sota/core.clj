@@ -27,9 +27,12 @@
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.obs.store :as store]
             [toolkit.datapotamus.recorder :as recorder]
+            [toolkit.datapotamus.render.live :as live]
+            [toolkit.datapotamus.render.stats :as stats]
             [toolkit.datapotamus.step :as step]
             [toolkit.datapotamus.trace :as trace]
             [toolkit.hn-sota.algolia :as algolia]
+            [toolkit.hn-sota.lineage :as lineage]
             [toolkit.hn-sota.models :as models]
             [toolkit.hn-sota.sentiment :as sentiment]
             [toolkit.hn.tree-fetch :as tree-fetch]
@@ -257,3 +260,57 @@
      (when (and (= :completed (:state result)) out-path)
        (spit out-path (with-out-str (json/pprint rows))))
      {:state (:state result) :count (count rows) :rows rows :error (:error result)})))
+
+;; ---- run-live! — manual start/inject/stop with live tree view --------------
+
+(defn run-live!
+  "Like `run-once!` but drives the flow manually so we can attach
+   `render.live/watch!` for a periodic terminal redraw of the tree
+   with per-step stats (counts, latency p50/p99, queue depth).
+
+   Opts: same as `run-once!` plus
+     :interval-ms — redraw period in ms (default 250)
+
+   The DuckDB trace store is mandatory for this entry point — the
+   final ranking is read back from `lineage/ranking` after quiescence
+   rather than from a `run-seq` collector. Pass `:db-path` (defaults
+   to a tempfile in /tmp).
+
+   Returns `{:state :rows :db-path :error}`."
+  ([] (run-live! {}))
+  ([{:keys [db-path interval-ms] :as opts
+     :or   {interval-ms 250}}]
+   (let [db        (or db-path
+                       (str "/tmp/hn-sota-" (System/currentTimeMillis) ".duckdb"))
+         ;; build-flow leaves :out unwired (run-seq normally adds its
+         ;; own collector); manual start! needs a sink to terminate
+         ;; the chain or quiescence reports a missing channel.
+         flow      (step/serial :hn-sota-live (build-flow opts) (step/sink))
+         ps        (pubsub/make)
+         watcher   (stats/make)
+         _         (stats/attach! ps watcher)
+         run-meta  (store/make-run-meta flow {:workflow-id "hn-sota"})
+         rec       (recorder/start-recorder! ps run-meta)
+         handle    (flow/start! flow {:pubsub ps})
+         stop-view (live/watch! handle flow watcher {:interval-ms interval-ms})]
+     (flow/inject! handle {:data :tick})
+     (flow/inject! handle {})  ; close boundary input
+     (flow/await-quiescent! handle)
+     (stop-view)
+     (let [trace0 ((:stop rec))
+           result (flow/stop! handle)
+           trace  (-> trace0
+                      (update :run store/finalize-run-meta)
+                      (assoc-in [:run :status]
+                                (if (= :completed (:state result)) "ok" "error")))]
+       (println)
+       (println (format "flushing %d events to %s …"
+                        (count (:events trace0)) db))
+       (let [t0 (System/nanoTime)]
+         (store/flush-run! db trace)
+         (println (format "flushed in %dms"
+                          (long (/ (- (System/nanoTime) t0) 1e6)))))
+       {:state   (:state result)
+        :error   (:error result)
+        :db-path db
+        :rows    (lineage/ranking db)}))))

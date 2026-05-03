@@ -44,11 +44,11 @@
                        (redraw stepmap
                                (stats/stats-map-from-flow
                                 flow-handle stepmap watcher))
+                       (Thread/sleep (long interval-ms))
                        (catch InterruptedException _
                          (vreset! stop? true))
                        (catch Throwable t
-                         (println "live/watch! redraw error:" (ex-message t))))
-                     (Thread/sleep (long interval-ms)))))]
+                         (println "live/watch! redraw error:" (ex-message t)))))))]
      (.setDaemon thread true)
      (.start thread)
      (fn stop! []
