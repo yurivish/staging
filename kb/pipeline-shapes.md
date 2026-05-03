@@ -85,15 +85,27 @@ the same vocabulary covers any directed graph at any level.
 
 | Kind | Has | What it represents |
 |---|---|---|
-| `:empty` | — | container with no internal edges |
+| `:empty` | — | container with no internal edges, or a "phantom" branch (direct src→sink edge in a parallel) |
 | `:chain` | `:order` | linear sequence; off-spine = ∅ |
-| `:scatter-gather` | `:source`, `:sink`, `:branches` | one→K disjoint chains→one; off-spine = ∅ |
+| `:scatter-gather` | `:source`, `:sink`, `:branches` | one→K disjoint sub-shapes→one; off-spine = ∅ |
 | `:cycle` | `:order`, `:internal-edges` | non-trivial SCC; off-spine = back-edges |
-| `:prime` | `:order`, `:internal-edges` | irreducible non-SP residue; off-spine = forward skips |
+| `:prime` | `:order`, `:internal-edges`, optionally `:source`/`:sink` | irreducible non-SP residue; off-spine = forward skips |
 
-Within `:order` and `:branches`, an element is either a path (atomic
-node) or a nested `{:kind :cycle ...}` record. `:internal-edges`
-endpoints match `:order` elements one-to-one.
+Within `:order` and `:branches`, elements may be:
+
+- A **path** (vec) — an atomic node.
+- A nested **`:cycle`** record — re-inflated SCC.
+- A nested **`:scatter-gather`** record — implicit sub-parallel inside
+  a chain (no explicit fan-out/fan-in container; e.g., a Y-shape
+  topology decomposes the chain `[src, sg-record, join, sink]`).
+- A nested **`:prime`** record — non-SP cluster between two chain
+  neighbors. Has `:source` / `:sink` fields giving its boundary
+  nodes; `:order` is the cluster interior (boundary nodes stripped).
+
+`:branches` is a vec of recursively-decomposed sub-shapes (chain /
+scatter-gather / cycle / prime / empty). Each branch represents the
+*middle* structure between the parent's source and sink — the shared
+endpoints aren't duplicated inside the branch's `:order`.
 
 ## Spine + off-spine: the unifying frame
 
@@ -358,6 +370,30 @@ series-parallel + Tarjan-cycle decomposition**.
 
 Categorical framing: **a morphism in the free traced symmetric
 monoidal category, presented as a tree of wiring diagrams**.
+
+## Verification
+
+The decomposition is checked against random SP-DAGs by a property-
+based test suite (`shape_test.clj`). Generators recursively compose
+SP-trees from `:series` and `:parallel` operators with `:leaf`
+atoms, materialize them into topologies, and verify properties:
+
+- **`sp-dag-decomposes-without-prime`** — random SP-DAGs never produce
+  a `:prime` node (they're SP by construction).
+- **`sp-dag-leaves-preserved`** — the decomposition tree's leaf count
+  matches the original topology.
+- **`sp-dag-decomposition-is-idempotent`** — deterministic.
+- **`render-is-total-on-sp-dags`** — every node's name appears in the
+  rendered output (no leaf is invisible).
+- **`wheatstone-insertion-yields-prime`** — perturbing an SP-DAG with
+  a wheatstone-bridge sub-graph produces a `:prime` cluster
+  somewhere in the decomposition.
+- **`render-is-total-on-perturbed-dags`** — non-SP DAGs still render
+  without crashing.
+
+Empirical evidence (50 trials × multiple seeds) that the algorithm
+covers arbitrary SP topologies, not just the structures our 27
+combinators produce.
 
 ## Edges have no metadata
 
