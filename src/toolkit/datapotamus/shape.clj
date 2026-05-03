@@ -218,20 +218,36 @@
 
 (defn- strip-shape-endpoints
   "Strip leading S and trailing T from `shape`'s :order so the shape
-   represents only the middle structure between S and T. Used after
-   recursing on a branch's full sub-DAG, so the resulting branch
-   shape doesn't duplicate the parallel-section's shared endpoints
-   (which the outer chain or rail already shows). Empty result
-   becomes :empty."
+   represents only the middle structure between S and T. Also filter
+   :internal-edges (for :prime) to drop edges incident on S or T —
+   those edges crossed the boundary and don't belong inside the
+   stripped sub-shape. Used after recursing on a branch's full
+   sub-DAG. Empty :order becomes :empty."
   [shape S T]
   (case (:kind shape)
-    (:chain :prime)
+    :chain
     (let [order (:order shape)
           v1 (if (= S (first order)) (vec (rest order)) order)
           v2 (if (and (seq v1) (= T (last v1))) (vec (butlast v1)) v1)]
       (if (empty? v2)
         {:kind :empty}
         (assoc shape :order v2)))
+
+    :prime
+    (let [order (:order shape)
+          v1 (if (= S (first order)) (vec (rest order)) order)
+          v2 (if (and (seq v1) (= T (last v1))) (vec (butlast v1)) v1)
+          interior (set v2)]
+      (if (empty? v2)
+        {:kind :empty}
+        (-> shape
+            (assoc :order v2)
+            (update :internal-edges
+                    (fn [es]
+                      (vec (filter (fn [[u v]]
+                                     (and (interior u) (interior v)))
+                                   es)))))))
+
     shape))
 
 (defn- try-parallel-decompose

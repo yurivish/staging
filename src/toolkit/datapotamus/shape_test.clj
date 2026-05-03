@@ -1,10 +1,12 @@
 (ns toolkit.datapotamus.shape-test
   (:require [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [toolkit.datapotamus.combinators.core :as cc]
+            [toolkit.datapotamus.render :as render]
             [toolkit.datapotamus.shape :as shape]
             [toolkit.datapotamus.step :as step]))
 
@@ -290,7 +292,7 @@
         src (fresh-id)
         snk (fresh-id)
         graph (materialize-sp tree src snk fresh-id)]
-    {:nodes (mapv (fn [path] {:path path :kind :leaf})
+    {:nodes (mapv (fn [path] {:path path :kind :leaf :name (name (last path))})
                   (sort (:nodes graph)))
      :edges (mapv (fn [[u v]] {:from-path u :to-path v})
                   (:edges graph))}))
@@ -368,3 +370,27 @@
       (or (nil? perturbed)
           (let [shape-tree (shape/decompose perturbed)]
             (contains-prime? (:shape shape-tree)))))))
+
+(defspec render-is-total-on-sp-dags
+  50
+  (prop/for-all [tree gen-sp-tree]
+    ;; Generated SP-DAG must render without crashing, and the rendered
+    ;; output must contain every leaf node's name at least once
+    ;; (no leaf is invisible).
+    (let [topology (sp-tree->topology tree)
+          lines (try (render/render topology) (catch Throwable _ nil))
+          names (set (map (comp name last :path) (:nodes topology)))
+          rendered-text (str/join "\n" (or lines []))]
+      (and (some? lines)
+           (every? #(str/includes? rendered-text %) names)))))
+
+(defspec render-is-total-on-perturbed-dags
+  50
+  (prop/for-all [tree gen-sp-tree]
+    ;; Wheatstone-perturbed DAG must also render without crashing.
+    (let [topology (sp-tree->topology tree)
+          perturbed (insert-wheatstone topology)]
+      (or (nil? perturbed)
+          (try
+            (boolean (seq (render/render perturbed)))
+            (catch Throwable _ false))))))
