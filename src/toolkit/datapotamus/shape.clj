@@ -216,53 +216,59 @@
 
 (declare classify-dag)
 
-(defn- clean-parallel-component?
-  "Is `comp` a clean two-terminal sub-DAG: single source connected from
-   S, single sink connected to T, and no S/T edges crossing the
-   component except through that one source/sink?"
-  [comp edges S T]
-  (let [comp-set  (set comp)
-        int-edges (filter (fn [[u v]] (and (comp-set u) (comp-set v))) edges)
-        cs (build-succ int-edges)
-        cp (build-pred int-edges)
-        comp-srcs (filter #(empty? (get cp %)) comp-set)
-        comp-snks (filter #(empty? (get cs %)) comp-set)]
-    (when (and (= 1 (count comp-srcs))
-               (= 1 (count comp-snks)))
-      (let [src-of (first comp-srcs)
-            snk-of (first comp-snks)]
-        (and (some (fn [[u v]] (and (= u S) (= v src-of))) edges)
-             (some (fn [[u v]] (and (= u snk-of) (= v T))) edges)
-             (every? (fn [[u v]]
-                       (or (not= u S)
-                           (not (comp-set v))
-                           (= v src-of)))
-                     edges)
-             (every? (fn [[u v]]
-                       (or (not= v T)
-                           (not (comp-set u))
-                           (= u snk-of)))
-                     edges))))))
+(defn- strip-shape-endpoints
+  "Strip leading S and trailing T from `shape`'s :order so the shape
+   represents only the middle structure between S and T. Used after
+   recursing on a branch's full sub-DAG, so the resulting branch
+   shape doesn't duplicate the parallel-section's shared endpoints
+   (which the outer chain or rail already shows). Empty result
+   becomes :empty."
+  [shape S T]
+  (case (:kind shape)
+    (:chain :prime)
+    (let [order (:order shape)
+          v1 (if (= S (first order)) (vec (rest order)) order)
+          v2 (if (and (seq v1) (= T (last v1))) (vec (butlast v1)) v1)]
+      (if (empty? v2)
+        {:kind :empty}
+        (assoc shape :order v2)))
+    shape))
 
 (defn- try-parallel-decompose
-  "If the level is a strict parallel composition — every middle weak
-   component is a clean two-terminal sub-DAG with a single source
-   connected to S and a single sink connected to T — return the
-   scatter-gather record (each branch recursively decomposed). nil
-   otherwise."
+  "If the level decomposes as parallel — at least 2 weakly-connected
+   middle components (or 1 component plus a direct S→T edge) — return
+   the scatter-gather record. Each branch is recursively decomposed
+   from its FULL sub-DAG (including S and T), capturing all edges
+   incident to the component — including 'shortcut' edges from S
+   directly to a non-source-of-comp middle node, or from a non-sink-of-
+   comp node directly to T. Without those edges, a wheatstone-bridge
+   sub-graph in a branch would be invisible (its middle-only view is
+   SP-decomposable; the wheatstone-ness is in the cross-edges).
+
+   The branch shape's :source and :sink fields equal S and T (shared
+   with the outer chain when this sg is embedded inline)."
   [paths edges S T]
   (let [middle (disj (set paths) S T)
-        middle-edges (filter (fn [[u v]] (and (middle u) (middle v))) edges)
+        middle-edges (filterv (fn [[u v]] (and (middle u) (middle v))) edges)
         components (weak-components middle middle-edges)
         has-direct? (boolean (some (fn [[u v]] (and (= u S) (= v T))) edges))]
-    (when (and (or (seq components) has-direct?)
-               (every? #(clean-parallel-component? % edges S T) components))
+    (when (>= (count components) (if has-direct? 1 2))
       (let [branch-shapes
             (mapv (fn [comp]
                     (let [comp-set (set comp)
-                          int-edges (filterv (fn [[u v]] (and (comp-set u) (comp-set v)))
-                                             edges)]
-                      (classify-dag (vec comp-set) int-edges)))
+                          ;; Branch sub-DAG: {S} ∪ comp ∪ {T} with all
+                          ;; edges restricted (excluding the direct
+                          ;; S→T shortcut, which is its own :empty
+                          ;; branch).
+                          branch-paths (vec (concat [S T] comp))
+                          br-set (set branch-paths)
+                          branch-edges (filterv
+                                        (fn [[u v]]
+                                          (and (br-set u) (br-set v)
+                                               (not (and (= u S) (= v T)))))
+                                        edges)]
+                      (-> (classify-dag branch-paths branch-edges)
+                          (strip-shape-endpoints S T))))
                   components)]
         {:kind :scatter-gather
          :source S
