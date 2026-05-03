@@ -118,8 +118,8 @@
       (is (seq k-lines)
           (str "expected at least one K× pattern line; got: " (pr-str out))))))
 
-(deftest in-branch-ft-lives-in-bracket-rail-not-left-column
-  (testing "Multi-element parallel branches: ↓ for in-branch fall-through lives next to bracket char, not in left column"
+(deftest bracket-rail-fall-through-vs-branch-exit
+  (testing "Multi-element parallel branches: in-branch ↓ lives in the rail (`⎢↓`); branch-exit ↓ lives in the left column. The two never co-occur on the same line."
     (let [sm (step/serial
               (step/step :pre inc)
               (cc/parallel :p
@@ -128,12 +128,25 @@
               (step/sink))
           out (lines sm)
           bracket-lines (filter #(re-find #"[⎡⎢⎣]" %) out)]
-      ;; No bracket line should start with `↓ ` in the left column.
-      (is (every? #(not (str/starts-with? % "↓ ")) bracket-lines)
-          (str "expected no left-column ↓ on bracket lines, got: " (pr-str bracket-lines)))
-      ;; At least one line should have a bracket-flush `↓` (in-branch fall-through).
-      (is (some #(re-find #"[⎡⎢]↓" %) bracket-lines)
-          (str "expected at least one bracket-flush ↓, got: " (pr-str bracket-lines))))))
+      ;; In-branch ↓ (rail-flush) must appear on each branch's
+      ;; non-final element — here a1 and b1. The mark slot is 2 chars
+      ;; wide (`↓ `) so content stays column-aligned.
+      (is (some #(re-find #"⎢↓ a1\b" %) bracket-lines)
+          (str "expected `⎢↓ a1` (a1's in-branch ↓ to a2), got: " (pr-str bracket-lines)))
+      (is (some #(re-find #"⎢↓ b1\b" %) bracket-lines)
+          (str "expected `⎢↓ b1` (b1's in-branch ↓ to b2), got: " (pr-str bracket-lines)))
+      ;; Branch-exit ↓ (left-column) must appear on each branch's last
+      ;; element — here a2 and b2 (they feed fan-in below the rail).
+      ;; Non-fall mark slot is `  ` (2 spaces) for column alignment.
+      (is (some #(re-find #"^↓ ⎢  a2\b" %) bracket-lines)
+          (str "expected `↓ ⎢  a2` (branch-exit ↓), got: " (pr-str bracket-lines)))
+      (is (some #(re-find #"^↓ ⎢  b2\b" %) bracket-lines)
+          (str "expected `↓ ⎢  b2` (branch-exit ↓), got: " (pr-str bracket-lines)))
+      ;; Mutual exclusion: no line has BOTH a left-column ↓ AND a
+      ;; rail-flush ↓ — those signals describe different flows.
+      (is (every? #(not (and (str/starts-with? % "↓ ")
+                             (re-find #"[⎡⎢]↓" %))) bracket-lines)
+          (str "expected no line with both left-column ↓ and rail ↓, got: " (pr-str bracket-lines))))))
 
 (deftest scatter-gather-branches-render-in-chain-order
   (testing "branch elements appear in source-chain order, not arbitrary set order"
@@ -188,14 +201,15 @@
 ;; ============================================================================
 
 (deftest stealing-workers-aggregates-fully
-  (testing "k=4 stealing-workers with step inner: clean K× blocks, no 15+1 split"
+  (testing "k=4 stealing-workers with step inner: clean K× block, no 4+1 split"
     (let [sm (cw/stealing-workers :pool 4 (step/step :work inc))
           out (render/render sm)]
-      ;; Expect exactly one each of "4× shim K", "4× worker K", "4× exit K".
-      (is (= 1 (count (filter #(re-find #"\b4× shim K\b" %) out)))
-          (str "expected one '4× shim K' line; got: " (pr-str out)))
-      (is (= 1 (count (filter #(re-find #"\b4× worker K\b" %) out))))
-      (is (= 1 (count (filter #(re-find #"\b4× exit K\b" %) out))))
+      ;; Expect exactly one '4× worker K' aggregated row. The new
+      ;; decentralized stealing-workers has only one nested proc per
+      ;; worker (the shim+inner sub-step), so the block aggregation
+      ;; collapses cleanly to a single K× row.
+      (is (= 1 (count (filter #(re-find #"\b4× worker K\b" %) out)))
+          (str "expected one '4× worker K' line; got: " (pr-str out)))
       ;; Should NOT have any individual `worker N` lines (no half-block).
       (is (every? #(not (re-find #"\bworker \d\b" %)) out)
           (str "expected no individual worker lines, got: " (pr-str out))))))

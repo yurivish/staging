@@ -38,8 +38,7 @@
         h       (flow/start! sm {:pubsub ps :flow-id "capture-test"})]
     (try
       (doseq [v (range n)] (flow/inject! h {:data v}))
-      (flow/inject! h {})                         ; input-done
-      (flow/await-quiescent! h)
+      (flow/flush-and-drain! h)
       (capture/capture h sm watcher 'tiny-pipeline)
       (finally
         (flow/stop! h)))))

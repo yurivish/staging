@@ -5,32 +5,11 @@
 
      :data        has :data, has :tokens
      :signal      no  :data, has :tokens
-     :input-done  no  :data, no  :tokens
+     :broadcast   has :signal-id (for shutdown / flush via `flow/cast!`)
 
-   `:input-done` is a per-port lifecycle signal — \"this external
-   input has been exhausted.\" It triggers `:on-all-input-done` (once all
-   of a proc's input ports have been input-done'd) and cascades to
-   declared outputs. It is NOT a processing barrier: data and signals
-   continue to be processed on a port even after that port has been
-   input-done'd (e.g. via a cyclic feedback edge or an upstream that
-   propagates input-done eagerly while still producing in-flight data).
-   System termination — \"the pipeline has actually settled, no more
-   activity\" — is a separate, emergent property detected via counter
-   quiescence (`flow/await-quiescent!`).
-
-   Aggregator pattern: input-done means \"no new external input,\" not
-   \"no more data of any kind.\" When upstream eager-propagates input-
-   done while in-flight work is still arriving (e.g. a `stealing-workers`
-   in recursive-feedback mode), buffer-and-flush-on-close aggregators
-   race with that in-flight data — use cumulative-emit-on-data
-   (`combinators/cumulative-by-group`) and rely on quiescence to spot
-   the final per-group emission. When upstream waits for all data to
-   drain before propagating input-done (the default for
-   `round-robin-workers` / non-recursive `stealing-workers` chains —
-   the join awaits all K worker output ports before cascading),
-   input-done at the aggregator IS a reliable barrier and
-   `combinators/batch-by-group` is the efficient choice (one
-   `summarize-rows` call per group instead of N).
+   System termination is via counter quiescence (`flow/await-quiescent!`).
+   Stashing aggregators flush on the broadcast protocol — see
+   `flow/cast!` and `flow/flush-and-drain!`.
 
    The absence of :data / :tokens is preserved for structural clarity,
    but `:msg-kind` is the canonical source — dispatch reads the stamp
@@ -70,28 +49,35 @@
   {:msg-id (random-uuid) :data-id (random-uuid) :msg-kind :signal
    :tokens tokens :parent-msg-ids []})
 
-(defn new-input-done
-  "Input-done marker: signals upstream-exhausted on a port. No :data, no :tokens."
-  []
-  {:msg-id (random-uuid) :msg-kind :input-done :parent-msg-ids []})
+(defn new-broadcast
+  "Broadcast envelope: signal-id + payload, no tokens. Broadcasts are
+   externally injected (via `flow/cast!`) and don't participate in
+   token balance — the cast! call increments :sent once per subscribed
+   proc to keep counters balanced."
+  ([signal-id]         (new-broadcast signal-id nil))
+  ([signal-id payload] {:msg-id (random-uuid) :msg-kind :broadcast
+                        :signal-id signal-id :data payload
+                        :parent-msg-ids []}))
+
+(defn broadcast? [m] (= (:msg-kind m) :broadcast))
 
 (defn from-opts
   "Build a root envelope from {:data ... :tokens ...} opts.
    Presence rules:
      :data given        → data envelope (with :tokens if also given)
      only :tokens given → signal envelope
-     neither            → input-done marker"
+     neither            → ex-info"
   [{:keys [data tokens] :as opts}]
   (case [(contains? opts :data) (contains? opts :tokens)]
     [true  true]  (assoc (new-msg data) :tokens tokens)
     [true  false] (new-msg data)
     [false true]  (new-signal tokens)
-    [false false] (new-input-done)))
+    [false false] (throw (ex-info "msg/from-opts: must supply :data or :tokens"
+                                  {:opts opts}))))
 
 (defn envelope-kind [m] (:msg-kind m))
 (defn data?         [m] (= (:msg-kind m) :data))
 (defn signal?       [m] (= (:msg-kind m) :signal))
-(defn input-done?   [m] (= (:msg-kind m) :input-done))
 
 ;; ============================================================================
 ;; Free-algebra constructors over input messages
@@ -201,8 +187,8 @@
 (defn- pre-built-msg?
   "True iff `v` is a complete message envelope (has :msg-kind) but is
    NOT a pending msg awaiting synthesis. Used to pass raw envelopes
-   like `(msg/new-input-done)` through handler returns so combinators
-   can emit input-done on a subset of output ports."
+   (e.g. broadcast envelopes minted via `new-broadcast`) through
+   handler returns without re-deriving them."
   [v]
   (and (map? v) (:msg-kind v) (not (pending? v))))
 
@@ -279,10 +265,10 @@
                    :parent-msg-ids (:parent-msg-ids v)
                    :tokens         t}]
            [(update pm port (fnil conj []) m) (conj evs ev)])
-         ;; Pre-built envelope (e.g. raw new-input-done): pass through
-         ;; with no token synthesis or split/merge event. The framework's
-         ;; per-msg :send-out trace event still fires when port-map is
-         ;; written to channels, so counters stay balanced.
+         ;; Pre-built envelope: pass through with no token synthesis
+         ;; or split/merge event. The framework's per-msg :send-out
+         ;; trace event still fires when port-map is written to
+         ;; channels, so counters stay balanced.
          [(update pm port (fnil conj []) v) evs]))
      [{} []]
      pairs)))

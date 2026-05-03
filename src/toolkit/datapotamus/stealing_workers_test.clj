@@ -1,10 +1,10 @@
 (ns toolkit.datapotamus.stealing-workers-test
-  "Tests for c/stealing-workers — coordinator-driven work-stealing
-   pool with optional recursive feedback. Single coordinator + K
-   shims + K worker inners; state transitions in the coordinator are
-   serialized by core.async.flow's per-proc invocation, eliminating
-   the close-cascade race that affected the prior shared-queue
-   implementation."
+  "Tests for c/stealing-workers — decentralized work-stealing pool.
+   Each worker reads from a shared channel array via alts! priority
+   (own first, peers next); recursive `:work` emissions are dispatched
+   back into the channel array via a daemon thread that uses non-
+   blocking try-puts. No central coordinator, no bidirectional buffer
+   dependency, no deadlock under wide recursive fan-out."
   (:refer-clojure :exclude [run!])
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -259,3 +259,106 @@
       (and (= :completed (:state res))
            (= (mapv count-nodes trees)
               (mapv count (:outputs res)))))))
+
+;; ============================================================================
+;; F. Regression — wide recursive fan-out
+;;
+;; The original centralized-coord stealing-workers deadlocked under
+;; wide recursive `:work` fan-out: workers blocked sending to coord
+;; while coord blocked sending to workers. The new decentralized
+;; design (shared channels with alts! priority + non-blocking work
+;; dispatcher) handles this without any bidirectional buffer cycle.
+;; ============================================================================
+
+(deftest f1-wide-recursive-fan-out-no-deadlock
+  ;; Each worker emits N=5 :work msgs per invocation, recursing D=4
+  ;; levels deep. Total nodes = 1 + 5 + 25 + 125 + 625 = 781.
+  (let [inner (step/handler-map
+               {:ports   {:ins {:in ""} :outs {:out "" :work ""}}
+                :on-data (fn [ctx _ {:keys [id depth]}]
+                           (let [kids (when (pos? depth)
+                                        (mapv (fn [i]
+                                                {:id (+ (* id 10) i)
+                                                 :depth (dec depth)})
+                                              (range 5)))]
+                             (cond-> {:out [(msg/child ctx {:id id})]}
+                               (seq kids)
+                               (assoc :work (msg/children ctx kids)))))})
+        wf  (c/stealing-workers :pool 8 inner)
+        t0  (System/currentTimeMillis)
+        res (flow/run-seq wf [{:id 1 :depth 4}])
+        ms  (- (System/currentTimeMillis) t0)
+        n   (count (mapcat identity (:outputs res)))]
+    (is (= :completed (:state res)))
+    (is (= 781 n) "all 781 nodes emitted")
+    (is (< ms 30000) (str "must complete fast; took " ms "ms"))))
+
+;; ============================================================================
+;; G. Regression — irrelevant-input signals don't loop on :work
+;;
+;; If an upstream step returns {} for some input, the framework
+;; auto-signals downstream. That signal must NOT be broadcast on the
+;; pool's :work feedback port — that would create an infinite signal
+;; loop. The wrapper installs a custom :on-signal that emits only
+;; on :out for handler-maps that declare :work.
+;; ============================================================================
+
+(deftest g1-filter-empty-doesnt-loop-on-work
+  (let [filter-step (step/step :gate nil
+                               (fn [ctx _ {:keys [keep?]}]
+                                 (if keep?
+                                   {:out [(msg/pass ctx)]}
+                                   {})))
+        worker (step/handler-map
+                {:ports {:ins {:in ""} :outs {:out "" :work ""}}
+                 :on-data (fn [ctx _ {:keys [id depth] :as d}]
+                            (let [kids (when (pos? depth)
+                                         [{:id (* id 10)
+                                           :depth (dec depth)
+                                           :keep? true}])]
+                              (cond-> {:out [(msg/child ctx d)]}
+                                (seq kids)
+                                (assoc :work (msg/children ctx kids)))))})
+        wf  (step/serial filter-step
+                         (c/stealing-workers :pool 4 worker))
+        res (flow/run-seq wf [{:keep? false :id 1 :depth 1}
+                              {:keep? true  :id 2 :depth 2}
+                              {:keep? false :id 3 :depth 1}])]
+    (is (= :completed (:state res)))
+    (testing "the :keep? false items are filtered, no signal-loop"
+      (let [outs (:outputs res)]
+        (is (= 3 (count outs)))
+        (is (= [] (nth outs 0)))
+        (is (= [] (nth outs 2)))
+        (is (= #{{:id 2 :depth 2 :keep? true}
+                 {:id 20 :depth 1 :keep? true}
+                 {:id 200 :depth 0 :keep? true}}
+               (set (nth outs 1))))))))
+
+;; ============================================================================
+;; H. Step-inner support
+;;
+;; The wrapper handles step inners by building a 2-proc sub-step
+;; (shim handler-map → user step). Step inners cannot use :work
+;; recursive feedback (their internal output ports can't be cleanly
+;; overridden) — convert to handler-map if you need it.
+;; ============================================================================
+
+(deftest h1-step-inner-non-recursive
+  (let [square-step (step/step :sq (fn [d] (* d d)))
+        wf  (c/stealing-workers :pool 4 square-step)
+        res (flow/run-seq wf [1 2 3 4 5])]
+    (is (= :completed (:state res)))
+    (is (= [[1] [4] [9] [16] [25]] (:outputs res)))))
+
+;; ============================================================================
+;; I. Edge cases
+;; ============================================================================
+
+(deftest i1-empty-input-completes-cleanly
+  ;; run-seq short-circuits on empty coll without starting the flow,
+  ;; but the contract still requires a clean :completed result.
+  (let [wf  (c/stealing-workers :pool 4 (step/step :sq #(* % %)))
+        res (flow/run-seq wf [])]
+    (is (= :completed (:state res)))
+    (is (= [] (:outputs res)))))

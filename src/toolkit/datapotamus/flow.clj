@@ -65,11 +65,9 @@
    e.g., when deferring propagation to a later invocation via stashed
    parent refs and an eventual `msg/merge`.
 
-   Note: input-done is a per-port lifecycle signal, not a processing
-   barrier. Data and signals continue to be processed on a port even
-   after that port has been input-done'd (e.g. via a cyclic feedback
-   edge that re-feeds the port). The system terminates on counter
-   quiescence, not on input-done."
+   The system terminates on counter quiescence (sent = recv = completed).
+   Stashing aggregators flush via the broadcast protocol — see
+   `cast!` and `flush-and-drain!`."
   [hmap m s ctx trace-sid outs kind]
   (try
     (let [ret                  (case kind
@@ -92,67 +90,25 @@
     (catch Throwable ex
       [s {} [(trace/failure-event trace-sid m ex)]])))
 
-(defn- run-input-done
-  "Input-done lifecycle: track per-port input-done arrivals in framework state, fire two
-   user hooks per-port and once-when-all-closed.
-
-   On each new input-done arrival (port not yet in ::input-dones-seen):
-     1. Track it in ::input-dones-seen.
-     2. Call :on-input-done (ctx s port) — per-port hook, fires once per
-        port. Default no-op. Use this when a combinator needs to react
-        to a specific upstream's exhaustion before all inputs are closed.
-     3. If all declared ports are now closed, call :on-all-input-done
-        (ctx s) — the drain hook.
-     4. Auto-append new-input-done on every output port unless
-        :on-all-input-done returned msg/drain.
-
-   Both hooks may return port-maps; their outputs are merged (per-port
-   concat). msg/drain from :on-input-done suppresses just that hook's
-   contribution. msg/drain from :on-all-input-done additionally suppresses
-   the auto-append of new-input-done envelopes onto outputs.
-
-   Redundant input-done on an already-closed port is a no-op — matters
-   for cyclic flows where a feedback edge can re-deliver after the hook
-   has fired."
-  [hmap m ctx s trace-sid ins outs]
-  (let [in-port (:in-port ctx)
-        closed  (::input-dones-seen s #{})]
-    (if (contains? closed in-port)
-      [s {} [(trace/success-event trace-sid m)]]
-      (let [closed' (conj closed in-port)
-            all-ins (set (keys ins))
-            all-closed? (= closed' all-ins)]
-        (try
-          (let [;; Per-port hook: always fires for new closures.
-                on-port (:on-input-done hmap (fn [_ s _] [s {}]))
-                [s1 msgs1-raw] (normalize-return s (on-port ctx s in-port))
-                msgs1   (if (identical? msgs1-raw msg/drain) {} msgs1-raw)
-                ;; All-closed hook: only when this is the last port.
-                [s2 msgs2 all-drain?]
-                (if all-closed?
-                  (let [r ((:on-all-input-done hmap) ctx s1)
-                        [s' msgs] (normalize-return s1 r)
-                        d? (identical? msgs msg/drain)]
-                    [s' (if d? {} msgs) d?])
-                  [s1 {} false])
-                ;; Merge the two port-maps additively (concat per port).
-                combined (merge-with (fnil into []) msgs1 msgs2)
-                [synth-pm synth-evs] (msg/synthesize combined m trace-sid)
-                ;; Auto-append new-input-done on every output unless
-                ;; the all-closed hook returned msg/drain.
-                port-map (if (and all-closed? (not all-drain?))
-                           (reduce (fn [pm p]
-                                     (update pm p (fnil conj []) (msg/new-input-done)))
-                                   synth-pm (keys outs))
-                           synth-pm)
-                events  (vec (concat synth-evs
-                                     (send-out-events trace-sid port-map)
-                                     [(trace/success-event trace-sid m)]))]
-            [(assoc s2 ::input-dones-seen closed') port-map events])
-          (catch Throwable ex
-            [(assoc s ::input-dones-seen closed')
-             {}
-             [(trace/failure-event trace-sid m ex)]]))))))
+(defn- run-broadcast
+  "Broadcast lifecycle: an externally-cast signal arrives. `signal-id` is
+   the cast key the framework matched against this proc's :signal-select.
+   Calls :on-broadcast (default no-op), synthesizes any returned outputs
+   normally, and emits :recv/:send-out/:success events as for regular
+   inputs — broadcasts are first-class trace citizens."
+  [hmap m signal-id ctx s trace-sid outs]
+  (try
+    (let [ret                  ((:on-broadcast hmap) ctx s signal-id m)
+          [s' msgs]            (normalize-return s ret)
+          msgs'                (if (identical? msgs msg/drain) {} msgs)
+          [port-map synth-evs] (msg/synthesize msgs' m trace-sid)
+          _                    (validate-ports! trace-sid port-map outs)
+          events (vec (concat synth-evs
+                              (send-out-events trace-sid port-map)
+                              [(trace/success-event trace-sid m)]))]
+      [s' port-map events])
+    (catch Throwable ex
+      [s {} [(trace/failure-event trace-sid m ex)]])))
 
 (defn run-step
   "Pure dispatch. Returns [new-state port-map events].
@@ -163,9 +119,9 @@
         ctx  {:pubsub step-sp :step-id trace-sid :cancel cancel-p
               :in-port in-port :msg m :ins ins :outs outs}]
     (case (msg/envelope-kind m)
-      :input-done (run-input-done           hmap m ctx s trace-sid ins outs)
-      :signal     (run-data-or-signal       hmap m s ctx trace-sid outs :signal)
-      :data       (run-data-or-signal       hmap m s ctx trace-sid outs :data))))
+      :broadcast  (run-broadcast      hmap m (:signal-id m) ctx s trace-sid outs)
+      :signal     (run-data-or-signal hmap m s ctx trace-sid outs :signal)
+      :data       (run-data-or-signal hmap m s ctx trace-sid outs :data))))
 
 ;; ============================================================================
 ;; proc-fn — the core.async.flow 4-arity adapter
@@ -183,15 +139,17 @@
    Publishing, counter updates, and quiescence signalling all happen here
    on the publish path — no self-subscription."
   [hmap trace-sid step-sp {:keys [cancel-p counters done-p]}]
-  (let [ports (:ports hmap)
-        ins   (:ins ports)
-        outs  (:outs ports)
+  (let [ports         (:ports hmap)
+        ins           (:ins ports)
+        outs          (:outs ports)
+        signal-select (:signal-select hmap)
         emit! (fn [ev]
                 (trace/sp-pub step-sp ev)
                 (when (ctrs/record-event! counters ev)
                   (deliver @done-p :quiescent)))]
     (fn
-      ([]      {:params {} :ins ins :outs outs})
+      ([]      (cond-> {:params {} :ins ins :outs outs}
+                 signal-select (assoc :signal-select signal-select)))
       ([_]     ((:on-init hmap)))
       ([s transition]
        (if (= transition :clojure.core.async.flow/stop)
@@ -201,26 +159,16 @@
            s)
          s))
       ([s in-port m]
-       (cond
-         ;; Channel closed on a port not in the handler's declared :ins.
-         ;; Happens when ::flow/in-ports injects an input under a name
-         ;; the handler doesn't list. Don't dispatch — that would add a
-         ;; non-declared key to ::input-dones-seen and break run-input-done's
-         ;; (= closed all-ins) test, permanently blocking cascade.
-         ;; Framework's read loop already dissocs the chan on the first
-         ;; nil read.
-         (and (nil? m) (not (contains? ins in-port)))
+       (if (nil? m)
+         ;; Channel closed (nil from core.async.flow's read loop). The
+         ;; framework's read loop already dissocs the chan from read-ins
+         ;; on first nil read; we just acknowledge with no events.
+         ;; Termination is via quiescence (counter balance), not via a
+         ;; per-port close cascade — see flush-and-drain! for the
+         ;; flush-on-quiescence broadcast protocol used by stashing
+         ;; aggregators.
          [s {}]
-
-         :else
-         ;; `or` branch: when m is nil, the channel was closed and
-         ;; core.async.flow has called us once with nil before dropping
-         ;; the chan. Synthesize a fresh input-done envelope so the rest
-         ;; of the pipeline (recv-event, run-step → run-input-done,
-         ;; ::input-dones-seen, cascade, auto-append) runs identically to an
-         ;; envelope-input-done arrival. Lineage gap is intrinsic — close
-         ;; has no upstream message to attribute to.
-         (let [m (or m (msg/new-input-done))]
+         (do
            ;; Publish :recv on arrival, before the handler runs. Emitting it
            ;; alongside :success (as we used to) made every pair atomic in the
            ;; event log, so live consumers couldn't derive in-flight counts.
@@ -355,8 +303,10 @@
   (into {}
         (map (fn [[sid pfn]]
                (let [spec (pfn)]
-                 [sid {:ins  (set (keys (:ins  spec)))
-                       :outs (set (keys (:outs spec)))}])))
+                 [sid (cond-> {:ins  (set (keys (:ins  spec)))
+                               :outs (set (keys (:outs spec)))}
+                        (:signal-select spec) (assoc :signal-select
+                                                     (:signal-select spec)))])))
         (:procs instrumented)))
 
 (defn- validate-wired-outs!
@@ -488,6 +438,99 @@
        (deref p timeout-ms :timeout)
        @p))))
 
+(defn- castees-of
+  "Procs whose :signal-select matches `signal-id`. Returns a vector of
+   sids — used to determine how many :sent counters to bump so quiescence
+   stays reachable after the broadcast."
+  [port-index signal-id]
+  (vec (for [[sid {:keys [signal-select]}] port-index
+             :when (and signal-select (signal-select signal-id))]
+         sid)))
+
+(defn cast!
+  "Broadcast `payload` under `signal-id` to every proc whose
+   :signal-select matches. The framework's flow/inject special-cases
+   `[::flow/cast signal-id]` as a broadcast target.
+
+   Counter accounting: each subscribed proc will fire one :recv +
+   one :success when it processes the broadcast. We pre-bump :sent
+   once per matching castee so quiescence (sent = recv = completed)
+   remains reachable after the broadcast drains.
+
+   Trace accounting: an :inject event is published for the broadcast
+   so its descendants (e.g. flush emissions from stashing aggregators)
+   have an :inject ancestor in the trace — required for `run-seq`'s
+   per-input attribution to work and for retroactive lineage walks
+   via obs.store.
+
+   Returns the handle. No-op (other than returning) if no proc
+   subscribes to `signal-id` — keeps shutdown loops well-behaved
+   on flows with no broadcast consumers."
+  ([handle signal-id]         (cast! handle signal-id nil))
+  ([handle signal-id payload]
+   (let [{::keys [graph counters done-p port-index pubsub scope fid]} handle
+         castees   (castees-of port-index signal-id)
+         n         (count castees)]
+     (when (pos? n)
+       (let [item (msg/new-broadcast signal-id payload)]
+         (swap! done-p (fn [p] (if (realized? p) (promise) p)))
+         (dotimes [_ n] (ctrs/record-inject! counters))
+         (pubsub/pub pubsub (trace/run-subject-for scope :inject)
+                     (assoc (trace/msg-envelope item)
+                            :kind :inject
+                            :scope-path [fid] :scope scope
+                            :signal-id signal-id
+                            :at (trace/now)))
+         @(flow/inject graph [::flow/cast signal-id] [item])))
+     handle)))
+
+(defn flush-and-drain!
+  "Iterative broadcast-flush shutdown protocol. Replaces the previous
+   `(inject! handle {})` close-cascade.
+
+   Loop: wait for quiescence, broadcast `signal-id` (default
+   `::flow/flush`), wait for quiescence again. Repeat until a round
+   produces no emissions beyond the broadcast itself (i.e., no
+   downstream propagation happened). Bounded by the longest chain of
+   stashing aggregators in the topology — typically ≤ 5 rounds.
+
+   Why iteration: a single broadcast hits all procs simultaneously, so
+   a chain A→B of stashing aggregators flushes A in round 1 (B sees
+   nothing yet) and B in round 2 (now buffered with A's flushed data).
+
+   Progress detection: the broadcast itself bumps :sent by N (the
+   number of subscribed procs) and :recv/:completed by N too. Real
+   work happened only if :sent grew by MORE than N — i.e., somebody
+   emitted in response. If sent-delta == N, every proc was a no-op
+   (returned {} or msg/drain), so we're done.
+
+   Returns `{:rounds n :state :completed|:failed :final-counters {...}}`."
+  ([handle]           (flush-and-drain! handle ::flow/flush))
+  ([handle signal-id]
+   (let [{::keys [port-index]} handle]
+     (loop [rounds 0]
+       (let [signal (await-quiescent! handle)]
+         (cond
+           (vector? signal)                   ; [:failed err]
+           {:rounds rounds :state :failed :error (second signal)
+            :final-counters (counters handle)}
+
+           (= :quiescent signal)
+           (let [n           (count (castees-of port-index signal-id))
+                 sent-before (:sent (counters handle))
+                 _           (cast! handle signal-id)
+                 _           (await-quiescent! handle)
+                 sent-after  (:sent (counters handle))
+                 emissions   (- sent-after sent-before n)]
+             (if (pos? emissions)
+               (recur (inc rounds))
+               {:rounds rounds :state :completed
+                :final-counters (counters handle)}))
+
+           :else
+           {:rounds rounds :state :unknown :signal signal
+            :final-counters (counters handle)}))))))
+
 (defn stop!
   "Tear down the graph. Returns {:state :counters :error}."
   [handle]
@@ -501,13 +544,17 @@
        :error    err})))
 
 (defn run!
-  "Start, inject one message, wait for quiescence, stop."
+  "Start, inject one message, drain via broadcast-flush, stop.
+   Stashing aggregators downstream are flushed by `flush-and-drain!`'s
+   iterative broadcast loop (replaces the older empty-inject /
+   input-done cascade)."
   [stepmap opts]
   (let [handle (start! stepmap (select-keys opts [:pubsub :flow-id]))]
     (inject! handle (select-keys opts [:in :port :data :tokens]))
-    (let [signal (await-quiescent! handle)]
-      (-> (stop! handle)
-          (assoc :state (if (= :quiescent signal) :completed :failed))))))
+    (let [{:keys [state error]} (flush-and-drain! handle)]
+      (cond-> (stop! handle)
+        true       (assoc :state state)
+        error      (assoc :error error)))))
 
 ;; ============================================================================
 ;; run-seq — run a flow against a collection, attribute outputs to inputs
@@ -560,11 +607,10 @@
            wf        (step/serial stepmap (collector-step ::collector collected))
            handle    (start! wf {:pubsub ps :flow-id fid})]
        (doseq [d coll] (inject! handle {:data d}))
-       (inject! handle {})  ; close boundary input — fires :on-all-input-done cascade
-       (let [signal    (await-quiescent! handle)
-             result    (-> (stop! handle)
-                           (assoc :state (if (= :quiescent signal) :completed :failed))
-                           (cond-> (vector? signal) (assoc :error (second signal))))
+       (let [{:keys [state error]} (flush-and-drain! handle)
+             result    (cond-> (stop! handle)
+                         true  (assoc :state state)
+                         error (assoc :error error))
              _           (prov-unsub)
              evs         @provenance
              inject-ids  (mapv :msg-id (filter #(= :inject (:kind %)) evs))

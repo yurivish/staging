@@ -522,77 +522,6 @@
         (is (some? sink-recv))
         (is (= {"g" 777} (:tokens sink-recv)))))))
 
-;; Inject with neither :data nor :tokens routes a :input-done marker. On a
-;; linear chain, each step sees :input-done once and cascades it to the next.
-(deftest input-done-cascades-through-single-input-chain
-  (let [wf (step/serial
-           (step/step :a inc)
-           (step/step :b #(* 2 %))
-           (step/step :c inc)
-           (step/sink))
-        h (start! wf)
-        _ (flow/inject! h {})
-        _ (flow/await-quiescent! h)
-        result (stop! h)
-        events (:events result)
-        by-kind (fn [sid]
-                  (frequencies (map (juxt :kind :msg-kind)
-                                    (filterv #(= sid (:step-id %)) events))))]
-    (testing "run completes and counters balance"
-      (is (= :completed (:state result)))
-      (is (nil? (:error result)))
-      (let [{:keys [sent recv completed]} (:counters result)]
-        (is (= sent recv completed))))
-    (testing "no user handler was invoked (no data :recv events)"
-      (is (empty? (events-of result :recv :data))))
-    (testing "each mid-chain step cascaded done"
-      (doseq [sid [:a :b :c]]
-        (is (= 1 (get (by-kind sid) [:recv :input-done] 0)))
-        (is (= 1 (get (by-kind sid) [:send-out :input-done] 0)))
-        (is (= 1 (get (by-kind sid) [:success :input-done] 0)))))
-    (testing "sink absorbed done"
-      (is (= 1 (get (by-kind :sink) [:recv :input-done] 0)))
-      (is (zero? (get (by-kind :sink) [:send-out :input-done] 0)))
-      (is (= 1 (get (by-kind :sink) [:success :input-done] 0))))))
-
-;; A multi-input step holds its :input-done cascade until every input port
-;; has received its own :input-done marker — only then does it close
-;; downstream.
-(deftest input-done-multi-input-holds-until-all-inputs-closed
-  (let [wf (-> (step/beside
-                (step/step :merge
-                           {:ins  {:left "" :right ""}
-                            :outs {:out ""}}
-                           (fn [_ctx s d]
-                             [s {:out [d]}]))
-                (step/sink))
-               (step/connect [:merge :out] [:sink :in])
-               (step/input-at :merge))
-        h (start! wf)
-        events-after (fn [] (events h))
-        by-kind (fn [sid]
-                  (frequencies (map (juxt :kind :msg-kind)
-                                    (filterv #(= sid (:step-id %)) (events-after)))))]
-    (testing "before any injection, no events"
-      (is (empty? (filterv #(= :merge (:step-id %)) (events-after)))))
-    (flow/inject! h {:in :merge :port :left})
-    (flow/await-quiescent! h)
-    (testing "after first done on :left: :recv done fired, cascade has NOT"
-      (is (= 1 (get (by-kind :merge) [:recv :input-done] 0)))
-      (is (zero? (get (by-kind :merge) [:send-out :input-done] 0)))
-      (is (= 1 (get (by-kind :merge) [:success :input-done] 0)))
-      (is (empty? (filterv #(= :sink (:step-id %)) (events-after)))))
-    (flow/inject! h {:in :merge :port :right})
-    (flow/await-quiescent! h)
-    (testing "after second done on :right: cascade fires, sink receives done"
-      (is (= 2 (get (by-kind :merge) [:recv :input-done] 0)))
-      (is (= 1 (get (by-kind :merge) [:send-out :input-done] 0)))
-      (is (= 2 (get (by-kind :merge) [:success :input-done] 0)))
-      (is (= 1 (get (by-kind :sink) [:recv :input-done] 0)))
-      (is (= 1 (get (by-kind :sink) [:success :input-done] 0))))
-    (testing "user handler was never invoked"
-      (is (empty? (events-of (stop! h) :recv :data))))))
-
 ;; ============================================================================
 ;; Act VI — Derivation helpers + ctx :in-port
 ;;
@@ -1452,23 +1381,26 @@
         (is (= :try (:step-id (first fs))))))))
 
 ;; A drain-style aggregator (stash everything under `msg/drain`, emit at
-;; close) needs the `:on-all-input-done` cascade to flush. `run-seq` injects an
-;; `input-done` envelope after the data so this works transparently —
-;; quiescence
-;; balance alone would terminate before `:on-all-input-done` ever fires.
-(deftest run-seq-fires-on-all-input-done-aggregator
+;; flush) needs the `:on-broadcast` flush trigger. `run-seq` calls
+;; `flush-and-drain!` which broadcasts `::caf/flush` at quiescence —
+;; quiescence balance alone would terminate before any flush hook fires.
+(deftest run-seq-fires-on-broadcast-aggregator
   (let [agg (step/handler-map
              {:ports         {:ins {:in ""} :outs {:out ""}}
               :on-init       (fn [] {:items []})
               :on-data       (fn [ctx s _d]
                                [(update s :items conj (:msg ctx)) msg/drain])
-              :on-all-input-done (fn [ctx s]
-                               {:out [(msg/merge ctx (:items s)
-                                                 (mapv :data (:items s)))]})})
+              :signal-select #{:clojure.core.async.flow/flush}
+              :on-broadcast  (fn [ctx s _sig _msg]
+                               (if (empty? (:items s))
+                                 [s {}]
+                                 [{:items []}
+                                  {:out [(msg/merge ctx (:items s)
+                                                    (mapv :data (:items s)))]}]))})
         wf  {:procs {:agg agg} :conns [] :in :agg :out :agg}
         res (flow/run-seq wf [1 2 3])]
     (is (= :completed (:state res)))
-    (testing "the merged-on-close output is attributed to all inputs"
+    (testing "the merged-on-flush output is attributed to all inputs"
       (is (= [[[1 2 3]] [[1 2 3]] [[1 2 3]]] (:outputs res))))))
 
 ;; ============================================================================
@@ -1737,23 +1669,6 @@
       (finally
         (when-not (realized? (::flow/cancel h)) (stop! h))))))
 
-;; Done cascade fires exactly once downstream. The join's K distinct input
-;; ports ensure on-all-input-done fires once, not K times.
-(deftest round-robin-workers-input-done-cascade-fires-once
-  (let [wf (step/serial
-           (cw/round-robin-workers :pool 3 (step/passthrough :w))
-           (step/sink))
-        h  (start! wf)]
-    (flow/inject! h {})
-    (flow/await-quiescent! h)
-    (let [result (stop! h)
-          dones  (filterv #(and (= :sink (:step-id %))
-                                (= :recv (:kind %))
-                                (= :input-done (:msg-kind %)))
-                          (:events result))]
-      (is (= :completed (:state result)))
-      (is (= 1 (count dones))))))
-
 ;; `inner` may be a composite step, not just a single handler-map — internal
 ;; sids get prefixed per-worker so state is isolated even when inner has
 ;; multiple procs.
@@ -1765,20 +1680,23 @@
     (is (= [[4] [6] [8] [10]] (:outputs res)))))
 
 ;; ----------------------------------------------------------------------------
-;; stealing-workers — work-stealing sibling of `round-robin-workers`.
+;; stealing-workers — decentralized work-stealing pool.
 ;;
-;; The combinator's design: 1 coordinator + 1 ext-wrap + K shims + K worker
-;; inners (+ K exit-wrappers, for step inners). The coordinator owns the queue
-;; as state and dispatches to free workers via ::flow/out-ports overrides on
-;; per-worker channels. Worker emissions arrive at coord :rec tagged
-;; ::class :work (queue + dispatch) or ::class :result (mark worker free +
-;; forward on :out). Recursive feedback (handler-map inners with a :work
-;; output port) and step inners are both supported.
+;; Same router + join skeleton as round-robin-workers. Each worker reads
+;; from a SHARED channel array via alts! priority (own first, peers next),
+;; so an idle worker can grab an item the router placed in a busy worker's
+;; queue. Stealing falls out of channel sharing — no central coordinator.
 ;;
-;; Tests below mirror the `round-robin-workers` suite where they apply, plus a
-;; wall-clock assertion that demonstrates work-stealing actually rebalances
-;; skewed load. The recursive-feedback path has its own deeper test file
-;; (stealing_workers_test.clj).
+;; Recursive `:work` feedback (handler-map inners with a :work output port)
+;; is dispatched via a daemon thread that try-puts across the channel array
+;; without ever blocking. Wide trees that previously deadlocked the coord-
+;; based design now complete cleanly — see stealing_workers_test.clj for
+;; the regression suite (countdown, branching trees, work-only, wide
+;; fan-out, signal-loop guard).
+;;
+;; Tests below mirror the round-robin-workers suite where they apply, plus
+;; a wall-clock assertion that demonstrates work-stealing rebalances
+;; skewed load.
 ;; ----------------------------------------------------------------------------
 
 (deftest stealing-workers-exactly-once-delivery
@@ -1789,21 +1707,6 @@
     ;; no drops, no duplicates. (run-seq attributes by lineage, so
     ;; :outputs is in input order regardless of dispatch race.)
     (is (= (mapv vector (range 20)) (:outputs res)))))
-
-(deftest stealing-workers-input-done-cascade-fires-once
-  (let [wf (step/serial
-            (cw/stealing-workers :pool 3 (step/passthrough :w))
-            (step/sink))
-        h  (start! wf)]
-    (flow/inject! h {})
-    (flow/await-quiescent! h)
-    (let [result (stop! h)
-          dones  (events-of result :recv :input-done)]
-      (is (= :completed (:state result)))
-      ;; One input-done arrives at the sink — not K. The K shims each take
-      ;; one auto-appended input-done from the feeder, cascade independently
-      ;; through their inner, and the join's K-input cascade dedupes to 1.
-      (is (= 1 (count (filter #(= :sink (:step-id %)) dones)))))))
 
 (deftest stealing-workers-k-1-degenerate
   (let [wf  (cw/stealing-workers :pool 1 (step/step :inc inc))

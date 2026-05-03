@@ -25,7 +25,8 @@
    `:get-json` is the URL→JSON fn (typically `clojure.data.json` over
    `http-kit/get`); supplied as an arg so each pipeline can stub it
    in tests."
-  (:require [toolkit.datapotamus.combinators.workers :as c]
+  (:require [clojure.core.async.flow :as-alias flow]
+            [toolkit.datapotamus.combinators.workers :as c]
             [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]))
 
@@ -78,18 +79,16 @@
    When the expected set hits empty, the tree is complete — emit one
    `msg/merge` per root and drop that root from state.
 
-   Per-tree emit avoids the close-cascade race that buffer-until-close
-   suffers under c/stealing-workers in recursive mode: msg/drain'd :on-data invocations
-   absorb the data flow, allowing run-seq's await-quiescent! to fire
-   on transient counter balance before :on-all-input-done has run.
    Per-tree emit keeps each tree's emission tied directly to the
    data-flow events that complete it — counter balance moves with
    the merge, not transiently before it.
 
-   :on-all-input-done is a fallback flush for incomplete trees (e.g., a
-   fetch failure leaves some kid forever unexpected). It emits any
-   partially-reassembled trees so the caller observes the partial
-   result rather than silently losing it."
+   :on-broadcast (on `::flow/flush`) is a fallback flush for incomplete
+   trees (e.g., a fetch failure leaves some kid forever unexpected).
+   It emits any partially-reassembled trees so the caller observes the
+   partial result rather than silently losing it. State is cleared
+   after flush so re-broadcasts in the `flush-and-drain!` loop are
+   no-ops."
   {:procs
    {:aggregate-trees
     (step/handler-map
@@ -117,16 +116,20 @@
                  {:out [(msg/merge ctx parents tree)]}
                  {})])
             [s' msg/drain])))
-      :on-all-input-done
-      (fn [ctx s]
+      :signal-select #{::flow/flush}
+      :on-broadcast
+      (fn [ctx s _sig _msg]
         ;; Fallback flush: emit any roots that never completed (e.g.
         ;; due to a missing kid from a fetch failure).
-        {:out (vec (for [[root {:keys [entries]}] s
-                         :let [parents (mapv :msg entries)
-                               nodes   (mapv :node entries)
-                               tree    (reassemble-tree root nodes)]
-                         :when tree]
-                     (msg/merge ctx parents tree)))})})}
+        (if (empty? s)
+          [s {}]
+          [{}
+           {:out (vec (for [[root {:keys [entries]}] s
+                            :let [parents (mapv :msg entries)
+                                  nodes   (mapv :node entries)
+                                  tree    (reassemble-tree root nodes)]
+                            :when tree]
+                        (msg/merge ctx parents tree)))}]))})}
    :conns [] :in :aggregate-trees :out :aggregate-trees})
 
 (defn step

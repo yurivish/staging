@@ -38,10 +38,11 @@
    a plain map keyed by message-kind/lifecycle slot:
 
      {:on-data       (fn [ctx state data] → return)
-      :on-signal     (fn [ctx state]      → return)   ; default: broadcast
-      :on-all-input-done (fn [ctx state]      → return)   ; default: emit nothing
-      :on-init       (fn []               → initial-state)   ; default: {}
-      :on-stop       (fn [ctx state]      → any)             ; default: nil
+      :on-signal     (fn [ctx state]      → return)        ; default: broadcast
+      :signal-select (fn [signal-id]      → bool)          ; default: never
+      :on-broadcast  (fn [ctx state sig msg] → return)     ; default: no-op
+      :on-init       (fn []               → initial-state) ; default: {}
+      :on-stop       (fn [ctx state]      → any)           ; default: nil
       :ports         {:ins {...} :outs {...}}}
 
    `step/step` fills in defaults for everything except `:on-data` and
@@ -67,22 +68,32 @@
 
 (def ^:private DEFAULTS
   "Filled in by `handler-map` when the user omits the slot. Signal broadcasts
-   a signal msg on every output port; all-closed emits nothing (the interpreter
-   cascades `input-done` onto outs in addition); init is an empty state map; stop
-   releases nothing."
+   a signal msg on every output port; init is an empty state map; stop
+   releases nothing.
+
+   :signal-select defaults to a never-match predicate so procs that don't
+   opt in receive no broadcasts. :on-broadcast defaults to no-op for the
+   same reason — broadcast handling is opt-in via :signal-select.
+
+   Termination model: there is no per-port close cascade. The system
+   terminates on counter quiescence (sent = recv = completed). Stashing
+   aggregators flush via the broadcast protocol — see flow/cast! and
+   flow/flush-and-drain!."
   {:ports         {:ins {:in ""} :outs {:out ""}}
    :on-signal     (fn [ctx _state]
                     (into {} (map (fn [p] [p [(msg/signal ctx)]])) (keys (:outs ctx))))
-   :on-all-input-done (fn [_ctx _state] {})
    :on-init       (fn []            {})
-   :on-stop       (fn [_ctx _state] nil)})
+   :on-stop       (fn [_ctx _state] nil)
+   :signal-select (fn [_signal-id] false)
+   :on-broadcast  (fn [_ctx _state _signal-id _msg] {})})
 
 (defn handler-map
   "Build a handler-map from a partial spec, filling in defaults.
 
    Tier-3 escape hatch: use this when you need a custom :on-signal,
-   :on-all-input-done, :on-init, or :on-stop. For ordinary handlers prefer
-   `step`, which wraps a handler-map in a 1-proc step for you."
+   :on-broadcast / :signal-select, :on-init, or :on-stop. For ordinary
+   handlers prefer `step`, which wraps a handler-map in a 1-proc step
+   for you."
   [m]
   (reduce-kv (fn [acc k v] (cond-> acc (nil? (acc k)) (assoc k v)))
              m DEFAULTS))

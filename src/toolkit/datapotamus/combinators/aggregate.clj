@@ -12,24 +12,28 @@
                              windows; close on watermark.
      `sliding-window`      — overlapping fixed-size event-time windows;
                              close on watermark."
-  (:require [toolkit.datapotamus.msg :as msg]
+  (:require [clojure.core.async.flow :as-alias flow]
+            [toolkit.datapotamus.msg :as msg]
             [toolkit.datapotamus.step :as step]))
 
 (defn batch-by-group
-  "Aggregator step. Buffers every input row until input is exhausted,
-   then groups by `key-fn` and emits one summary per group as a
-   `msg/merge` over all parent msgs in that group.
+  "Aggregator step. Buffers every input row until a flush broadcast
+   arrives, then groups by `key-fn` and emits one summary per group
+   as a `msg/merge` over all parent msgs in that group.
 
    Returns `msg/drain` from :on-data to suppress the framework's
    auto-signal on :out — required because we stash the parent ref
-   and derive a single `msg/merge` child later in
-   `:on-all-input-done`. Without drain, the auto-signal would
-   double-count parent tokens (see the deferred-derivation pattern
-   in `msg.clj`).
+   and derive a single `msg/merge` child later in `:on-broadcast`.
+   Without drain, the auto-signal would double-count parent tokens
+   (see the deferred-derivation pattern in `msg.clj`).
+
+   Flushed by `flow/flush-and-drain!` (which broadcasts
+   `::flow/flush`); state is cleared after flush so re-broadcasts
+   are no-ops, letting the `flush-and-drain!` loop converge.
 
    - `key-fn`         : (row → group-key)
    - `summarize-rows` : (group-key, rows → summary-data) — called
-                        once per group on input-done."
+                        once per group on flush."
   [key-fn summarize-rows]
   {:procs
    {:aggregate
@@ -39,16 +43,19 @@
       :on-data
       (fn [ctx s row]
         [(update s :rows conj {:msg (:msg ctx) :row row}) msg/drain])
-      :on-all-input-done
-      (fn [ctx s]
-        (let [grouped (group-by (comp key-fn :row) (:rows s))
-              out-msgs (mapv (fn [[k entries]]
-                               (let [parents (mapv :msg entries)
-                                     rows    (mapv :row entries)]
-                                 (msg/merge ctx parents
-                                            (summarize-rows k rows))))
-                             grouped)]
-          {:out out-msgs}))})}
+      :signal-select #{::flow/flush}
+      :on-broadcast
+      (fn [ctx s _sig _msg]
+        (if (empty? (:rows s))
+          [s {}]
+          (let [grouped (group-by (comp key-fn :row) (:rows s))
+                out-msgs (mapv (fn [[k entries]]
+                                 (let [parents (mapv :msg entries)
+                                       rows    (mapv :row entries)]
+                                   (msg/merge ctx parents
+                                              (summarize-rows k rows))))
+                               grouped)]
+            [{:rows []} {:out out-msgs}])))})}
    :conns [] :in :aggregate :out :aggregate})
 
 (defn cumulative-by-group
@@ -95,9 +102,8 @@
 
 (defn join-by-key
   "Step that joins N input ports by a per-port key extractor. Each
-   incoming msg is buffered under (port, key); on `:on-all-input-done`
-   (after every declared input port has reported done), `on-match` is
-   called once per key with the per-port items.
+   incoming msg is buffered under (port, key); on flush broadcast,
+   `on-match` is called once per key with the per-port items.
 
    Config:
      :ports        — vector of input port keywords (required, ≥2)
@@ -109,7 +115,7 @@
                      false: emit any key seen on any port.
      :id           — sid for the step (default :join-by-key)
 
-   Note: this is a *batch* join — emissions happen on input-done, not
+   Note: this is a *batch* join — emissions happen on flush, not
    per-arrival. Use `cumulative-by-group` for incremental aggregation
    over a single input."
   [{:keys [ports key-fns on-match require-all? id]
@@ -125,11 +131,8 @@
     (step/handler-map
      {:ports   {:ins  (zipmap ports (repeat ""))
                 :outs {:out ""}}
-      :on-init (fn []
-                 {;; {key {port [{:msg :row} ...]}}
-                  :buf {}
-                  ;; Set of ports we've seen :on-input-done on.
-                  :done-ports #{}})
+      :on-init (fn [] {;; {key {port [{:msg :row} ...]}}
+                       :buf {}})
       :on-data
       (fn [ctx s row]
         (let [port  (:in-port ctx)
@@ -137,25 +140,23 @@
           [(update-in s [:buf k port] (fnil conj [])
                       {:msg (:msg ctx) :row row})
            msg/drain]))
-      :on-input-done
-      (fn [_ctx s port]
-        (let [done' (conj (:done-ports s) port)
-              s'    (assoc s :done-ports done')]
-          [s' {}]))
-      :on-all-input-done
-      (fn [ctx s]
-        (let [emissions
-              (vec
-               (for [[k port-map] (sort-by key (:buf s))
-                     :let [items   (into {}
-                                         (for [p ports]
-                                           [p (mapv :row (get port-map p []))]))
-                           parents (mapv :msg
-                                         (mapcat val port-map))]
-                     :when (or (not require-all?)
-                               (every? #(seq (get items %)) ports))]
-                 (msg/merge ctx parents (on-match k items))))]
-          {:out emissions}))})}})
+      :signal-select #{::flow/flush}
+      :on-broadcast
+      (fn [ctx s _sig _msg]
+        (if (empty? (:buf s))
+          [s {}]
+          (let [emissions
+                (vec
+                 (for [[k port-map] (sort-by key (:buf s))
+                       :let [items   (into {}
+                                           (for [p ports]
+                                             [p (mapv :row (get port-map p []))]))
+                             parents (mapv :msg
+                                           (mapcat val port-map))]
+                       :when (or (not require-all?)
+                                 (every? #(seq (get items %)) ports))]
+                   (msg/merge ctx parents (on-match k items))))]
+            [{:buf {}} {:out emissions}])))})}})
 
 ;; ============================================================================
 ;; Time windows — tumbling and sliding, watermark-driven
@@ -169,7 +170,15 @@
 (defn- emit-closed-windows
   "Close every window whose end ≤ watermark. Returns [s' emissions]
    where emissions is a vec of `msg/child` outputs (empty if nothing
-   closed)."
+   closed). Each emission is attributed to ctx's current msg (the
+   input that triggered the close — `on-data` path), giving lossy but
+   inject-rooted attribution. The :on-broadcast path uses `msg/merge`
+   over the buffered items' msgs instead — see the window aggregator
+   bodies for that branch.
+
+   Window state shape: `{start [{:msg <env> :data <d>} ...]}` so the
+   broadcast path can reach the original input msgs. The on-data path
+   here only needs the :data values to call `on-window`."
   [ctx s size wm on-window]
   (let [size        (long size)
         wm          (long wm)
@@ -177,7 +186,7 @@
         emissions   (mapv (fn [start]
                             (msg/child ctx
                                        (on-window start (+ ^long start size)
-                                                  (get-in s [:windows start]))))
+                                                  (mapv :data (get-in s [:windows start])))))
                           closed-keys)
         s'          (update s :windows
                             (fn [ws] (apply dissoc ws closed-keys)))]
@@ -224,17 +233,24 @@
               (do (on-late d) {})
               (let [s1            (-> s
                                       (assoc :watermark wm)
-                                      (update-in [:windows start] (fnil conj []) d))
+                                      (update-in [:windows start] (fnil conj [])
+                                                 {:msg (:msg ctx) :data d}))
                     [s2 emissions] (emit-closed-windows ctx s1 size wm on-window)]
                 [s2 (if (seq emissions) {:out emissions} {})]))))
-        :on-all-input-done
-        (fn [ctx s]
+        :signal-select #{::flow/flush}
+        :on-broadcast
+        (fn [ctx s _sig _msg]
           (let [open-keys (sort (keys (:windows s)))]
-            {:out (mapv (fn [start]
-                          (msg/child ctx
-                                     (on-window start (+ start size)
-                                                (get-in s [:windows start]))))
-                        open-keys)}))})}
+            (if (empty? open-keys)
+              [s {}]
+              [(assoc s :windows {})
+               {:out (mapv (fn [start]
+                             (let [entries (get-in s [:windows start])
+                                   parents (mapv :msg entries)
+                                   datas   (mapv :data entries)]
+                               (msg/merge ctx parents
+                                          (on-window start (+ start size) datas))))
+                           open-keys)}])))})}
      :conns [] :in id :out id}))
 
 (defn sliding-window
@@ -287,18 +303,25 @@
             (if (and (empty? live) (seq cands))
               ;; All candidate windows are closed → fully late.
               (do (on-late d) {})
-              (let [s1 (reduce (fn [acc start]
-                                 (update-in acc [:windows start] (fnil conj []) d))
+              (let [entry {:msg (:msg ctx) :data d}
+                    s1 (reduce (fn [acc start]
+                                 (update-in acc [:windows start] (fnil conj []) entry))
                                (assoc s :watermark wm)
                                live)
                     [s2 emissions] (emit-closed-windows ctx s1 size wm on-window)]
                 [s2 (if (seq emissions) {:out emissions} {})]))))
-        :on-all-input-done
-        (fn [ctx s]
+        :signal-select #{::flow/flush}
+        :on-broadcast
+        (fn [ctx s _sig _msg]
           (let [open-keys (sort (keys (:windows s)))]
-            {:out (mapv (fn [start]
-                          (msg/child ctx
-                                     (on-window start (+ start size)
-                                                (get-in s [:windows start]))))
-                        open-keys)}))})}
+            (if (empty? open-keys)
+              [s {}]
+              [(assoc s :windows {})
+               {:out (mapv (fn [start]
+                             (let [entries (get-in s [:windows start])
+                                   parents (mapv :msg entries)
+                                   datas   (mapv :data entries)]
+                               (msg/merge ctx parents
+                                          (on-window start (+ start size) datas))))
+                           open-keys)}])))})}
      :conns [] :in id :out id}))

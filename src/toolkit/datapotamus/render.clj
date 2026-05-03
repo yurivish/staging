@@ -104,32 +104,52 @@
                     (assoc-in [(dec n) :fall-through?] ft)))))
 
 (defn- apply-bracket-rail
-  "Decorate a flat seq of branch lines with the parallel-section
-   `⎢` rail and absorb in-branch chain fall-through into the rail
-   itself. Each line gets a 2-character prefix `⎢<↓ or space>`:
+  "Decorate per-branch tagged lines with the parallel-section `⎢` rail.
+   Each line gets a 2-character prefix `⎢<↓ or space>`:
      - `⎢↓name` — in-branch fall-through to next line.
      - `⎢ name` — no in-branch fall-through.
    Corners (`⎡⎣`) are deliberately omitted — they were ambiguous
    about whether the parent line above belongs to the bracket. A
    uniform `⎢` rail says \"these lines are siblings under the parent
-   above\" without that ambiguity. Last line never has fall-through
-   (nothing inside the bracket after it).
+   above\" without that ambiguity.
+
+   Branch exits — the LAST line of each branch — also get a
+   `:branch-exit?` flag set, which `finalize` translates into a
+   left-column `↓` showing that the row feeds the line below the
+   rail (the SG sink or chain successor). Without this flag the
+   reader couldn't distinguish a branch's exit row from its
+   continuation rows.
+
+   `:fall-through?` on the OUTPUT is cleared so an enclosing rail
+   (nested-parallel case) doesn't misread it as in-branch chain flow.
+   Branch-exit signal lives in `:branch-exit?` precisely so it
+   doesn't propagate up through nested rails — each rail level owns
+   its own branch-exit detection.
+
    Leading whitespace on the input line is fully replaced — all
    bracket-wrapped content sits at the same column relative to the
    rail, regardless of nesting depth. Inner brackets re-introduce
-   visual offset where needed. Output `:fall-through?` is cleared so
-   `finalize` doesn't also emit a left-column `↓` for the same line."
-  [tagged-lines]
-  (let [total (count tagged-lines)]
+   visual offset where needed."
+  [per-branch]
+  (let [exit-indices
+        (loop [acc #{} idx 0 [b & bs] per-branch]
+          (if b
+            (let [n (count b)]
+              (recur (cond-> acc (pos? n) (conj (+ idx (dec n))))
+                     (+ idx n) bs))
+            acc))
+        all-lines (apply concat per-branch)]
     (vec
      (map-indexed
       (fn [i {:keys [line fall-through? paths]}]
-        (let [last? (= (dec total) i)
-              fall-through-mark (if (and fall-through? (not last?)) "↓" " ")
-              rest-line (str/replace line #"^\s+" "")
-              new-line (str "⎢" fall-through-mark rest-line)]
-          {:line new-line :fall-through? false :paths paths}))
-      tagged-lines))))
+        (let [exit?             (contains? exit-indices i)
+              ;; 2-char mark slot keeps content at the same column
+              ;; whether or not the row has in-branch fall-through.
+              fall-through-mark (if fall-through? "↓ " "  ")
+              rest-line         (str/replace line #"^\s+" "")
+              new-line          (str "⎢" fall-through-mark rest-line)]
+          {:line new-line :fall-through? false :branch-exit? exit? :paths paths}))
+      all-lines))))
 
 (defn- apply-collapsed-rail
   "Decorate the lines of a collapsed `K× …` block with a single-row
@@ -177,10 +197,19 @@
       [{:line (str (indent depth) (str (last-sid elt))) :fall-through? false :paths [elt]}])
 
     (and (map? elt) (= :cycle (:kind elt)))
-    (cons {:line (str (indent depth) "(cycle)")
-           :fall-through? false
-           :paths (vec (filter vector? (:order elt)))}
-          (render-shape elt children-map (inc depth)))
+    ;; Render the cycle's contents at one deeper indent and suffix
+    ;; `(cycle)` onto the first member's line so the marker attaches
+    ;; to a real node instead of floating on its own row (same family
+    ;; as the inline `(prime)` and `⎢ (direct)` ambiguities).
+    (let [inner (render-shape elt children-map (inc depth))]
+      (if (seq inner)
+        (let [{:keys [line fall-through? branch-exit? paths]} (first inner)]
+          (cons {:line (str line "  (cycle)")
+                 :fall-through? fall-through?
+                 :branch-exit? branch-exit?
+                 :paths paths}
+                (rest inner)))
+        inner))
 
     (and (map? elt) (= :scatter-gather (:kind elt)))
     ;; Inline scatter-gather record inside a parent chain's :order.
@@ -318,7 +347,7 @@
             collapsed (render-collapsed k payload all-paths branch-depth)]
         (apply-collapsed-rail (with-fall-through collapsed true)))
       :uncompressed
-      (apply-bracket-rail (apply concat (nth result 2))))))
+      (apply-bracket-rail (nth result 2)))))
 
 (defn- render-inline-sg
   "Render a scatter-gather record that's nested inside a parent chain's
@@ -330,33 +359,45 @@
 
 (defn- render-inline-prime
   "Render a prime record nested inside a parent chain's :order — a
-   non-SP cluster between two chain neighbors. Emits a `(prime)`
-   header line and the cluster's internal nodes at one deeper indent
-   (the :order with :source / :sink stripped, since those are chain
-   neighbors). Off-spine annotations within the prime aren't shown
-   inline (they'd require a more elaborate sub-render); the header
-   signals that the cluster is non-decomposable."
+   non-SP cluster between two chain neighbors. The first interior
+   member's line carries a `(prime)` suffix marking the cluster
+   boundary; remaining members follow at the same indent. The
+   cluster's internal edges are visualized using the same
+   classified-annotations machinery as top-level primes — spine
+   ↓ between consecutive interior nodes that share an edge, plus
+   `⮥`/`⮧` for off-spine edges."
   [prime children-map branch-depth]
-  (let [order (:order prime)
-        S (:source prime)
-        T (:sink prime)
-        interior (->> order
-                      (remove #(or (= % S) (= % T)))
-                      vec)
-        node-name (fn [elt]
-                    (cond
-                      (vector? elt)
-                      (or (some-> (get children-map elt) :name)
-                          (last-sid elt))
-                      :else (pr-str elt)))]
-    (cons {:line (str (indent branch-depth) "(prime)")
-           :fall-through? false
-           :paths (vec (filter vector? interior))}
-          (mapv (fn [elt]
-                  {:line (str (indent (inc branch-depth)) (node-name elt))
-                   :fall-through? false
-                   :paths (when (vector? elt) [elt])})
-                interior))))
+  (let [order      (:order prime)
+        S          (:source prime)
+        T          (:sink prime)
+        interior   (->> order
+                        (remove #(or (= % S) (= % T)))
+                        vec)
+        edges      (set (:internal-edges prime))
+        anns       (classified-annotations
+                    {:order interior :internal-edges (:internal-edges prime)})
+        n          (count interior)
+        node-name  (fn [elt]
+                     (cond
+                       (vector? elt)
+                       (or (some-> (get children-map elt) :name)
+                           (last-sid elt))
+                       :else (pr-str elt)))]
+    (vec
+     (map-indexed
+      (fn [i elt]
+        (let [next-elt   (when (< (inc i) n) (nth interior (inc i)))
+              spine?     (boolean (and next-elt (contains? edges [elt next-elt])))
+              base-line  (str (indent (inc branch-depth)) (node-name elt))
+              with-mark  (if (zero? i) (str base-line "  (prime)") base-line)
+              ann-strs   (mapv annotation-string (anns elt))
+              final-line (if (seq ann-strs)
+                           (str with-mark "  " (str/join ", " ann-strs))
+                           with-mark)]
+          {:line final-line
+           :fall-through? spine?
+           :paths (when (vector? elt) [elt])}))
+      interior))))
 
 ;; ---- Pattern compression for cycle / prime :order ----
 ;;
@@ -768,11 +809,13 @@
 ;; ---- Top-level entry points ----
 
 (defn- finalize
-  "Convert tagged lines to printable strings: prepend `↓ ` on fall-through lines,
-   `  ` otherwise."
+  "Convert tagged lines to printable strings: prepend `↓ ` on lines that
+   either have a chain successor (`:fall-through?`) or are branch exits
+   feeding the line below the immediately-enclosing rail
+   (`:branch-exit?`); otherwise `  `."
   [tagged]
-  (mapv (fn [{:keys [line fall-through?]}]
-          (str (if fall-through? "↓ " "  ") line))
+  (mapv (fn [{:keys [line fall-through? branch-exit?]}]
+          (str (if (or fall-through? branch-exit?) "↓ " "  ") line))
         tagged))
 
 (defn- tree->tagged
@@ -924,8 +967,8 @@
    associated path records get blank but width-matching cells so the
    column separators (`│`) line up vertically across all rows."
   [tagged stats-map]
-  (let [base-strs (mapv (fn [{:keys [line fall-through?]}]
-                          (str (if fall-through? "↓ " "  ") line))
+  (let [base-strs (mapv (fn [{:keys [line fall-through? branch-exit?]}]
+                          (str (if (or fall-through? branch-exit?) "↓ " "  ") line))
                         tagged)
         tree-w (apply max 0 (map count base-strs))
         cells  (resolve-line-stats tagged stats-map)

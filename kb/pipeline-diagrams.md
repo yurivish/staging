@@ -27,15 +27,16 @@ Every line has three slots:
 
 | Glyph | Meaning |
 |---|---|
-| `↓` (left column) | This line's element flows to the line(s) directly below — see the fall-through invariants. |
-| `↓` (in the rail, `⎢↓name`) | In-branch chain flow within a parallel arm. |
+| `↓` (left column) | This line's element flows to the line(s) directly below. Two distinct cases share this glyph: chain successor (next chain element below) and **branch exit** (last row of a parallel branch feeding the line below the rail). See the fall-through invariants. |
+| `↓` (in the rail, `⎢↓name`) | In-branch chain flow within a parallel arm. **Mutually exclusive with left-column `↓`** on the same line — they describe different flows. |
 | `⎢` | Parallel rail — the row is in pure parallel with the other `⎢` rows in the same block. See the rail invariant. |
 | `K× <name>` | K identical members collapsed (round-robin / stealing-workers / parallel with identical branches). When the class size > 1, digit-suffixed step ids display as `name K` (placeholder). |
 | `<name> (combinator)` on a container line | Marks containers built by named combinators (`parallel`, `round-robin-workers`, `stealing-workers`). Lifted from `:combinator` metadata. |
 | `⮥ <name>` (right) | Back-edge to a line above (always named). The path is across-then-up. |
 | `⮧ <name>` (right) | Forward off-spine edge to a non-adjacent line below. Across-then-down. |
-| `(direct)` rail row | A parallel branch with no intermediate steps — a direct source→sink path through the bracket. Without this marker the path is invisible and the rail looks like it has fewer members than it does. |
-| `(prime)` chain element | A non-series-parallel cluster nested inside a chain (e.g., a wheatstone bridge between two chain neighbors). The header marks the cluster boundary; interior nodes appear at one deeper indent. Rare — only triggered by hand-built non-SP topologies, never by the registered combinators. |
+| `(direct)` rail row | A parallel branch with no intermediate steps — a direct source→sink path through the bracket. Without this marker the path is invisible and the rail looks like it has fewer members than it does. The row carries a left-column branch-exit `↓` like any other branch. |
+| `<name>  (cycle)` suffix | A non-trivial SCC nested inside a chain. The marker attaches to the first cycle member's line; remaining members follow at the same indent. Top-level cycles render without this suffix (the whole rendering IS the cycle). |
+| `<name>  (prime)` suffix | A non-series-parallel cluster nested inside a chain (e.g., a wheatstone bridge between two chain neighbors). Marker attaches to the first interior member; off-spine edges between interior nodes render via `⮥`/`⮧` like top-level primes. Rare — only triggered by hand-built non-SP topologies, never by the registered combinators. |
 | `⎢` `⎢` (two rails on one row) | Nested parallel — the outer rail row holds a sub-parallel. The inner `⎢` rail wraps sub-branches at one deeper indent (col 4). |
 
 ## The rail invariant
@@ -61,31 +62,38 @@ appears as its own chain element below.
 
 When multiple branches are rendered together in one rail (e.g., a
 parallel of chains), the visual cues for distinguishing branches are
-combinations of three glyphs:
+combinations of four glyphs:
 
 - **`⎢↓` (in-rail `↓`)**: this row's element has a chain successor
   *within the same branch* (the next row continues the branch's
   chain).
-- **`⎢` (no in-rail `↓`)**: this row is either a branch with no
-  successor (single-leaf branch), or the *exit* of a multi-element
-  branch chain.
+- **`↓ ⎢` (left-column `↓` + rail)**: this row is the *exit* of its
+  branch — last row of a multi-element branch, or the lone row of a
+  single-leaf branch — and feeds the line below the rail (the SG
+  sink or chain successor).
+- **`⎢` (no in-rail `↓`, no left-column `↓`)**: a non-terminal row
+  inside a multi-row sub-shape (e.g., the source line of a nested
+  scatter-gather branch).
 - **`⎢ ⎢` (nested rail)**: this row's element is itself a sub-parallel
   (a scatter-gather nested inside this branch's chain). The inner
   rail wraps sub-branches.
 
-A branch ENDS at a row with no in-rail `↓` and no nested rail
-continuation; the next row at the rail-root column is the next
-branch's first element.
+A branch ENDS at a row marked with `↓ ⎢ ` (left-column `↓`); the
+next row at the rail-root column is the next branch's first element.
 
 Example with mixed branch shapes:
 ```
 ↓   group fan out
   ⎢↓window         ← branch 1 first element, in-branch successor
-  ⎢ explode        ← branch 1 exit (no in-rail ↓)
+↓ ⎢ explode        ← branch 1 exit (left-column ↓ → feeds fan in)
   ⎢↓rate limit     ← branch 2 first element
-  ⎢ bucket         ← branch 2 exit
+↓ ⎢ bucket         ← branch 2 exit
 ↓   group fan in
 ```
+
+The two `↓` glyphs never co-occur on the same row: in-rail `↓`
+means "in-branch chain flow," left-column `↓` means "branch exit
+into the next stage," and a single line is at most one of these.
 
 ## The fall-through invariants
 
@@ -114,10 +122,15 @@ more of the lines immediately below**. Concretely:
 5. **Scatter-gather sink (fan-in).** Gets `↓` if the parallel
    container has a chain successor at the outer level (via the same
    container-exit propagation as #3).
+6. **Branch exit.** The last row of each parallel branch within a
+   `⎢` rail gets a left-column `↓` showing the row feeds the line
+   below the rail (the SG sink, or for inline scatter-gathers the
+   chain successor). This signal is independent of in-rail `⎢↓`,
+   which marks in-branch chain flow within a multi-element branch.
 
 A line **without** `↓` either has no successor in the rendering (last
-visible line, or a parallel sibling whose neighbors are not real
-successors) or its successor is annotated explicitly on the right
+visible line, or a non-terminal row of a multi-row sub-shape inside a
+branch) or its successor is annotated explicitly on the right
 (`⮥` / `⮧`).
 
 ## Right-side annotations
@@ -150,9 +163,9 @@ downstream `sink`.
 ```
 ↓ specialists (parallel)
 ↓   specialists fan out
-  ⎢ skeptic
-  ⎢ facts
-  ⎢ solve
+↓ ⎢ skeptic
+↓ ⎢ facts
+↓ ⎢ solve
 ↓   specialists fan in
   sink
 ```
@@ -175,8 +188,10 @@ downstream `sink`.
 Each rail row is a complete branch (single leaf). The fan-out has
 edges to all three; all three feed fan-in; fan-in feeds sink. The `↓`
 on `fan out` directly above the rail is the rule "fans out to every
-rail row." The plain rail rows (no `↓`) are not chain successors of
-each other.
+rail row." The left-column `↓` on each rail row is the branch-exit
+marker — every branch is a single-leaf branch, so each row is
+simultaneously the branch's first and last element, and feeds fan-in
+below.
 
 ### Multi-element chain branches
 
@@ -187,9 +202,9 @@ Each parallel arm is a 2-step chain.
 ```
 ↓   group fan out
   ⎢↓window
-  ⎢ explode
+↓ ⎢ explode
   ⎢↓rate limit
-  ⎢ bucket
+↓ ⎢ bucket
 ↓   group fan in
 ```
 
@@ -212,10 +227,9 @@ Two branches: `window → explode` and `rate limit → bucket`. The
 rendering interleaves them: rail row 1 is branch A's entry, row 2 is
 branch A's continuation, row 3 is branch B's entry, row 4 is branch
 B's continuation. The `⎢↓` rail-↓ marks the in-branch chain edge
-(`window → explode`, `rate limit → bucket`). The plain rail (`⎢ `)
-on `explode` and `bucket` indicates "no in-branch successor" —
-combined with the rail invariant, that means these are branch exits
-feeding fan-in.
+(`window → explode`, `rate limit → bucket`). The left-column `↓` on
+`explode` and `bucket` marks them as branch exits feeding fan-in
+below the rail.
 
 There's **no** edge `window → rate limit` despite their geographic
 adjacency in the rendering; the rail just visually groups them. The
@@ -361,58 +375,62 @@ gracefully reports non-SP fragments as `:prime` clusters.
 When a hand-built topology includes a non-SP region (e.g., a
 wheatstone bridge) embedded in an otherwise SP frame, the
 decomposition isolates the non-SP region as a `:prime` sub-shape
-nested in the parent chain's `:order`. The renderer marks this with
-a `(prime)` header line and the cluster's interior nodes at one
-deeper indent:
+nested in the parent chain's `:order`. The renderer suffixes
+`(prime)` onto the first interior member's line; remaining members
+follow at the same indent, with off-spine edges between them
+visualized as `⮥`/`⮧`:
 
 ```
 ↓ src
-↓ A
-↓ B
-↓ C
-↓   (prime)
-      w1
-      w2
-      w3
+↓ a
+↓ p
+↓     q  (prime)  ⮧ s, ⮧ u
+↓     r
+↓     s  ⮧ u
+↓ u
+↓ d
   sink
 ```
 
-The `(prime)` header signals the cluster boundary; `:source` and
-`:sink` are the chain neighbors above and below (`C` and `sink`
-here). The interior nodes are listed but their internal edges aren't
-visualized inline — the header is the cue that the sub-graph is
-non-decomposable.
+The `(prime)` suffix signals the cluster boundary; `:source` and
+`:sink` are the chain neighbors above and below (`p` and `u` here),
+and they remain in the chain spine. Interior off-spine edges (e.g.,
+`q → s`, `q → u`) and boundary-crossing edges into the chain sink
+(e.g., `s → u`) annotate the relevant interior rows.
 
 None of the 27 registered pipelines contain non-SP regions; this
 rendering only appears for hand-built `step/connect` topologies.
 
-## Known limitations
+## Resolved limitations
 
-### Parallel branches feeding the outer stage — no explicit marker
+These were previously documented as deferred; they were surfaced and
+fixed while building `kb/pipeline-menagerie.md`. Behavior described
+above is current.
 
-In a multi-element chain branch, each branch's exit row has no
-explicit `↓` indicating "I feed the line below the rail." The rail
-itself implies fan-in, but the reader has to infer it. For example:
+- **Branch-exit `↓` marker.** Branch-exit rows now carry a left-column
+  `↓` distinct from in-rail `⎢↓`. Implemented in `apply-bracket-rail`
+  via a new `:branch-exit?` flag (separate from `:fall-through?` so
+  nested rails don't confuse the two signals).
+- **Inline `(prime)` interior edges.** `render-inline-prime` runs
+  `classified-annotations` on the prime's `:internal-edges`, so
+  interior and boundary-crossing off-spine edges render as `⮥`/`⮧`
+  on interior member lines, just like top-level primes.
+- **Standalone marker rows.** `(cycle)` and `(prime)` no longer float
+  on their own rows; they're suffixed onto their first interior
+  member's line, eliminating the visual ambiguity about cluster
+  boundaries.
 
-```
-  ⎢↓window
-  ⎢ explode    ← feeds fan in below, but no marker says so
-  ⎢↓rate limit
-  ⎢ bucket     ← same
-↓   group fan in
-```
+## Open limitations (cosmetic)
 
-A possible fix: `↓` in the **left column** on branch-exit rows (rows
-with no in-rail `↓` and no deeper rail row inside the same branch).
-That'd give: `↓ ⎢ explode`, `↓ ⎢ bucket`. The reading rule would be:
-"`↓` left of `⎢` means this branch's exit feeds the line below the
-rail." Not yet shipped — flagged for design when we revisit
-parallel-feeding-outer-stage cases.
-
-### Non-SP cluster interior edges aren't visualized
-
-The `(prime)` header marks a non-SP region but its internal edges
-(off-spine arrows like `⮧` / `⮥` between cluster members) aren't
-shown. Adding them would require recursing into the cluster's
-classified-annotations machinery. Deferred until we see a real
-pipeline with a substantive non-SP region.
+- **Inner-rail branch exits in nested parallels.** When a parallel
+  branch is itself a sub-SG, the inner-rail branch exits don't get
+  an inner-rail `↓` marker — there's no spare slot between the outer
+  and inner rail glyphs. The inner-sink line at outer indent
+  visually resolves the flow, so reader inference still works, but
+  it's less explicit than the outer-rail case.
+- **Boundary edges from S into a `(prime)` cluster.** Edges from the
+  upstream chain neighbor into interior nodes (e.g., `p → q`,
+  `p → r`) aren't annotated on the `p` line because chain elements
+  outside the cluster don't carry cluster-specific annotations. The
+  reader infers entry edges from the `(prime)` marker on the first
+  interior member.
