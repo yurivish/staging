@@ -101,8 +101,8 @@
 
 (defn dump
   "Walk the registry, snapshot each pipeline's static topology, write a
-   single JSON file. Default output: /work/dev/pipelines.json."
-  [{:keys [out] :or {out "/work/dev/pipelines.json"}}]
+   single JSON file. Default output: /work/dev/data/pipelines.json."
+  [{:keys [out] :or {out "/work/dev/data/pipelines.json"}}]
   (let [entries (mapv pipeline->entry pipelines)]
     (io/make-parents out)
     (with-open [w (io/writer out)]

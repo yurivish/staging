@@ -628,7 +628,7 @@ annotated explicitly on the right.
 
 `clojure -X:export-pipelines` (see `/work/src/datapotamus_export.clj`)
 walks every pipeline namespace in the repo, calls its `build-flow`,
-and writes a single JSON file at `dev/pipelines.json` (gitignored).
+and writes a single JSON file at `dev/data/pipelines.json` (gitignored).
 Each entry has:
 
 - `:name`, `:description` (ns-form docstring)
@@ -658,7 +658,7 @@ clojure -J--add-opens=java.base/java.nio=ALL-UNNAMED \
         -M -e '(load-file "/work/dev/render_pipelines.clj")'
 ```
 
-Default output is `/work/dev/pipelines.md`.
+Default output is `/work/dev/data/pipelines.md`.
 
 ---
 

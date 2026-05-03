@@ -190,7 +190,7 @@ left `↓` only.
 - A name at deeper indent inside a bracket: continuation of the
   previous branch's chain.
 
-### Sample (from `dev/pipelines.md`)
+### Sample (from `dev/data/pipelines.md`)
 
 ```
 ↓ fetch top ids

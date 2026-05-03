@@ -11,7 +11,9 @@
 /*.json
 cache
 .claude
-dev
+dev/data/
+dev/podcast_*
+dev/mac_mini.clj
 out
 out copy
 out-cc
