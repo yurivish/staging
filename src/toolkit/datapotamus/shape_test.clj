@@ -91,6 +91,85 @@
 ;; Property: leaves preserved
 ;; ============================================================================
 
+;; ============================================================================
+;; :series-parallel recursion — non-trivial sub-shapes inside a chain
+;; ============================================================================
+
+(deftest y-shape-decomposes-as-chain-with-nested-parallel
+  (testing "src → {A, B} → C → sink: chain[src, parallel(A, B), C, sink]"
+    (let [src (step/step :src {:ins {:in ""} :outs {:to-a "" :to-b ""}} (fn [_ _ _] {}))
+          a   (step/step :a   {:ins {:in ""} :outs {:out ""}}            (fn [_ _ _] {}))
+          b   (step/step :b   {:ins {:in ""} :outs {:out ""}}            (fn [_ _ _] {}))
+          c   (step/step :c   {:ins {:from-a "" :from-b ""} :outs {:out ""}} (fn [_ _ _] {}))
+          snk (step/sink)
+          sm (-> (step/beside src a b c snk)
+                 (step/connect [:src :to-a] [:a :in])
+                 (step/connect [:src :to-b] [:b :in])
+                 (step/connect [:a :out]    [:c :from-a])
+                 (step/connect [:b :out]    [:c :from-b])
+                 (step/connect [:c :out]    [:sink :in]))
+          t (shape/decompose (step/topology sm))
+          shape (:shape t)]
+      (is (= :chain (:kind shape))
+          "top-level shape is a chain (not scatter-gather with one weird branch)")
+      (is (= 4 (count (:order shape)))
+          "chain has 4 elements: src, parallel-sub-shape, c, sink")
+      (is (= [:src] (first (:order shape))))
+      (is (= [:c]   (nth (:order shape) 2)))
+      (is (= [:sink] (last (:order shape))))
+      (let [sg (second (:order shape))]
+        (is (and (map? sg) (= :scatter-gather (:kind sg)))
+            "second order element is a nested scatter-gather record")
+        (is (= 2 (count (:branches sg))))
+        (is (= #{{:kind :chain :order [[:a]]}
+                 {:kind :chain :order [[:b]]}}
+               (set (:branches sg)))
+            "branches are chain shape records, not bare path vecs")))))
+
+(deftest series-cut-recurses-cleanly
+  (testing "src → A → {B, C} → D → sink: chain[src, A, parallel(B, C), D, sink]"
+    (let [src (step/step :src {:ins {:in ""} :outs {:out ""}}    (fn [_ _ _] {}))
+          a   (step/step :a   {:ins {:in ""} :outs {:to-b "" :to-c ""}} (fn [_ _ _] {}))
+          b   (step/step :b   {:ins {:in ""} :outs {:out ""}}    (fn [_ _ _] {}))
+          c   (step/step :c   {:ins {:in ""} :outs {:out ""}}    (fn [_ _ _] {}))
+          d   (step/step :d   {:ins {:from-b "" :from-c ""} :outs {:out ""}} (fn [_ _ _] {}))
+          snk (step/sink)
+          sm (-> (step/beside src a b c d snk)
+                 (step/connect [:src :out]  [:a :in])
+                 (step/connect [:a :to-b]   [:b :in])
+                 (step/connect [:a :to-c]   [:c :in])
+                 (step/connect [:b :out]    [:d :from-b])
+                 (step/connect [:c :out]    [:d :from-c])
+                 (step/connect [:d :out]    [:sink :in]))
+          shape (:shape (shape/decompose (step/topology sm)))]
+      (is (= :chain (:kind shape)))
+      (is (= 5 (count (:order shape))))
+      (is (= [:src] (first (:order shape))))
+      (is (= [:a] (nth (:order shape) 1)))
+      (let [sg (nth (:order shape) 2)]
+        (is (and (map? sg) (= :scatter-gather (:kind sg))))
+        (is (= 2 (count (:branches sg)))))
+      (is (= [:d] (nth (:order shape) 3)))
+      (is (= [:sink] (nth (:order shape) 4))))))
+
+(deftest wheatstone-bridge-stays-prime
+  (testing "src → {A, B}, A → {C, T}, B → C, C → T (T = sink): non-SP, falls to :prime"
+    (let [src (step/step :src {:ins {:in ""} :outs {:to-a "" :to-b ""}} (fn [_ _ _] {}))
+          a   (step/step :a   {:ins {:in ""} :outs {:to-c "" :to-t ""}} (fn [_ _ _] {}))
+          b   (step/step :b   {:ins {:in ""} :outs {:to-c ""}}          (fn [_ _ _] {}))
+          c   (step/step :c   {:ins {:from-a "" :from-b ""} :outs {:to-t ""}} (fn [_ _ _] {}))
+          t   (step/step :t   {:ins {:from-a "" :from-c ""} :outs {}}   (fn [_ _ _] {}))
+          sm (-> (step/beside src a b c t)
+                 (step/connect [:src :to-a] [:a :in])
+                 (step/connect [:src :to-b] [:b :in])
+                 (step/connect [:a :to-c]   [:c :from-a])
+                 (step/connect [:a :to-t]   [:t :from-a])
+                 (step/connect [:b :to-c]   [:c :from-b])
+                 (step/connect [:c :to-t]   [:t :from-c]))
+          shape (:shape (shape/decompose (step/topology sm)))]
+      (is (= :prime (:kind shape))
+          "Wheatstone bridge is the canonical non-SP DAG; correctly classified as :prime"))))
+
 (deftest leaves-preserved
   (testing "decompose preserves leaf count for various shapes"
     (doseq [[label sm] [[:chain     (step/serial (step/step :a inc)

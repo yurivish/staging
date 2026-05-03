@@ -150,11 +150,14 @@
 
 (declare render-shape)
 
+(declare render-inline-sg compute-branch-lines)
+
 (defn- render-elt
-  "Render one :order element (a path or a nested :cycle record).
-   Returns a seq of {:line :fall-through? :paths} maps. `:paths` carries the
-   step paths the line represents — usually a single path; for a
-   nested :cycle record's header line, the cycle's members."
+  "Render one :order element (a path, a nested :cycle record, or a
+   nested :scatter-gather record). Returns a seq of
+   {:line :fall-through? :paths} maps. `:paths` carries the step paths
+   the line represents — usually a single path; for a nested record's
+   header line, the members."
   [elt children-map depth]
   (cond
     (vector? elt)
@@ -179,25 +182,41 @@
            :paths (vec (filter vector? (:order elt)))}
           (render-shape elt children-map (inc depth)))
 
+    (and (map? elt) (= :scatter-gather (:kind elt)))
+    ;; Inline scatter-gather record inside a parent chain's :order.
+    ;; The sg's :source and :sink are the chain neighbors and are
+    ;; rendered by the chain — so we emit only the branches under a
+    ;; rail at depth+1.
+    (render-inline-sg elt children-map (inc depth))
+
     :else
     [{:line (str (indent depth) (pr-str elt)) :fall-through? false :paths []}]))
 
 ;; ---- Compression of identical scatter-gather branches ----
 
 (defn- branch-rendered
-  "Render a single branch (vec of :order elements). Branch root at
-   `branch-depth`; each subsequent chain element is rendered one
-   deeper, so that within the parallel bracket rail a name at the
-   root column reads as a new branch and a name at deeper columns
-   reads as a continuation of the previous branch's chain."
+  "Render a single branch shape at `branch-depth`. Branches are full
+   shape records (chain / scatter-gather / cycle / prime / empty); for
+   chain branches, each :order element renders one indent deeper so
+   name-at-root vs. name-at-deeper-indent reads as new-branch vs.
+   continuation."
   [branch children-map branch-depth]
-  (let [n (count branch)]
-    (apply concat
-           (map-indexed
-            (fn [i elt]
-              (with-fall-through (render-elt elt children-map (+ branch-depth i))
-                       (< i (dec n))))
-            branch))))
+  (case (:kind branch)
+    :chain
+    (let [order (:order branch)
+          n (count order)]
+      (apply concat
+             (map-indexed
+              (fn [i elt]
+                (with-fall-through (render-elt elt children-map (+ branch-depth i))
+                         (< i (dec n))))
+              order)))
+
+    :empty []
+
+    ;; Non-chain branch (scatter-gather, cycle, prime as a sub-shape).
+    ;; Recurse via render-shape; outer bracket rail wraps the result.
+    (render-shape branch children-map branch-depth)))
 
 (defn- branch-signature
   "Normalize a rendered branch so first-line names get a placeholder.
@@ -264,6 +283,30 @@
       (cons {:line (str (indent branch-depth) (str k "× ") body)
              :fall-through? false :paths all-paths}
             (rest sample)))))
+
+(defn- compute-branch-lines
+  "Render the branches of a scatter-gather shape and apply the
+   appropriate rail (collapsed K× or per-branch ⎢). Returns the
+   tagged lines for the bracket — does NOT include source/sink lines."
+  [branches children-map branch-depth]
+  (let [rendered (mapv #(branch-rendered % children-map branch-depth) branches)
+        result (compress-branches rendered)
+        [k mode] result]
+    (case mode
+      :collapsed
+      (let [[_ _ payload all-paths] result
+            collapsed (render-collapsed k payload all-paths branch-depth)]
+        (apply-collapsed-rail (with-fall-through collapsed true)))
+      :uncompressed
+      (apply-bracket-rail (apply concat (nth result 2))))))
+
+(defn- render-inline-sg
+  "Render a scatter-gather record that's nested inside a parent chain's
+   :order. The sg's source/sink are atomic chain neighbors (rendered
+   by the chain), so we emit only the bracketed branches at
+   `branch-depth`."
+  [sg children-map branch-depth]
+  (compute-branch-lines (:branches sg) children-map branch-depth))
 
 ;; ---- Pattern compression for cycle / prime :order ----
 ;;
@@ -627,40 +670,28 @@
       (apply concat
              (map-indexed
               (fn [i elt]
-                (with-fall-through (render-elt elt children-map depth)
-                         (< i (dec n))))
+                (let [rendered (render-elt elt children-map depth)]
+                  ;; Inline scatter-gather records inside a chain
+                  ;; represent a parallel sub-shape whose source/sink
+                  ;; ARE the chain neighbors. The chain neighbors carry
+                  ;; the fall-through arrow; the rail rows themselves
+                  ;; should stay un-↓ (matches heterogeneous parallel
+                  ;; rendering). Skip with-fall-through propagation.
+                  (if (and (map? elt) (= :scatter-gather (:kind elt)))
+                    rendered
+                    (with-fall-through rendered (< i (dec n))))))
               order)))
 
     :scatter-gather
-    ;; Branches render at the same depth as source/sink. The bracket
-    ;; rail itself (⎡⎢⎣) provides the visual offset, so we don't add
-    ;; an extra indent level on top of that — keeps nested-bracket
-    ;; output compact.
-    ;;
-    ;; Collapsed mode (K× block aggregation): visually it's a chain
-    ;; `source → K× block → sink`, so we add fall-through on source
-    ;; and the K× header, and decorate the block with a single-row
-    ;; `⎢` rail to keep the parallel-bracket signal visible.
-    ;; Uncompressed mode: source still has an edge to the first
-    ;; branch, so it gets ↓ too — the rule is "↓ if next visible line
-    ;; is a real successor," and that's true even when there are
-    ;; OTHER successors as well.
-    (let [branch-depth depth
-          branches (:branches shape)
-          rendered (mapv #(branch-rendered % children-map branch-depth) branches)
-          result (compress-branches rendered)
-          [k mode] result
-          source-lines (with-fall-through
+    ;; Top-level scatter-gather (e.g., as the inner shape of a
+    ;; container like cc/parallel). Source has ↓ (real edge to every
+    ;; branch). Branches render via the compute-branch-lines helper.
+    ;; Sink's ↓ comes from the outer chain's with-fall-through
+    ;; propagation if the parent has a chain successor.
+    (let [source-lines (with-fall-through
                         (render-elt (:source shape) children-map depth)
                         true)
-          branch-lines (case mode
-                         :collapsed
-                         (let [[_ _ payload all-paths] result
-                               collapsed (render-collapsed k payload all-paths branch-depth)]
-                           (apply-collapsed-rail
-                            (with-fall-through collapsed true)))
-                         :uncompressed
-                         (apply-bracket-rail (apply concat (nth result 2))))
+          branch-lines (compute-branch-lines (:branches shape) children-map depth)
           sink-lines (with-fall-through
                       (render-elt (:sink shape) children-map depth)
                       false)]

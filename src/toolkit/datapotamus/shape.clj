@@ -143,67 +143,213 @@
             (vswap! pred-cnt update v dec))
           (recur (conj out u) (disj remaining u)))))))
 
+(defn- build-succ [edges]
+  (reduce (fn [m [u v]] (update m u (fnil conj #{}) v)) {} edges))
+
+(defn- build-pred [edges]
+  (reduce (fn [m [u v]] (update m v (fnil conj #{}) u)) {} edges))
+
+(defn- topo-positions
+  "Map node → topological position (deterministic via `node-key` tie-break)."
+  [paths succ pred]
+  (let [pred-cnt (volatile! (into {} (for [n paths] [n (count (get pred n))])))]
+    (loop [out {}
+           remaining (set paths)]
+      (if (empty? remaining)
+        out
+        (let [u (->> remaining
+                     (filter #(zero? (get @pred-cnt %)))
+                     (sort-by node-key)
+                     first)]
+          (when-not u
+            (throw (ex-info "topo-positions: input contains a cycle"
+                            {:remaining remaining})))
+          (doseq [v (get succ u)]
+            (vswap! pred-cnt update v dec))
+          (recur (assoc out u (count out))
+                 (disj remaining u)))))))
+
+(defn- find-cut-node
+  "First node X (in topo order, between S and T exclusive) that lies on
+   every S→T path. nil if none exists. X is a cut iff no edge u→v skips
+   it in topological order — i.e., no edge has topo(u) < topo(X) <
+   topo(v) with u ≠ X and v ≠ X."
+  [paths edges S T succ pred]
+  (let [pos (topo-positions paths succ pred)
+        ps  (pos S)
+        pt  (pos T)]
+    (->> paths
+         (remove #{S T})
+         (filter #(< ps (pos %) pt))
+         (sort-by pos)
+         (filter (fn [X]
+                   (let [px (pos X)]
+                     (not-any? (fn [[u v]]
+                                 (and (not= u X) (not= v X)
+                                      (< (pos u) px)
+                                      (> (pos v) px)))
+                               edges))))
+         first)))
+
+(defn- reachable-set
+  "Set of nodes reachable from `start` via a succ-map (directed walk)."
+  [start succ-map]
+  (loop [stk [start] seen #{}]
+    (if (empty? stk)
+      seen
+      (let [v (peek stk)]
+        (if (seen v)
+          (recur (pop stk) seen)
+          (recur (into (pop stk) (get succ-map v)) (conj seen v)))))))
+
+(defn- subgraph-between
+  "The sub-DAG of nodes that lie on some directed S→X path (S, X
+   inclusive). Returns `[paths edges]`."
+  [edges S X]
+  (let [succ   (build-succ edges)
+        pred   (build-pred edges)
+        from-S (reachable-set S succ)
+        to-X   (reachable-set X pred)
+        sub    (set/intersection from-S to-X)
+        sub-e  (filterv (fn [[u v]] (and (sub u) (sub v))) edges)]
+    [(vec sub) sub-e]))
+
+(declare classify-dag)
+
+(defn- clean-parallel-component?
+  "Is `comp` a clean two-terminal sub-DAG: single source connected from
+   S, single sink connected to T, and no S/T edges crossing the
+   component except through that one source/sink?"
+  [comp edges S T]
+  (let [comp-set  (set comp)
+        int-edges (filter (fn [[u v]] (and (comp-set u) (comp-set v))) edges)
+        cs (build-succ int-edges)
+        cp (build-pred int-edges)
+        comp-srcs (filter #(empty? (get cp %)) comp-set)
+        comp-snks (filter #(empty? (get cs %)) comp-set)]
+    (when (and (= 1 (count comp-srcs))
+               (= 1 (count comp-snks)))
+      (let [src-of (first comp-srcs)
+            snk-of (first comp-snks)]
+        (and (some (fn [[u v]] (and (= u S) (= v src-of))) edges)
+             (some (fn [[u v]] (and (= u snk-of) (= v T))) edges)
+             (every? (fn [[u v]]
+                       (or (not= u S)
+                           (not (comp-set v))
+                           (= v src-of)))
+                     edges)
+             (every? (fn [[u v]]
+                       (or (not= v T)
+                           (not (comp-set u))
+                           (= u snk-of)))
+                     edges))))))
+
+(defn- try-parallel-decompose
+  "If the level is a strict parallel composition — every middle weak
+   component is a clean two-terminal sub-DAG with a single source
+   connected to S and a single sink connected to T — return the
+   scatter-gather record (each branch recursively decomposed). nil
+   otherwise."
+  [paths edges S T]
+  (let [middle (disj (set paths) S T)
+        middle-edges (filter (fn [[u v]] (and (middle u) (middle v))) edges)
+        components (weak-components middle middle-edges)
+        has-direct? (boolean (some (fn [[u v]] (and (= u S) (= v T))) edges))]
+    (when (and (or (seq components) has-direct?)
+               (every? #(clean-parallel-component? % edges S T) components))
+      (let [branch-shapes
+            (mapv (fn [comp]
+                    (let [comp-set (set comp)
+                          int-edges (filterv (fn [[u v]] (and (comp-set u) (comp-set v)))
+                                             edges)]
+                      (classify-dag (vec comp-set) int-edges)))
+                  components)]
+        {:kind :scatter-gather
+         :source S
+         :sink T
+         :branches (cond-> branch-shapes
+                     has-direct? (conj {:kind :empty}))}))))
+
+(defn- chain-pre-elements
+  "Order-elements representing shape `s` in a chain context where s
+   ends at node X. Drops the trailing X for a chain; for a non-chain
+   shape, returns `[s.source s]` so the chain reads
+   `<source>, <sg-record>, X, ...`."
+  [s]
+  (case (:kind s)
+    :chain (vec (butlast (:order s)))
+    :empty []
+    :scatter-gather [(:source s) s]
+    [s]))
+
+(defn- chain-post-elements
+  "Order-elements representing shape `s` in a chain context where s
+   starts at node X. Drops the leading X for a chain; for a non-chain
+   shape, returns `[s s.sink]` so the chain reads
+   `..., X, <sg-record>, <sink>`."
+  [s]
+  (case (:kind s)
+    :chain (vec (rest (:order s)))
+    :empty []
+    :scatter-gather [s (:sink s)]
+    [s]))
+
 (defn- classify-dag
-  "Classify an acyclic graph (`paths` set, `edges` vec of `[u v]`)."
+  "Recursively decompose a DAG into a series-parallel shape tree.
+   Returns one of:
+     {:kind :empty}
+     {:kind :chain :order [...]}              ; :order may include scatter-gather records
+     {:kind :scatter-gather :source S :sink T :branches [shape...]}
+     {:kind :prime :order [...] :internal-edges [...]}
+
+   Algorithm (Valdes–Tarjan–Lawler-style two-terminal recognition):
+     1. Trivial: empty / single-node / no edges.
+     2. Multi-source or multi-sink → :prime.
+     3. Chain — every internal node has in/out-degree 1.
+     4. Series cut — find a node X (between S and T) that lies on every
+        S→T path; recurse on the two halves and compose as a chain.
+     5. Parallel — middle splits into clean two-terminal components,
+        each connected once-to-S and once-to-T; recurse on each branch.
+     6. Otherwise → :prime (e.g., the Wheatstone bridge)."
   [paths edges]
-  (if (empty? paths)
-    {:kind :empty}
-    (let [succ    (reduce (fn [m [u v]] (update m u (fnil conj #{}) v)) {} edges)
-          pred    (reduce (fn [m [u v]] (update m v (fnil conj #{}) u)) {} edges)
-          srcs    (filter #(empty? (get pred %)) paths)
-          snks    (filter #(empty? (get succ %)) paths)
-          ->prime (fn [] {:kind :prime
-                          :order (kahn-order paths succ pred)
-                          :internal-edges (vec edges)})]
-      (cond
-        (empty? edges)
-        (if (<= (count paths) 1)
-          {:kind :chain :order (vec paths)}
-          (->prime))
+  (let [path-set (set paths)]
+    (cond
+      (empty? path-set) {:kind :empty}
 
-        (or (not= 1 (count srcs)) (not= 1 (count snks)))
-        (->prime)
+      :else
+      (let [succ    (build-succ edges)
+            pred    (build-pred edges)
+            srcs    (filter #(empty? (get pred %)) path-set)
+            snks    (filter #(empty? (get succ %)) path-set)
+            ->prime (fn [] {:kind :prime
+                            :order (kahn-order path-set succ pred)
+                            :internal-edges (vec edges)})]
+        (cond
+          (= 1 (count path-set))
+          {:kind :chain :order (vec path-set)}
 
-        :else
-        (let [src   (first srcs)
-              snk   (first snks)
-              order (chain-order paths succ pred)]
-          (if order
-            {:kind :chain :order (vec order)}
-            (let [middle      (disj paths src snk)
-                  comps       (weak-components middle edges)
-                  comp-of     (reduce (fn [m c] (reduce #(assoc %1 %2 c) m c))
-                                      {} comps)
-                  edges-ok?   (every? (fn [[u v]]
-                                        (or (and (= u src) (= v snk))
-                                            (and (= u src) (middle v))
-                                            (and (middle u) (= v snk))
-                                            (and (middle u) (middle v)
-                                                 (= (comp-of u) (comp-of v)))))
-                                      edges)
-                  has-direct? (boolean (some (fn [[u v]] (and (= u src) (= v snk))) edges))]
-              (if (and edges-ok? (or (seq comps) has-direct?))
-                (let [order-branch
-                      (fn [comp]
-                        (let [comp-set (set comp)
-                              within   (filter (fn [[u v]]
-                                                 (and (comp-set u) (comp-set v)))
-                                               edges)
-                              succ' (reduce (fn [m [u v]] (update m u (fnil conj #{}) v))
-                                            {} within)
-                              pred' (reduce (fn [m [u v]] (update m v (fnil conj #{}) u))
-                                            {} within)]
-                          (or (chain-order comp-set succ' pred')
-                              ;; Fallback: branch isn't a clean chain
-                              ;; (multiple sources/sinks). Preserve some
-                              ;; deterministic order.
-                              (vec (sort comp-set)))))]
-                  {:kind     :scatter-gather
-                   :source   src
-                   :sink     snk
-                   :branches (cond-> (mapv (fn [comp] (vec (order-branch comp))) comps)
-                               has-direct? (conj []))})
-                (->prime)))))))))
+          (empty? edges)
+          (->prime)
+
+          (or (not= 1 (count srcs)) (not= 1 (count snks)))
+          (->prime)
+
+          :else
+          (let [S (first srcs) T (first snks)]
+            (or
+              (when-let [order (chain-order path-set succ pred)]
+                {:kind :chain :order (vec order)})
+              (when-let [X (find-cut-node path-set edges S T succ pred)]
+                (let [[g1-paths g1-edges] (subgraph-between edges S X)
+                      [g2-paths g2-edges] (subgraph-between edges X T)
+                      s1 (classify-dag g1-paths g1-edges)
+                      s2 (classify-dag g2-paths g2-edges)]
+                  {:kind :chain
+                   :order (vec (concat (chain-pre-elements s1)
+                                       [X]
+                                       (chain-post-elements s2)))}))
+              (try-parallel-decompose path-set edges S T)
+              (->prime))))))))
 
 ;; ============================================================================
 ;; Per-level: SCC condensation + recursive labeling
