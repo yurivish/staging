@@ -115,7 +115,7 @@
           (str "expected at least one K× pattern line; got: " (pr-str out))))))
 
 (deftest in-branch-ft-lives-in-bracket-rail-not-left-column
-  (testing "Multi-element parallel branches: ↓ for in-branch FT lives next to bracket char, not in left column"
+  (testing "Multi-element parallel branches: ↓ for in-branch fall-through lives next to bracket char, not in left column"
     (let [sm (step/serial
               (step/step :pre inc)
               (cc/parallel :p
@@ -127,7 +127,7 @@
       ;; No bracket line should start with `↓ ` in the left column.
       (is (every? #(not (str/starts-with? % "↓ ")) bracket-lines)
           (str "expected no left-column ↓ on bracket lines, got: " (pr-str bracket-lines)))
-      ;; At least one line should have a bracket-flush `↓` (in-branch FT).
+      ;; At least one line should have a bracket-flush `↓` (in-branch fall-through).
       (is (some #(re-find #"[⎡⎢]↓" %) bracket-lines)
           (str "expected at least one bracket-flush ↓, got: " (pr-str bracket-lines))))))
 

@@ -79,57 +79,74 @@
   "Append right-side annotations to the first line of `tagged`."
   [tagged annots]
   (if (and (seq tagged) (seq annots))
-    (let [{:keys [line ft? paths]} (first tagged)
+    (let [{:keys [line fall-through? paths]} (first tagged)
           suffix (str "  " (str/join ", " (map annotation-string annots)))]
-      (cons {:line (str line suffix) :ft? ft? :paths paths} (rest tagged)))
+      (cons {:line (str line suffix) :fall-through? fall-through? :paths paths} (rest tagged)))
     tagged))
 
-(defn- with-ft
-  "Set :ft? on the FIRST line of `tagged` (the order-element's
+(defn- with-fall-through
+  "Set :fall-through? on the FIRST line of `tagged` (the order-element's
    representative line in its parent shape). Inner lines keep whatever
-   :ft? they got from their own shape rendering."
-  [tagged ft?]
+   :fall-through? they got from their own shape rendering."
+  [tagged fall-through?]
   (if (seq tagged)
-    (cons (assoc (first tagged) :ft? (boolean ft?)) (rest tagged))
+    (cons (assoc (first tagged) :fall-through? (boolean fall-through?)) (rest tagged))
     tagged))
 
 (defn- apply-bracket-rail
   "Decorate a flat seq of branch lines with the parallel-section bracket
-   `⎡⎢⎣` and absorb in-branch chain FT into the rail itself. Each line
+   `⎡⎢⎣` and absorb in-branch chain fall-through into the rail itself. Each line
    gets a 2-character prefix `<bracket><↓ or space>` flush against the
    content:
-     - `⎡↓name` — first line of bracket, in-branch FT to next line.
-     - `⎡ name` — first line of bracket, no in-branch FT.
+     - `⎡↓name` — first line of bracket, in-branch fall-through to next line.
+     - `⎡ name` — first line of bracket, no in-branch fall-through.
      - `⎢↓name` / `⎢ name` — middle lines.
-     - `⎣ name` — last line of bracket; never has FT.
+     - `⎣ name` — last line of bracket; never has fall-through.
      - `⎢ name` (alone) — single-line bracket.
    Leading whitespace on the input line is fully replaced — all
    bracket-wrapped content sits at the same column relative to the
    rail, regardless of nesting depth. Inner brackets re-introduce
-   visual offset where needed. Output `:ft?` is cleared so `finalize`
+   visual offset where needed. Output `:fall-through?` is cleared so `finalize`
    doesn't also emit a left-column `↓` for the same line."
   [tagged-lines]
   (let [total (count tagged-lines)]
     (vec
      (map-indexed
-      (fn [i {:keys [line ft? paths]}]
+      (fn [i {:keys [line fall-through? paths]}]
         (let [last? (= (dec total) i)
               bracket (cond
                         (and (= 0 i) (= 1 total)) "⎢"
                         (= 0 i) "⎡"
                         last? "⎣"
                         :else "⎢")
-              ft-mark (if (and ft? (not last?)) "↓" " ")
+              fall-through-mark (if (and fall-through? (not last?)) "↓" " ")
               rest-line (str/replace line #"^\s+" "")
-              new-line (str bracket ft-mark rest-line)]
-          {:line new-line :ft? false :paths paths}))
+              new-line (str bracket fall-through-mark rest-line)]
+          {:line new-line :fall-through? false :paths paths}))
       tagged-lines))))
+
+(defn- apply-collapsed-rail
+  "Decorate the lines of a collapsed `K× …` block with a single-row
+   `⎢` rail at col 2. The K× block sits at the same level as
+   source/sink (it's their visual successor in the chain), so its
+   fall-through belongs in the LEFT column — unlike multi-row
+   `⎡⎢⎣` brackets, which absorb in-branch fall-through into the rail
+   itself. Leaves `:fall-through?` intact so `finalize` emits `↓` at
+   col 0; the rail just adds `⎢ ` at col 2 (replacing the existing
+   2-space indent), preserving any deeper indent for inner lines."
+  [tagged]
+  (vec
+   (map (fn [{:keys [line fall-through? paths]}]
+          (let [rest-line (if (>= (count line) 2) (subs line 2) line)
+                new-line (str "⎢ " rest-line)]
+            {:line new-line :fall-through? fall-through? :paths paths}))
+        tagged)))
 
 (declare render-shape)
 
 (defn- render-elt
   "Render one :order element (a path or a nested :cycle record).
-   Returns a seq of {:line :ft? :paths} maps. `:paths` carries the
+   Returns a seq of {:line :fall-through? :paths} maps. `:paths` carries the
    step paths the line represents — usually a single path; for a
    nested :cycle record's header line, the cycle's members."
   [elt children-map depth]
@@ -138,26 +155,26 @@
     (if-let [child (get children-map elt)]
       (case (:kind child)
         :leaf
-        [{:line (str (indent depth) (:name child)) :ft? false :paths [elt]}]
+        [{:line (str (indent depth) (:name child)) :fall-through? false :paths [elt]}]
 
         :container
         (cons {:line (str (indent depth) (:name child)
                           (when-let [c (:combinator child)]
                             (str " (" (name c) ")")))
-               :ft? false :paths [elt]}
+               :fall-through? false :paths [elt]}
               (render-shape (:shape child)
                             (into {} (for [c (:children child)] [(:path c) c]))
                             (inc depth))))
-      [{:line (str (indent depth) (str (last-sid elt))) :ft? false :paths [elt]}])
+      [{:line (str (indent depth) (str (last-sid elt))) :fall-through? false :paths [elt]}])
 
     (and (map? elt) (= :cycle (:kind elt)))
     (cons {:line (str (indent depth) "(cycle)")
-           :ft? false
+           :fall-through? false
            :paths (vec (filter vector? (:order elt)))}
           (render-shape elt children-map (inc depth)))
 
     :else
-    [{:line (str (indent depth) (pr-str elt)) :ft? false :paths []}]))
+    [{:line (str (indent depth) (pr-str elt)) :fall-through? false :paths []}]))
 
 ;; ---- Compression of identical scatter-gather branches ----
 
@@ -172,7 +189,7 @@
     (apply concat
            (map-indexed
             (fn [i elt]
-              (with-ft (render-elt elt children-map (+ branch-depth i))
+              (with-fall-through (render-elt elt children-map (+ branch-depth i))
                        (< i (dec n))))
             branch))))
 
@@ -183,11 +200,11 @@
    signature — different branches have different paths by definition."
   [tagged]
   (when (seq tagged)
-    (let [{:keys [line ft?]} (first tagged)
+    (let [{:keys [line fall-through?]} (first tagged)
           leading (re-find #"^\s*" line)
-          first-norm {:line (str leading "<<wrapper>>") :ft? ft?}]
+          first-norm {:line (str leading "<<wrapper>>") :fall-through? fall-through?}]
       (cons first-norm
-            (mapv #(select-keys % [:line :ft?]) (rest tagged))))))
+            (mapv #(select-keys % [:line :fall-through?]) (rest tagged))))))
 
 (defn- compress-branches
   "If all branches share a signature AND have non-trivial inner content,
@@ -228,7 +245,7 @@
           leading (re-find #"^\s*" line)
           body (subs line (count leading))]
       [{:line (str (indent branch-depth) (str k "× ") body)
-        :ft? false :paths all-paths}])
+        :fall-through? false :paths all-paths}])
 
     :else
     ;; Multi-line: header `K× <wrapper>` line at branch-depth, inner
@@ -239,7 +256,7 @@
           leading (re-find #"^\s*" line)
           body (-> (subs line (count leading)) displayify-line)]
       (cons {:line (str (indent branch-depth) (str k "× ") body)
-             :ft? false :paths all-paths}
+             :fall-through? false :paths all-paths}
             (rest sample)))))
 
 ;; ---- Pattern compression for cycle / prime :order ----
@@ -264,8 +281,8 @@
       (str/replace #"(\b[a-zA-Z]+(?:\s[a-zA-Z]+)*)\s(\d+)$" "$1 K")))
 
 (defn- normalize-tagged [tagged]
-  (mapv (fn [{:keys [line ft?]}]
-          {:line (displayify-line line) :ft? ft?})
+  (mapv (fn [{:keys [line fall-through?]}]
+          {:line (displayify-line line) :fall-through? fall-through?})
         tagged))
 
 (defn- find-pattern-at
@@ -308,17 +325,17 @@
         all-paths (vec
                    (mapcat (fn [elt-tagged] (mapcat :paths elt-tagged))
                            (subvec pre-rendered start (+ start (* n size)))))
-        normalized (mapv (fn [{:keys [line ft? paths]}]
+        normalized (mapv (fn [{:keys [line fall-through? paths]}]
                            {:line (displayify-line line)
-                            :ft? ft?
+                            :fall-through? fall-through?
                             :paths paths})
                          first-instance)]
     (if (seq normalized)
-      (let [{:keys [line ft?]} (first normalized)
+      (let [{:keys [line fall-through?]} (first normalized)
             leading (re-find #"^\s*" line)
             body (subs line (count leading))
             new-line (str leading n "× " body)]
-        (cons {:line new-line :ft? ft? :paths all-paths}
+        (cons {:line new-line :fall-through? fall-through? :paths all-paths}
               (rest normalized)))
       normalized)))
 
@@ -381,8 +398,8 @@
             sub-rendering (binding [*aggregate?* true]
                             (render-shape (:shape child) sub-children 0))]
         [:container
-         (mapv (fn [{:keys [line ft?]}]
-                 [(displayify-line line) ft?])
+         (mapv (fn [{:keys [line fall-through?]}]
+                 [(displayify-line line) fall-through?])
                sub-rendering)]))))
 
 (defn- canonicalize-coloring
@@ -492,7 +509,7 @@
   [color class-map pattern]
   (let [members (get class-map color)
         rep (first (sort members))
-        rep-name (-> (last-sid rep) displayify-line)]
+        rep-name (-> (last-sid rep) humanize-sid displayify-line)]
     (case pattern
       ;; Singleton target: just the name.
       :fan-in    rep-name
@@ -549,9 +566,9 @@
                       ;; K-placeholder would lie about the real step names.
                       tagged (render-elt rep children-map depth)
                       tagged' (if (> k 1)
-                                (mapv (fn [{:keys [line ft? paths]}]
+                                (mapv (fn [{:keys [line fall-through? paths]}]
                                         {:line (displayify-line line)
-                                         :ft? ft?
+                                         :fall-through? fall-through?
                                          :paths paths})
                                       tagged)
                                 tagged)
@@ -559,11 +576,11 @@
                       ;; represents ALL k members, so :paths is the
                       ;; full class member list.
                       tagged'' (if (and (> k 1) (seq tagged'))
-                                 (let [{:keys [line ft?]} (first tagged')
+                                 (let [{:keys [line fall-through?]} (first tagged')
                                        leading (re-find #"^\s*" line)
                                        body (subs line (count leading))]
                                    (cons {:line (str leading k "× " body)
-                                          :ft? ft?
+                                          :fall-through? fall-through?
                                           :paths (vec class-members)}
                                          (rest tagged')))
                                  tagged')
@@ -576,14 +593,14 @@
                                        (str "← " tname)
                                        (str "→ " tname))))
                       tagged''' (if (seq annot-strs)
-                                  (let [{:keys [line ft? paths]} (first tagged'')]
+                                  (let [{:keys [line fall-through? paths]} (first tagged'')]
                                     (cons {:line (str line "  " (str/join ", " annot-strs))
-                                           :ft? ft?
+                                           :fall-through? fall-through?
                                            :paths paths}
                                           (rest tagged'')))
                                   tagged'')
-                      ;; Set FT based on class-level spine
-                      final (with-ft tagged''' spine-edge?)]
+                      ;; Set fall-through based on class-level spine
+                      final (with-fall-through tagged''' spine-edge?)]
                   final))
               class-order)))))
 
@@ -592,7 +609,7 @@
 (defn render-shape
   "Walk a shape (one of `:empty` / `:chain` / `:scatter-gather` /
    `:cycle` / `:prime`) under a child path → child-node lookup.
-   Returns a seq of {:line :ft?} maps."
+   Returns a seq of {:line :fall-through?} maps."
   [shape children-map depth]
   (case (:kind shape)
     :empty
@@ -604,7 +621,7 @@
       (apply concat
              (map-indexed
               (fn [i elt]
-                (with-ft (render-elt elt children-map depth)
+                (with-fall-through (render-elt elt children-map depth)
                          (< i (dec n))))
               order)))
 
@@ -613,21 +630,35 @@
     ;; rail itself (⎡⎢⎣) provides the visual offset, so we don't add
     ;; an extra indent level on top of that — keeps nested-bracket
     ;; output compact.
+    ;;
+    ;; Collapsed mode (K× block aggregation): visually it's a chain
+    ;; `source → K× block → sink`, so we add fall-through on source
+    ;; and the K× header, and decorate the block with a single-row
+    ;; `⎢` rail to keep the parallel-bracket signal visible.
+    ;; Uncompressed mode: source has edges to multiple branches;
+    ;; fall-through would imply a single successor, so we suppress it
+    ;; and let the multi-row bracket rail carry the structure.
     (let [branch-depth depth
           branches (:branches shape)
           rendered (mapv #(branch-rendered % children-map branch-depth) branches)
           result (compress-branches rendered)
-          [k mode] result]
-      (concat
-       (with-ft (render-elt (:source shape) children-map depth) false)
-       (case mode
-         :collapsed
-         (let [[_ _ payload all-paths] result]
-           (render-collapsed k payload all-paths branch-depth))
-
-         :uncompressed
-         (apply-bracket-rail (apply concat (nth result 2))))
-       (with-ft (render-elt (:sink shape) children-map depth) false)))
+          [k mode] result
+          collapsed? (= :collapsed mode)
+          source-lines (with-fall-through
+                        (render-elt (:source shape) children-map depth)
+                        collapsed?)
+          branch-lines (case mode
+                         :collapsed
+                         (let [[_ _ payload all-paths] result
+                               collapsed (render-collapsed k payload all-paths branch-depth)]
+                           (apply-collapsed-rail
+                            (with-fall-through collapsed true)))
+                         :uncompressed
+                         (apply-bracket-rail (apply concat (nth result 2))))
+          sink-lines (with-fall-through
+                      (render-elt (:sink shape) children-map depth)
+                      false)]
+      (concat source-lines branch-lines sink-lines))
 
     (:cycle :prime)
     (or (when *aggregate?*
@@ -640,25 +671,25 @@
                             (fn [i]
                               (let [elt (nth order i)
                                     next-elt (when (< (inc i) n) (nth order (inc i)))
-                                    ft? (and next-elt (contains? edges [elt next-elt]))
+                                    fall-through? (and next-elt (contains? edges [elt next-elt]))
                                     tagged (render-elt elt children-map depth)
                                     with-anns (attach-annotations tagged (anns elt))]
-                                (with-ft with-anns ft?)))
+                                (with-fall-through with-anns fall-through?)))
                             (range n))]
           (apply concat (compress-cycle-order pre-rendered))))))
 
 ;; ---- Top-level entry points ----
 
 (defn- finalize
-  "Convert tagged lines to printable strings: prepend `↓ ` on FT lines,
+  "Convert tagged lines to printable strings: prepend `↓ ` on fall-through lines,
    `  ` otherwise."
   [tagged]
-  (mapv (fn [{:keys [line ft?]}]
-          (str (if ft? "↓ " "  ") line))
+  (mapv (fn [{:keys [line fall-through?]}]
+          (str (if fall-through? "↓ " "  ") line))
         tagged))
 
 (defn- tree->tagged
-  "Like tree->lines but returns the {:line :ft? :paths} structures
+  "Like tree->lines but returns the {:line :fall-through? :paths} structures
    without finalizing to plain strings. Stats consumers use this to
    look up per-path stats by line."
   [tree]
@@ -703,7 +734,7 @@
      (tree->lines (->tree x)))))
 
 (defn render-tagged
-  "Like `render` but returns a vec of `{:line :ft? :paths}` maps
+  "Like `render` but returns a vec of `{:line :fall-through? :paths}` maps
    instead of finalized strings. Each line carries the step paths it
    represents (typically one; K for block-aggregated lines). Used by
    stats and live-view consumers that look up per-path data per line."
@@ -806,8 +837,8 @@
    associated path records get blank but width-matching cells so the
    column separators (`│`) line up vertically across all rows."
   [tagged stats-map]
-  (let [base-strs (mapv (fn [{:keys [line ft?]}]
-                          (str (if ft? "↓ " "  ") line))
+  (let [base-strs (mapv (fn [{:keys [line fall-through?]}]
+                          (str (if fall-through? "↓ " "  ") line))
                         tagged)
         tree-w (apply max 0 (map count base-strs))
         cells  (resolve-line-stats tagged stats-map)

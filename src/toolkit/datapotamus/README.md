@@ -551,7 +551,8 @@ Quick reference:
 | Visual element | Meaning |
 |---|---|
 | Indent under a name (no bracket) | Inside that container |
-| `⎡⎢⎣` rail | Parallel section (scatter-gather) |
+| `⎡⎢⎣` rail | Parallel section (scatter-gather, multiple branches) |
+| `⎢` rail (single column, no corners) | Collapsed parallel section — all branches identical, summarized as one `K× …` row |
 | Name at the bracket-root column | A new parallel arm starts |
 | Name at a deeper column inside a bracket | Continuation of the previous arm's chain |
 | `↓` left column | Outer-shape chain flow (between same-indent siblings) |
@@ -582,11 +583,15 @@ three slots:
     the bracket-root column is a new branch's root; a name indented
     deeper is a continuation of the previous branch's chain.
   - `K× <inner>` — K identical parallel branches collapsed (e.g.
-    `c/round-robin-workers` with k=16). The same prefix also marks
+    `c/round-robin-workers` with k=16). The block carries a
+    single-column `⎢` rail (no corners) to keep the parallel-bracket
+    signal visible — the multi-branch `⎡⎢⎣` corners would only have
+    one logical row of content, so they're replaced by the
+    extension-only middle char. The same prefix also marks
     block-aggregated equivalence classes inside `:cycle` and `:prime`
     shapes (e.g. `c/stealing-workers` collapses to one block per
-    class: `K× sK`, `K× wK`, `K× eK`). When a class has size > 1,
-    digit-suffixed identifiers display as `wK`.
+    class: `K× shim K`, `K× worker K`, `K× exit K`). When a class has
+    size > 1, digit-suffixed identifiers display as `worker K`.
 
 #### Block aggregation in cycles
 
