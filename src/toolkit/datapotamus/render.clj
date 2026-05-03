@@ -13,8 +13,8 @@
    - Body — name, optionally with a `│ ` branch-root marker for
             scatter-gather arms or a `K× …` compression header.
    - Right slot (after the name):
-       `⬏ <name>`        — back-edge to a line above (always named).
-       `⬎ <name>`        — forward off-spine to a non-adjacent line below.
+       `⮥ <name>`        — back-edge to a line above (always named).
+       `⮧ <name>`        — forward off-spine to a non-adjacent line below.
 
    Two layers:
    - `render` — pure, returns a seq of lines (strings, no newlines).
@@ -72,8 +72,8 @@
 
 (defn- annotation-string [annot]
   (cond
-    (and (vector? annot) (= :back (first annot))) (str "⬏ " (elt-name (second annot)))
-    (and (vector? annot) (= :fwd (first annot)))  (str "⬎ " (elt-name (second annot)))))
+    (and (vector? annot) (= :back (first annot))) (str "⮥ " (elt-name (second annot)))
+    (and (vector? annot) (= :fwd (first annot)))  (str "⮧ " (elt-name (second annot)))))
 
 (defn- attach-annotations
   "Append right-side annotations to the first line of `tagged`."
@@ -586,8 +586,8 @@
                                          pos-target (class-pos cj)
                                          tname (class-display-name cj class-map pattern)]
                                      (if (< pos-target pos-source)
-                                       (str "⬏ " tname)
-                                       (str "⬎ " tname))))
+                                       (str "⮥ " tname)
+                                       (str "⮧ " tname))))
                       tagged''' (if (seq annot-strs)
                                   (let [{:keys [line fall-through? paths]} (first tagged'')]
                                     (cons {:line (str line "  " (str/join ", " annot-strs))
