@@ -237,7 +237,8 @@
   (reduce
    (fn [acc [sid proc]]
      (let [path (conj parent-path sid)
-           node {:path path :name (humanize sid)}]
+           node (cond-> {:path path :name (humanize sid)}
+                  (:combinator proc) (assoc :combinator (:combinator proc)))]
        (cond
          (step? proc)
          (-> acc

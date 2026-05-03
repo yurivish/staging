@@ -364,7 +364,7 @@
    over all rows seen so far. The last emission is the final summary."
   [{:keys [n-divergent-samples] :or {n-divergent-samples 10}}]
   {:procs
-   {:agg
+   {:aggregate
     (step/handler-map
      {:ports {:ins {:in ""} :outs {:out ""}}
       :on-init (fn [] {:rows []})
@@ -391,7 +391,7 @@
                          :most-divergent       divergent
                          :rows                 rows-data}]
           [s' {:out [(msg/merge ctx parents summary)]}]))})}
-   :conns [] :in :agg :out :agg})
+   :conns [] :in :aggregate :out :aggregate})
 
 ;; --- Flow -------------------------------------------------------------------
 

@@ -29,7 +29,7 @@
   ([k inner]     (round-robin-workers (gensym "round-robin-workers-") k inner))
   ([id k inner]
    (assert (pos-int? k) "round-robin-workers: k must be a positive integer")
-   (let [ws        (mapv #(keyword (str "w" %)) (range k))
+   (let [ws        (mapv #(keyword (str "worker-" %)) (range k))
          join-ins  (mapv #(keyword (str "in" %)) (range k))
          route     (fn [ctx s msg-fn]
                      (let [i (mod (long (:i s 0)) k)]
@@ -49,7 +49,8 @@
                                   [[[:router w] [w :in]]
                                    [[w :out]    [:join (join-ins i)]]])
                                 (range) ws))
-         pool      {:procs procs :conns conns :in :router :out :join}]
+         pool      {:procs procs :conns conns :in :router :out :join
+                    :combinator :round-robin-workers}]
      {:procs {id pool} :conns [] :in id :out id})))
 
 (defn- wrap-worker-multiplexed
@@ -223,11 +224,11 @@
    (assert (or (step/handler-map? inner) (step/step? inner))
            "stealing-workers: inner must be a handler-map or step")
    (let [step-inner? (step/step? inner)
-         to-w-ports  (mapv #(keyword (str "to-w" %)) (range k))
-         shim-ids    (mapv #(keyword (str "s" %)) (range k))
-         worker-ids  (mapv #(keyword (str "w" %)) (range k))
+         to-w-ports  (mapv #(keyword (str "to-worker-" %)) (range k))
+         shim-ids    (mapv #(keyword (str "shim-" %)) (range k))
+         worker-ids  (mapv #(keyword (str "worker-" %)) (range k))
          exit-ids    (when step-inner?
-                       (mapv #(keyword (str "e" %)) (range k)))
+                       (mapv #(keyword (str "exit-" %)) (range k)))
          to-w-chans  (vec (repeatedly k #(a/chan 1)))
 
          ;; Try-dispatch: pop items from the queue to free workers until
@@ -413,5 +414,6 @@
                        (mapv (fn [w] [[w :to-coord] [:coord :rec] {:buf-or-n 1024}])
                              worker-ids))))
 
-         pool {:procs procs :conns conns :in :ext :out :coord}]
+         pool {:procs procs :conns conns :in :ext :out :coord
+               :combinator :stealing-workers}]
      {:procs {id pool} :conns [] :in id :out id})))

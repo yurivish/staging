@@ -62,13 +62,24 @@ edges-by-parent (group-by #(vec (butlast (first %))) edges)
 - `:topology` — flat `{:nodes :edges}` over all paths at all depths. Lossless. Good for arbitrary graph algorithms downstream.
 - `:shape` — the same edges reorganized by the combinator hierarchy with per-level Tarjan applied. Higher-level interpretive view: `:chain` / `:scatter-gather` / `:cycle` / `:prime` at each container.
 
-Both kinds of cycles are encoded uniformly: cycles among leaves of one combinator, and cycles among sibling combinators, both surface at the level where they live as `{:kind :cycle :members [...] :back-edges [...]}`. Cycles cannot span combinator boundaries — the flat-edge property forbids it.
+Both kinds of cycles are encoded uniformly: cycles among leaves of one combinator, and cycles among sibling combinators, both surface at the level where they live as `{:kind :cycle :order [...] :internal-edges [...]}`. Cycles cannot span combinator boundaries — the flat-edge property forbids it.
 
-## The `:back-edges` naming wart
+## Spine + off-spine: the unifying frame
 
-A _back edge_ (DFS classification) is the edge that closes a loop — the one pointing to a node still on the recursion stack. Removing the back edges of an SCC breaks all of its cycles.
+All four shape kinds reduce to "walk a spine in `:order`, attach annotations for edges that don't lie along it":
 
-Our `:cycle` records do **not** store back edges. They store every edge whose both endpoints are inside the SCC (shape.clj:186–190). For `A ⇄ B` that's one extra edge; for larger SCCs it can be many. Fine for "show me everything in this loop"; misleading if a consumer wants the minimum feedback edge set. Renaming to `:internal-edges` would remove the wart with no behavior change.
+- `:chain` — `:order` is the source→sink walk; every edge is a consecutive-pair edge; off-spine = ∅.
+- `:scatter-gather` — spine is source → branches → sink; off-spine = ∅ by construction.
+- `:cycle` — `:order` is an Eades–Lin–Smyth FAS ordering of members that minimizes backward edges; `:internal-edges` is every edge with both endpoints inside the SCC. Spine = the consecutive-pair edges along `:order`; off-spine = the rest (the feedback arcs).
+- `:prime` — `:order` is a Kahn topo sort over the level's sub-DAG (with SCCs already condensed to nested cycle records); `:internal-edges` is every edge in that sub-DAG. Same partition: spine = consecutive-pair edges, off-spine = the rest (forward edges that skip spine positions).
+
+The renderer does not need to know which `:kind` it's looking at to compute the partition; it only needs `:order` and `:internal-edges`. Each shape `:kind` differs only in how it interprets the result: cycle → off-spine arrows go backward (loops), prime → off-spine arrows go forward (skips), chain/scatter-gather → off-spine is empty by construction.
+
+## Edges have no metadata
+
+A natural question: should combinators that introduce structural feedback (e.g. `stealing-workers`'s `:work` port) tag those edges with a `:role :feedback` flag, so the renderer doesn't need to compute a FAS?
+
+We don't, and we don't plan to. SCCs in real pipelines are tiny — Eades–Lin–Smyth at O(V+E) or even brute-force minimum FAS is way beyond good enough at that scale. Adding metadata to edges couples visualization concerns into combinator authoring and into every consumer of the topology, scaffolding for a problem we don't have evidence for. If a real readability case ever appears (a combinator where two edges look algorithmically equivalent but only one is "the feedback edge"), we can add a tag then, with that motivating example in hand.
 
 ## The mathematical object
 

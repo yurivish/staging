@@ -74,8 +74,8 @@
                  (step/output-at [:agent :final]))
           t  (shape/decompose (step/topology sm))]
       (is (= :cycle (-> t :shape :kind)))
-      (is (= #{[:agent] [:worker]} (set (-> t :shape :members))))
-      (is (= 2 (count (-> t :shape :back-edges)))))))
+      (is (= #{[:agent] [:worker]} (set (-> t :shape :order))))
+      (is (= 2 (count (-> t :shape :internal-edges)))))))
 
 ;; ============================================================================
 ;; :prime fallback

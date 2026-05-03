@@ -137,7 +137,7 @@
    (counter balance) is what tells the caller that no more emissions
    are coming."
   {:procs
-   {:agg
+   {:aggregate
     (step/handler-map
      {:ports   {:ins {:in ""} :outs {:out ""}}
       :on-init (fn [] {:rows []})
@@ -148,7 +148,7 @@
                                           (:rows s'))
                        summary   (summarize-story story-id par-msgs)]
                    [s' {:out [(msg/merge ctx par-msgs summary)]}]))})}
-   :conns [] :in :agg :out :agg})
+   :conns [] :in :aggregate :out :aggregate})
 
 (defn build-flow
   ([] (build-flow {}))

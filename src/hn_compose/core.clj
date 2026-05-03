@@ -68,19 +68,19 @@
   ([{:keys [size-ms rps burst]
      :or   {size-ms 60000 rps 1000 burst 1000}}]
    (let [;; Stories sub-pipeline (flat — inner procs at outer level).
-         rl       (ct/rate-limited {:rps rps :burst burst :id :stories-rl})
-         bkt      {:procs {:stories-bkt (stories-bucket-handler size-ms)}
-                   :conns [] :in :stories-bkt :out :stories-bkt}
+         rl       (ct/rate-limited {:rps rps :burst burst :id :stories-rate-limit})
+         bkt      {:procs {:stories-bucket (stories-bucket-handler size-ms)}
+                   :conns [] :in :stories-bucket :out :stories-bucket}
          stories  (step/serial rl bkt)
          ;; Comments sub-pipeline.
          win      (ca/tumbling-window {:size-ms size-ms :time-fn :time
-                                      :id :comments-win
+                                      :id :comments-window
                                       :on-window (fn [start end items]
                                                    {:window-start start
                                                     :window-end   end
                                                     :items        items})})
-         exp      {:procs {:comments-exp (explode-by-author-handler)}
-                   :conns [] :in :comments-exp :out :comments-exp}
+         exp      {:procs {:explode-by-author (explode-by-author-handler)}
+                   :conns [] :in :explode-by-author :out :explode-by-author}
          comments (step/serial win exp)
          ;; Join.
          join     (ca/join-by-key

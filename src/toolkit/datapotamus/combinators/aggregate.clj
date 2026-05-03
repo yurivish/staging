@@ -32,7 +32,7 @@
                         once per group on input-done."
   [key-fn summarize-rows]
   {:procs
-   {:agg
+   {:aggregate
     (step/handler-map
      {:ports   {:ins {:in ""} :outs {:out ""}}
       :on-init (fn [] {:rows []})
@@ -49,7 +49,7 @@
                                             (summarize-rows k rows))))
                              grouped)]
           {:out out-msgs}))})}
-   :conns [] :in :agg :out :agg})
+   :conns [] :in :aggregate :out :aggregate})
 
 (defn cumulative-by-group
   "Aggregator step. On each input, accumulates the row in its
@@ -78,7 +78,7 @@
                         msgs seen for that group."
   [key-fn summarize-rows]
   {:procs
-   {:agg
+   {:aggregate
     (step/handler-map
      {:ports   {:ins {:in ""} :outs {:out ""}}
       :on-init (fn [] {:groups {}})
@@ -91,7 +91,7 @@
               parents (mapv :msg entries)
               rows    (mapv :row entries)]
           [s' {:out [(msg/merge ctx parents (summarize-rows k rows))]}]))})}
-   :conns [] :in :agg :out :agg})
+   :conns [] :in :aggregate :out :aggregate})
 
 (defn join-by-key
   "Step that joins N input ports by a per-port key extractor. Each

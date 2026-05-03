@@ -180,8 +180,8 @@
      (cc/parallel :plan worker-pool-map :select plan-fn :post vals)"
   [id port->step & {:keys [select post] :or {post identity}}]
   (let [ports    (vec (keys port->step))
-        fo-id    id
-        fi-id    (keyword (str (name id) "*"))
+        fo-id    (keyword (str (name id) "-fan-out"))
+        fi-id    (keyword (str (name id) "-fan-in"))
         fo       (if select
                    (fan-out fo-id ports select)
                    (fan-out fo-id ports))
@@ -196,4 +196,5 @@
         bracket  (-> wired
                      (step/input-at fo-id)
                      (step/output-at fi-id))]
-    (step/serial id bracket)))
+    (-> (step/serial id bracket)
+        (update-in [:procs id] assoc :combinator :parallel))))

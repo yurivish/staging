@@ -524,7 +524,107 @@ fine to alias that one as `:as c` and read the prefix as "combinator." For
 files that mix two or more, the four-letter aliases keep the call sites
 self-explanatory.
 
-## TODO: custom visualizer over the static-topology dump
+## Static-topology views
+
+Two artifacts let you inspect a pipeline's structure offline.
+
+### Terminal renderer (`toolkit.datapotamus.render`)
+
+Renders a stepmap as an indented nested-list view. From a REPL:
+
+```clojure
+(require '[toolkit.datapotamus.render :as r]
+         '[my.pipeline.ns :as p])
+
+(r/print-pipeline (p/build-flow))   ; prints to *out*
+(r/render          (p/build-flow))  ; returns a seq of strings
+```
+
+`render/render` and `render/print-pipeline` accept a stepmap, a
+topology (`step/topology` output), or a shape tree
+(`shape/decompose` output).
+
+### Notation legend
+
+Quick reference:
+
+| Visual element | Meaning |
+|---|---|
+| Indent under a name (no bracket) | Inside that container |
+| `⎡⎢⎣` rail | Parallel section (scatter-gather) |
+| Name at the bracket-root column | A new parallel arm starts |
+| Name at a deeper column inside a bracket | Continuation of the previous arm's chain |
+| `↓` left column | Outer-shape chain flow (between same-indent siblings) |
+| `↓` next to a bracket char (`⎡↓ ` / `⎢↓ `) | In-branch chain flow within a parallel arm |
+| `← <name>` right | Back-edge to a line above (always named) |
+| `→ <name>` right | Forward off-spine to a non-adjacent line below |
+| `K× <name>` | K identical parallel things collapsed |
+| `<name> (combinator)` on a container line | Marks containers built by named combinators (`parallel`, `round-robin-workers`, `stealing-workers`) so the reader doesn't have to infer from the inner proc shape |
+
+The `K` in names like `worker K` or `eK` is a placeholder for a per-instance index. It only appears inside `K× …` blocks (where K members were collapsed by block aggregation). If you see it on a non-aggregated line, that's a bug — the underlying step id is the real digit (`worker 0`, `e3`, etc.).
+
+The rest of this section is the detailed reference. Every line uses
+three slots:
+
+```
+[left ] [indent + body                ] [right]
+```
+
+- **Left** (column 0): `↓ ` if this line falls through to its
+  successor in the same shape's `:order` (and that pair is a real
+  edge); `  ` (two spaces) otherwise. Trace a contiguous `↓` column
+  to read the spine.
+- **Body**:
+  - `<name>` — a leaf step or container.
+  - `⎡ <name>` / `⎢ <name>` / `⎣ <name>` — scatter-gather parallel
+    bracket rail. `⎡` marks the first line of the parallel section,
+    `⎣` the last, `⎢` middle lines. Within the bracket: a name at
+    the bracket-root column is a new branch's root; a name indented
+    deeper is a continuation of the previous branch's chain.
+  - `K× <inner>` — K identical parallel branches collapsed (e.g.
+    `c/round-robin-workers` with k=16). The same prefix also marks
+    block-aggregated equivalence classes inside `:cycle` and `:prime`
+    shapes (e.g. `c/stealing-workers` collapses to one block per
+    class: `K× sK`, `K× wK`, `K× eK`). When a class has size > 1,
+    digit-suffixed identifiers display as `wK`.
+
+#### Block aggregation in cycles
+
+Cycle/prime shapes go through a 1-WL color refinement pass that
+partitions members into classes that are recursively
+indistinguishable. Each class renders as one `K× <representative>`
+block. Inter-class edges are summarized using one of these patterns
+(based on the bipartite edge structure between two classes):
+
+| Pattern | Condition | Display |
+|---|---|---|
+| **fan-in** | every `Ci`-member → singleton `Cj` | `K× xK → y` |
+| **fan-out** | singleton `Ci` → every `Cj`-member | `x ← K× yK` |
+| **bijection** | `\|Ci\| = \|Cj\| = K`, edges form a perfect matching | `K× xK → yK` (suffix-K convention) |
+| **complete** | every `Ci`-member → every `Cj`-member | `K× xK → K× yK` |
+
+If any inter-class pattern is *partial* (none of the above), the
+faithfulness gate bails on aggregation for that shape; per-member
+rendering is used. To force per-member rendering globally, pass
+`{:aggregate? false}`:
+
+```clojure
+(render/print-pipeline (p/build-flow))                      ; aggregated (default)
+(render/print-pipeline (p/build-flow) {:aggregate? false})  ; per-member view
+```
+
+Disaggregation is lossless — any block aggregation can be expanded.
+- **Right** (after the name):
+  - `↑` — back-edge to the **immediately previous** textual line.
+  - `← <name>` — back-edge to a **non-adjacent** line above.
+  - `→ <name>` — forward off-spine to a **non-adjacent** line below.
+  - (Adjacent forward = the spine, encoded by left `↓` only.)
+
+Reading rule: a `↓` in the left column says "the next visible line
+is a real edge from me at this shape's level"; everything else is
+annotated explicitly on the right.
+
+### JSON export
 
 `clojure -X:export-pipelines` (see `/work/src/datapotamus_export.clj`)
 walks every pipeline namespace in the repo, calls its `build-flow`,
@@ -537,20 +637,28 @@ Each entry has:
 - `:tree` — `viz/from-step` combinator hierarchy
 - `:shape` — recursive shape classification from
   `toolkit.datapotamus.shape/decompose`. Each container carries one
-  of: `:chain` (with `:order`), `:scatter-gather` (with `:branches`),
-  `:cycle` (with `:members` and `:back-edges`), `:prime` (irreducible
-  fallback), or `:empty`. Cycles inside chains/scatter-gathers nest as
-  `{:kind :cycle ...}` records inside `:order`/`:branches`, so the
-  same vocabulary covers any directed graph at any level.
+  of: `:chain` (with `:order`), `:scatter-gather` (with `:source`,
+  `:sink`, `:branches`), `:cycle` or `:prime` (each with `:order`
+  and `:internal-edges`), or `:empty`. Cycles inside chains and
+  scatter-gathers nest as `{:kind :cycle ...}` records inside
+  `:order`/`:branches`, so the same vocabulary covers any directed
+  graph at any level.
 
-The point is to iterate on a custom web visualization separately from
-the live `obs/viz` event-sourced viewer — `obs/viz` shows runtime
-queue depth and busy counts; this dump is the static structural
-picture. The `:shape` field gives the renderer enough hints to draw
-chains as horizontal strips, scatter-gathers as fans, and only fall
-back to generic graph layout for `:prime` regions. Build a small
-renderer (D3? Datastar component? something else?) that consumes the
-JSON and plays with layouts before we decide what to integrate.
+The JSON is the substrate for a future custom web visualization,
+separate from the live `obs/viz` event-sourced viewer.
+
+### Bulk markdown rendering
+
+`dev/render_pipelines.clj` walks the same registry and writes a
+single markdown file with each pipeline's rendered tree. Regenerate:
+
+```
+clojure -J--add-opens=java.base/java.nio=ALL-UNNAMED \
+        -J--add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+        -M -e '(load-file "/work/dev/render_pipelines.clj")'
+```
+
+Default output is `/work/dev/pipelines.md`.
 
 ---
 
