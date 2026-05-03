@@ -273,25 +273,31 @@
 (defn- chain-pre-elements
   "Order-elements representing shape `s` in a chain context where s
    ends at node X. Drops the trailing X for a chain; for a non-chain
-   shape, returns `[s.source s]` so the chain reads
-   `<source>, <sg-record>, X, ...`."
+   2-terminal shape (sg or prime with explicit :source/:sink), returns
+   `[s.source s]` so the chain reads `<source>, <sub-shape>, X, ...`.
+   The sub-shape's source is rendered as the chain neighbor; X is the
+   shared cut node — appears in the chain :order, not duplicated
+   inside the sub-shape's record at the boundary."
   [s]
   (case (:kind s)
     :chain (vec (butlast (:order s)))
     :empty []
     :scatter-gather [(:source s) s]
+    :prime (if (:source s) [(:source s) s] [s])
+    :cycle [s]
     [s]))
 
 (defn- chain-post-elements
   "Order-elements representing shape `s` in a chain context where s
    starts at node X. Drops the leading X for a chain; for a non-chain
-   shape, returns `[s s.sink]` so the chain reads
-   `..., X, <sg-record>, <sink>`."
+   2-terminal shape, returns `[s s.sink]`."
   [s]
   (case (:kind s)
     :chain (vec (rest (:order s)))
     :empty []
     :scatter-gather [s (:sink s)]
+    :prime (if (:sink s) [s (:sink s)] [s])
+    :cycle [s]
     [s]))
 
 (defn- classify-dag
@@ -321,9 +327,17 @@
             pred    (build-pred edges)
             srcs    (filter #(empty? (get pred %)) path-set)
             snks    (filter #(empty? (get succ %)) path-set)
-            ->prime (fn [] {:kind :prime
-                            :order (kahn-order path-set succ pred)
-                            :internal-edges (vec edges)})]
+            ->prime (fn []
+                      ;; Attach :source/:sink when 2-terminal; lets a
+                      ;; series-cut composer embed the prime as a
+                      ;; sub-shape inside a chain :order without losing
+                      ;; nodes (chain neighbors are :source / :sink;
+                      ;; prime's :order keeps every node).
+                      (cond-> {:kind :prime
+                               :order (kahn-order path-set succ pred)
+                               :internal-edges (vec edges)}
+                        (= 1 (count srcs)) (assoc :source (first srcs))
+                        (= 1 (count snks)) (assoc :sink (first snks))))]
         (cond
           (= 1 (count path-set))
           {:kind :chain :order (vec path-set)}
@@ -431,9 +445,12 @@
                  (cond->
                   (:internal-edges shape)
                    (update :internal-edges (fn [es] (mapv unmark-edge es)))))
-      :prime (-> shape
-                 (update :order unmark-order)
-                 (update :internal-edges (fn [es] (mapv unmark-edge es)))))))
+      :prime (cond-> shape
+               true (update :order unmark-order)
+               (:source shape) (update :source unmark)
+               (:sink shape) (update :sink unmark)
+               (:internal-edges shape)
+               (update :internal-edges (fn [es] (mapv unmark-edge es)))))))
 
 (defn- ->cycle [members internal-edges]
   (let [int-edges (vec internal-edges)]
